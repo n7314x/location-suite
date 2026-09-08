@@ -1,0 +1,53 @@
+name: Update SideStore Source
+
+on:
+  push:
+    tags: ["[0-9]*"]
+
+permissions:
+  contents: write
+
+jobs:
+  update-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for IPA release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in {1..60}; do
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                 --json assets --jq '.assets[].name' 2>/dev/null | grep -q '^TLocation.ipa$'; then
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "Timed out waiting for TLocation.ipa release asset."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Update source.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$GITHUB_REF_NAME"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$version/TLocation.ipa"
+          size=$(gh release view "$version" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[] | select(.name=="TLocation.ipa") | .size')
+          date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          jq --arg v "$version" --arg url "$url" --argjson size "$size" --arg date "$date" \
+            '.apps[0].versions = ([{version: $v, date: $date, downloadURL: $url, size: $size, minOSVersion: "17.4"}]
+               + [.apps[0].versions[] | select(.version != $v)])' \
+            source.json > source.tmp && mv source.tmp source.json
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add source.json
+          git diff --cached --quiet || git commit -m "ci: update SideStore source for $GITHUB_REF_NAME"
+          git push
