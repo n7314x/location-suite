@@ -4,6 +4,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -20,6 +21,17 @@ class SimulationBusy(RuntimeError):
 
 class SimulationClosed(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class TeleportSucceeded:
+    operation_id: str
+    latitude: float
+    longitude: float
+    completed_at: datetime
+
+
+TeleportSuccessCallback = Callable[[TeleportSucceeded], None]
 
 
 class PersistentLocationSession(Protocol):
@@ -112,7 +124,13 @@ class SimulationManager:
                 "lastSuccessfulUpdate": last_successful_update,
             }
 
-    def teleport(self, latitude: float, longitude: float) -> str:
+    def teleport(
+        self,
+        latitude: float,
+        longitude: float,
+        *,
+        on_success: TeleportSuccessCallback | None = None,
+    ) -> str:
         with self._lock:
             self._ensure_open()
             self._ensure_not_transitioning()
@@ -131,6 +149,7 @@ class SimulationManager:
                 latitude,
                 longitude,
                 update_existing,
+                on_success,
             )
             return operation_id
 
@@ -172,6 +191,7 @@ class SimulationManager:
         latitude: float,
         longitude: float,
         update_existing: bool,
+        on_success: TeleportSuccessCallback | None,
     ) -> None:
         with self._lock:
             if self._operation_id != operation_id:
@@ -206,12 +226,43 @@ class SimulationManager:
                     self._consecutive_failures = 1
                 return
 
+        completed_at = datetime.now(UTC)
+
+        # This event boundary deliberately sits after DVT accepted the
+        # coordinate and confirmed that its persistent session remains open.
+        # Consumers such as history storage stay outside the DVT layer.
+        if on_success is not None:
+            try:
+                on_success(
+                    TeleportSucceeded(
+                        operation_id=operation_id,
+                        latitude=latitude,
+                        longitude=longitude,
+                        completed_at=completed_at,
+                    )
+                )
+            except Exception:
+                # Persistence failures must not alter a working simulation.
+                pass
+
+        with self._lock:
+            if self._operation_id != operation_id:
+                return
+            if not self._session.active:
+                if self._state != SimulationState.ERROR:
+                    self._state = SimulationState.ERROR
+                    self._error = (
+                        "Persistent DVT location session terminated "
+                        "unexpectedly"
+                    )
+                    self._consecutive_failures = 1
+                return
             self._latitude = latitude
             self._longitude = longitude
             self._state = SimulationState.ACTIVE
             self._error = None
             self._consecutive_failures = 0
-            self._last_successful_update = datetime.now(UTC)
+            self._last_successful_update = completed_at
 
     def _clear_worker(self, operation_id: str) -> None:
         with self._lock:

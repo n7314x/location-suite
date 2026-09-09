@@ -1,7 +1,25 @@
 import os
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 PMD3 = Path.home() / ".pmd3" / "bin" / "pymobiledevice3"
+
+DATABASE_PATH = Path(
+    os.environ.get(
+        "LOCATION_SUITE_DATABASE_PATH",
+        PROJECT_ROOT / "data" / "location-suite.sqlite3",
+    )
+)
+
+SEARCH_BASE_URL = os.environ.get(
+    "LOCATION_SUITE_SEARCH_BASE_URL",
+    "https://photon.komoot.io",
+).rstrip("/")
+SEARCH_TIMEOUT = 8
+SEARCH_CACHE_SECONDS = 300
+SEARCH_CACHE_ENTRIES = 128
+HISTORY_LIMIT = 100
 
 TUNNELD_HOST = "127.0.0.1"
 TUNNELD_PORT = 49151

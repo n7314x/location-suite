@@ -1,24 +1,50 @@
 import type {
   Coordinates,
+  Favorite,
+  HistoryItem,
+  SearchResult,
   SimulationResponse,
 } from '../../types/api'
+import { SavedPlaces } from '../places/SavedPlaces'
+import { SearchBox } from '../places/SearchBox'
 
 type Props = {
   selected: Coordinates
+  selectedName: string | null
+  favorites: Favorite[]
+  history: HistoryItem[]
   simulation: SimulationResponse | null
   enabled: boolean
   busy: boolean
   onChange: (coordinates: Coordinates) => void
+  onPlaceSelect: (result: SearchResult) => void
+  onSavedPlaceSelect: (
+    coordinates: Coordinates,
+    name: string | null,
+  ) => void
+  onSaveFavorite: (name: string | null) => void
+  onRenameFavorite: (id: number, name: string) => void
+  onDeleteFavorite: (id: number) => void
+  onClearHistory: () => void
   onTeleport: () => void
   onClear: () => void
 }
 
 export function PointPanel({
   selected,
+  selectedName,
+  favorites,
+  history,
   simulation,
   enabled,
   busy,
   onChange,
+  onPlaceSelect,
+  onSavedPlaceSelect,
+  onSaveFavorite,
+  onRenameFavorite,
+  onDeleteFavorite,
+  onClearHistory,
   onTeleport,
   onClear,
 }: Props) {
@@ -37,6 +63,8 @@ export function PointPanel({
           Route
         </button>
       </div>
+
+      <SearchBox onSelect={onPlaceSelect} />
 
       <section className="sidebar-section">
         <div className="section-heading">
@@ -72,6 +100,10 @@ export function PointPanel({
             }
           />
         </label>
+
+        {selectedName && (
+          <div className="selected-name">{selectedName}</div>
+        )}
       </section>
 
       <section className="sidebar-section actions">
@@ -112,6 +144,17 @@ export function PointPanel({
           </strong>
         </section>
       )}
+
+      <SavedPlaces
+        selectedName={selectedName}
+        favorites={favorites}
+        history={history}
+        onSave={onSaveFavorite}
+        onSelect={onSavedPlaceSelect}
+        onRename={onRenameFavorite}
+        onDelete={onDeleteFavorite}
+        onClearHistory={onClearHistory}
+      />
     </div>
   )
 }

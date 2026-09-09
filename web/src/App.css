@@ -88,7 +88,7 @@
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns: 330px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -162,6 +162,94 @@
   border-color: #69717d;
 }
 
+.search-section {
+  margin-top: 18px;
+}
+
+.search-control {
+  position: relative;
+}
+
+.search-control input {
+  margin-top: 0;
+  padding-right: 76px;
+}
+
+.search-loading {
+  position: absolute;
+  top: 12px;
+  right: 11px;
+  color: #828a95;
+  font-size: 10px;
+  pointer-events: none;
+}
+
+.search-results {
+  position: absolute;
+  z-index: 1100;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  overflow: hidden;
+  border: 1px solid #343a43;
+  border-radius: 9px;
+  background: #181b20;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.42);
+}
+
+.search-result {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 10px 11px;
+  border: 0;
+  border-bottom: 1px solid #292e35;
+  background: transparent;
+  color: #e7e9ec;
+  text-align: left;
+  cursor: pointer;
+}
+
+.search-result.active,
+.search-result:hover {
+  background: #262b32;
+}
+
+.search-result span {
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+}
+
+.search-result small {
+  color: #89919c;
+  font-size: 9px;
+  text-transform: capitalize;
+}
+
+.search-empty,
+.search-attribution {
+  padding: 10px 11px;
+  color: #8d949e;
+  font-size: 10px;
+}
+
+.search-attribution {
+  padding-block: 7px;
+  border-top: 1px solid #292e35;
+  color: #686f79;
+  font-size: 8px;
+}
+
+.selected-name {
+  margin-top: 11px;
+  color: #bcc2ca;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .actions {
   display: grid;
   gap: 9px;
@@ -202,6 +290,144 @@
   background: #181b20;
 }
 
+.favorite-save-row,
+.favorite-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+}
+
+.favorite-save-row input,
+.favorite-editor input {
+  min-width: 0;
+  margin-top: 0;
+}
+
+.favorite-save-row button,
+.favorite-editor button,
+.section-heading.with-action button {
+  border: 1px solid #353b44;
+  border-radius: 8px;
+  background: #20242a;
+  color: #d4d8de;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.favorite-save-row button,
+.favorite-editor button {
+  padding: 0 11px;
+}
+
+.favorite-editor button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.place-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.place-row {
+  overflow: hidden;
+  border: 1px solid #2b3038;
+  border-radius: 9px;
+  background: #181b20;
+}
+
+.place-main,
+.history-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  background: transparent;
+  color: #dfe2e6;
+  text-align: left;
+  cursor: pointer;
+}
+
+.place-main:hover,
+.history-row:hover {
+  background: #20242a;
+}
+
+.place-main strong,
+.history-row strong {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.place-main span,
+.history-row span {
+  color: #7f8792;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.place-actions {
+  display: flex;
+  border-top: 1px solid #292e35;
+}
+
+.place-actions button {
+  flex: 1;
+  padding: 6px;
+  border: 0;
+  background: transparent;
+  color: #808894;
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.place-actions button + button {
+  border-left: 1px solid #292e35;
+}
+
+.place-actions button:hover {
+  background: #20242a;
+  color: #d9dde2;
+}
+
+.favorite-editor {
+  padding: 8px;
+}
+
+.place-empty {
+  padding: 9px 2px;
+  color: #707883;
+  font-size: 10px;
+}
+
+.section-heading.with-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.section-heading.with-action button {
+  padding: 4px 7px;
+  color: #929aa5;
+}
+
+.history-list {
+  max-height: 330px;
+  overflow-y: auto;
+}
+
+.history-row {
+  border: 1px solid #2b3038;
+  border-radius: 9px;
+  background: #181b20;
+}
+
 .card-label {
   margin-bottom: 5px;
   color: #7f8792;
@@ -210,7 +436,7 @@
 }
 
 .error-message {
-  margin-top: 16px;
+  margin-bottom: 16px;
   padding: 11px;
   border: 1px solid #67353d;
   border-radius: 9px;

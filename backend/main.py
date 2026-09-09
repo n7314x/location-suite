@@ -6,14 +6,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.api.routes import (
     device,
     health,
+    places,
+    search,
     simulation,
     tunnel,
 )
 from backend.simulation.manager import simulation_manager
+from backend.storage.database import location_store
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    location_store.initialize()
     try:
         yield
     finally:
@@ -22,7 +26,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Location Suite API",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -61,10 +65,22 @@ app.include_router(
     tags=["simulation"],
 )
 
+app.include_router(
+    search.router,
+    prefix="/api",
+    tags=["search"],
+)
+
+app.include_router(
+    places.router,
+    prefix="/api",
+    tags=["places"],
+)
+
 
 @app.get("/")
 def root():
     return {
         "name": "Location Suite",
-        "version": "0.3.0",
+        "version": "0.4.0",
     }

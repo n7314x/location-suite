@@ -1,12 +1,15 @@
 from fastapi import APIRouter, HTTPException, status
 
-from backend.schemas.location import Location
+from backend.history.service import SimulationHistoryService
+from backend.schemas.location import TeleportRequest
 from backend.simulation.manager import (
     SimulationBusy,
     simulation_manager,
 )
+from backend.storage.database import location_store
 
 router = APIRouter()
+history_service = SimulationHistoryService(location_store)
 
 
 @router.get("/simulation")
@@ -18,11 +21,12 @@ def simulation_status():
     "/simulation/teleport",
     status_code=status.HTTP_202_ACCEPTED,
 )
-def teleport(location: Location):
+def teleport(location: TeleportRequest):
     try:
         operation_id = simulation_manager.teleport(
             location.latitude,
             location.longitude,
+            on_success=history_service.success_callback(location.name),
         )
     except SimulationBusy as exc:
         raise HTTPException(
@@ -59,7 +63,7 @@ def clear():
     "/location/set",
     status_code=status.HTTP_202_ACCEPTED,
 )
-def legacy_set(location: Location):
+def legacy_set(location: TeleportRequest):
     return teleport(location)
 
 

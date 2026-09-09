@@ -1,6 +1,9 @@
 import type {
   Coordinates,
   DeviceResponse,
+  Favorite,
+  HistoryItem,
+  SearchResult,
   SimulationResponse,
   TunnelResponse,
 } from '../types/api'
@@ -14,6 +17,10 @@ async function request<T>(
   options?: RequestInit,
 ): Promise<T> {
   const response = await fetch(`${API}${path}`, options)
+
+  if (response.status === 204) {
+    return undefined as T
+  }
 
   let data: unknown
 
@@ -56,7 +63,10 @@ export function getSimulation() {
   return request<SimulationResponse>('/simulation')
 }
 
-export function teleport(location: Coordinates) {
+export function teleport(
+  location: Coordinates,
+  name: string | null,
+) {
   return request<{
     accepted: boolean
     operationId: string
@@ -65,7 +75,10 @@ export function teleport(location: Coordinates) {
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(location),
+    body: JSON.stringify({
+      ...location,
+      name,
+    }),
   })
 }
 
@@ -75,5 +88,61 @@ export function clearSimulation() {
     operationId: string
   }>('/simulation/clear', {
     method: 'POST',
+  })
+}
+
+export function searchPlaces(
+  query: string,
+  signal?: AbortSignal,
+) {
+  const parameters = new URLSearchParams({
+    q: query,
+  })
+  return request<{ results: SearchResult[] }>(
+    `/search?${parameters.toString()}`,
+    { signal },
+  )
+}
+
+export function getFavorites() {
+  return request<{ favorites: Favorite[] }>('/favorites')
+}
+
+export function createFavorite(
+  location: Coordinates,
+  name: string | null,
+) {
+  return request<{ favorite: Favorite }>('/favorites', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ ...location, name }),
+  })
+}
+
+export function renameFavorite(id: number, name: string) {
+  return request<{ favorite: Favorite }>(`/favorites/${id}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function deleteFavorite(id: number) {
+  return request<void>(`/favorites/${id}`, {
+    method: 'DELETE',
+  })
+}
+
+export function getHistory() {
+  return request<{ history: HistoryItem[] }>('/history')
+}
+
+export function clearHistory() {
+  return request<{ cleared: number }>('/history', {
+    method: 'DELETE',
   })
 }

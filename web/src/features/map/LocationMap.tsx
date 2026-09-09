@@ -3,8 +3,10 @@ import {
   MapContainer,
   Marker,
   TileLayer,
+  useMap,
   useMapEvents,
 } from 'react-leaflet'
+import { useEffect } from 'react'
 
 import type { Coordinates } from '../../types/api'
 
@@ -21,7 +23,30 @@ const locationIcon = L.divIcon({
 
 type Props = {
   selected: Coordinates
+  flyToVersion: number
   onSelect: (coordinates: Coordinates) => void
+}
+
+function FlyToSelection({
+  selected,
+  version,
+}: {
+  selected: Coordinates
+  version: number
+}) {
+  const map = useMap()
+
+  useEffect(() => {
+    if (version > 0) {
+      map.flyTo(
+        [selected.latitude, selected.longitude],
+        Math.max(map.getZoom(), 13),
+        { duration: 0.8 },
+      )
+    }
+  }, [map, selected.latitude, selected.longitude, version])
+
+  return null
 }
 
 function ClickHandler({
@@ -43,6 +68,7 @@ function ClickHandler({
 
 export function LocationMap({
   selected,
+  flyToVersion,
   onSelect,
 }: Props) {
   return (
@@ -81,6 +107,10 @@ export function LocationMap({
       />
 
       <ClickHandler onSelect={onSelect} />
+      <FlyToSelection
+        selected={selected}
+        version={flyToVersion}
+      />
     </MapContainer>
   )
 }
