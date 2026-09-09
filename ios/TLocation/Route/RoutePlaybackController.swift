@@ -167,7 +167,13 @@ final class RoutePlaybackController: ObservableObject {
 
     @discardableResult
     func stop() async -> Bool {
-        guard canStop || state == .error else { return true }
+        let isErrorState: Bool
+        if case .error = state {
+            isErrorState = true
+        } else {
+            isErrorState = false
+        }
+        guard canStop || isErrorState else { return true }
         generation &+= 1
         let stopGeneration = generation
         state = .stopping

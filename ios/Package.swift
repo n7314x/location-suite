@@ -17,6 +17,7 @@ let package = Package(
             name: "RouteEngineTests",
             dependencies: ["RouteEngine"],
             path: "TLocationTests",
+            exclude: ["TLocationTests.swift"],
             sources: ["RouteEngineTests.swift"]
         )
     ]
