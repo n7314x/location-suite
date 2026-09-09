@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - "ios/**"
+      - "contracts/**"
       - ".github/workflows/build-ios-ipa.yml"
   pull_request:
     branches: [main]
     paths:
       - "ios/**"
+      - "contracts/**"
       - ".github/workflows/build-ios-ipa.yml"
   workflow_dispatch:
 
@@ -57,6 +59,7 @@ jobs:
           plutil -lint ios/TLocation/TLocation.entitlements
           python3 -m json.tool ios/TLocation/TLocation.icon/icon.json >/dev/null
           python3 -m json.tool ios/TLocation/InfoPlist.xcstrings >/dev/null
+          python3 -m json.tool contracts/route-v1.schema.json >/dev/null
 
           library_architectures="$(lipo -archs ios/TLocation/idevice/libidevice_ffi.a)"
           echo "libidevice_ffi.a architectures: $library_architectures"
@@ -66,6 +69,9 @@ jobs:
           esac
 
           xcodebuild -project "$PROJECT_PATH" -list
+
+      - name: Test route engine
+        run: swift test --package-path ios
 
       - name: Archive unsigned device app
         run: |

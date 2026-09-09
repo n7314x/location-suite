@@ -24,6 +24,11 @@ private struct CoordinateSnapshot: Equatable {
     }
 }
 
+private enum MapInteractionMode {
+    case point
+    case route
+}
+
 /// Parses coordinates typed or pasted directly into the search field (e.g.
 /// "21.012452, 105.847002"). File-based import (GPX/KML/GeoJSON/CSV) has been
 /// removed; this inline text path is all that remains and must keep working.
@@ -450,6 +455,14 @@ struct LocationSimulationView: View {
     @FocusState private var isSearchFocused: Bool
     @State private var simulatedCoordinate: CLLocationCoordinate2D?
 
+    // Waypoint route creation/playback. The draft belongs to the map UI; all
+    // geometry, timing, state transitions, and device updates live behind the
+    // controller and its independently testable route domain.
+    @State private var interactionMode: MapInteractionMode = .point
+    @State private var routePoints: [RoutePoint] = []
+    @State private var routeIdentifier = LocationRoute.makeIdentifier()
+    @StateObject private var routePlayback = RoutePlaybackController.deviceController()
+
     // Bookmarks
     @State private var bookmarks: [LocationBookmark] = []
     /// Drives the single consolidated `.sheet` below — see `PendingSheet`.
@@ -543,7 +556,27 @@ struct LocationSimulationView: View {
     }
 
     private var hasActiveSimulation: Bool {
-        simulatedCoordinate != nil
+        simulatedCoordinate != nil || routePlayback.isSimulationActive
+    }
+
+    private var preparedRoute: LocationRoute? {
+        try? LocationRoute(
+            id: routeIdentifier,
+            mode: .walking,
+            points: routePoints,
+            speedProfile: .natural,
+            metadata: RouteMetadata(source: .waypoint)
+        )
+    }
+
+    private var routeDistance: Double {
+        (try? RouteGeometry(points: routePoints).totalDistance) ?? 0
+    }
+
+    private var routeCoordinates: [CLLocationCoordinate2D] {
+        routePoints.map {
+            CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
+        }
     }
 
     private var searchResultsListBase: some View {
@@ -692,6 +725,14 @@ struct LocationSimulationView: View {
             )
 
             mapControlButton(
+                systemImage: "figure.walk",
+                accessibilityLabel: "Waypoint Route Mode",
+                isDisabled: hasActiveSimulation || isBusy || !routePlayback.canEditRoute,
+                isSelected: interactionMode == .route,
+                action: toggleRouteMode
+            )
+
+            mapControlButton(
                 systemImage: "bookmark.fill",
                 accessibilityLabel: "Bookmarks",
                 isDisabled: false,
@@ -714,22 +755,28 @@ struct LocationSimulationView: View {
         accessibilityLabel: LocalizedStringKey,
         isDisabled: Bool,
         showsProgress: Bool = false,
+        isSelected: Bool = false,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            Group {
-                if showsProgress {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: systemImage)
-                        .font(.system(size: 17, weight: .semibold))
+            ZStack {
+                if isSelected {
+                    Circle().fill(Color.accentColor)
+                }
+                Group {
+                    if showsProgress {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: systemImage)
+                            .font(.system(size: 17, weight: .semibold))
+                    }
                 }
             }
             .frame(width: 48, height: 48)
             .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.tint)
+        .foregroundStyle(isSelected ? Color.white : Color.accentColor)
         .modifier(FloatingCircleBackground())
         .opacity(isDisabled ? 0.4 : 1)
         .disabled(isDisabled)
@@ -740,7 +787,11 @@ struct LocationSimulationView: View {
     /// message). Given a material backing so it stays legible on a map.
     private var bottomControlCluster: some View {
         VStack(spacing: 12) {
-            pinControls
+            if interactionMode == .route {
+                routeControls
+            } else {
+                pinControls
+            }
         }
         .animation(.default, value: statusMessage)
         .padding(.vertical, 14)
@@ -1012,7 +1063,50 @@ struct LocationSimulationView: View {
                     // pin. Only draws once location permission is granted.
                     UserAnnotation()
 
-                    if let coordinate {
+                    if interactionMode == .route {
+                        if routePoints.count >= 2 {
+                            MapPolyline(coordinates: routeCoordinates)
+                                .stroke(
+                                    Color.accentColor,
+                                    style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round)
+                                )
+                        }
+
+                        ForEach(Array(routePoints.enumerated()), id: \.offset) { index, point in
+                            Annotation(
+                                "Waypoint \(index + 1)",
+                                coordinate: CLLocationCoordinate2D(
+                                    latitude: point.latitude,
+                                    longitude: point.longitude
+                                )
+                            ) {
+                                Text("\(index + 1)")
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.white)
+                                    .frame(width: 26, height: 26)
+                                    .background(Circle().fill(Color.accentColor))
+                                    .overlay(Circle().strokeBorder(.white, lineWidth: 2))
+                                    .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+                            }
+                        }
+
+                        if let current = routePlayback.metrics?.currentCoordinate,
+                           routePlayback.isSimulationActive {
+                            Annotation(
+                                "Simulated Position",
+                                coordinate: CLLocationCoordinate2D(
+                                    latitude: current.latitude,
+                                    longitude: current.longitude
+                                )
+                            ) {
+                                Circle()
+                                    .fill(.green)
+                                    .frame(width: 14, height: 14)
+                                    .overlay(Circle().strokeBorder(.white, lineWidth: 3))
+                                    .shadow(color: .black.opacity(0.35), radius: 3)
+                            }
+                        }
+                    } else if let coordinate {
                         // `Annotation` rather than `Marker` so the information
                         // callout is anchored to the coordinate and pans and
                         // zooms with the map. `.bottom` puts the bottom of the
@@ -1041,7 +1135,7 @@ struct LocationSimulationView: View {
                     // (the annotation is hosted inside the map), so without this
                     // guard tapping Copy or Save would also re-drop the pin a few
                     // metres north of where it is.
-                    if isInsidePinAnnotation(point, proxy: proxy) {
+                    if interactionMode == .point, isInsidePinAnnotation(point, proxy: proxy) {
                         return
                     }
                     if let loc = proxy.convert(point, from: .local) {
@@ -1184,6 +1278,8 @@ struct LocationSimulationView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulateLocationRequested)) { notification in
             guard let requested = LocationSimulationRequest.coordinate(from: notification) else { return }
+            routePlayback.relinquishWithoutClearing()
+            interactionMode = .point
             if LocationSimulationRequest.isAlreadyApplied(notification) {
                 adoptExternalSimulation(at: requested)
             } else {
@@ -1192,10 +1288,20 @@ struct LocationSimulationView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .clearSimulatedLocationRequested)) { notification in
             if LocationSimulationRequest.isAlreadyApplied(notification) {
+                routePlayback.relinquishWithoutClearing()
                 adoptExternalClear()
+            } else if routePlayback.canStop {
+                stopRoute(returnCameraToRealLocation: false)
             } else {
                 clear()
             }
+        }
+        .onChange(of: routePlayback.state) { _, newState in
+            guard case .error(let playbackError) = newState else { return }
+            presentAlert(.message(
+                title: String(localized: "Route Playback Stopped"),
+                body: playbackError.message
+            ))
         }
         .onAppear {
             loadBookmarks()
@@ -1283,6 +1389,209 @@ struct LocationSimulationView: View {
         }
     }
 
+    @ViewBuilder
+    private var routeControls: some View {
+        if let metrics = routePlayback.metrics,
+           routePlayback.state == .starting ||
+           routePlayback.state == .playing ||
+           routePlayback.state == .paused ||
+           routePlayback.state == .stopping ||
+           routePlayback.state == .completed {
+            routePlaybackControls(metrics: metrics)
+        } else {
+            routeEditorControls
+        }
+    }
+
+    private var routeEditorControls: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                Label("Walking", systemImage: "figure.walk")
+                    .font(.subheadline.weight(.semibold))
+
+                if routePoints.count >= 2 {
+                    Text(Self.formattedDistance(routeDistance))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 4)
+
+                Button {
+                    undoLastWaypoint()
+                } label: {
+                    Image(systemName: "arrow.uturn.backward")
+                        .frame(width: 32, height: 32)
+                }
+                .buttonStyle(.plain)
+                .disabled(routePoints.isEmpty || !routePlayback.canEditRoute)
+                .accessibilityLabel("Undo Last Waypoint")
+
+                Button(role: .destructive) {
+                    clearRoute()
+                } label: {
+                    Image(systemName: "trash")
+                        .frame(width: 32, height: 32)
+                }
+                .buttonStyle(.plain)
+                .disabled(routePoints.isEmpty || !routePlayback.canEditRoute)
+                .accessibilityLabel("Clear Route")
+            }
+
+            HStack(spacing: 12) {
+                if routePlayback.isSimulationActive {
+                    Text("Location held at prior destination")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                } else if routePoints.isEmpty {
+                    Text("Tap the map to add the first waypoint")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else if preparedRoute == nil {
+                    Text("Add one more different waypoint")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(routePoints.count) waypoints")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 4)
+
+                if routePlayback.isSimulationActive {
+                    Button("Stop", role: .destructive) {
+                        stopRoute(returnCameraToRealLocation: false)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button {
+                    playRoute()
+                } label: {
+                    Label("Play", systemImage: "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(preparedRoute == nil || !pairingExists || !routePlayback.canEditRoute)
+            }
+        }
+    }
+
+    private func routePlaybackControls(metrics: RouteMetrics) -> some View {
+        VStack(spacing: 9) {
+            HStack(spacing: 8) {
+                Label("Walking", systemImage: "figure.walk")
+                    .font(.subheadline.weight(.semibold))
+
+                Text(routeStateLabel)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(routePlayback.state == .completed ? Color.green : Color.secondary)
+
+                Spacer(minLength: 4)
+
+                if routePlayback.state == .playing {
+                    Text(String(format: "%.1f m/s", metrics.currentSpeed))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            ProgressView(value: metrics.progress)
+                .tint(routePlayback.state == .completed ? Color.green : Color.accentColor)
+                .animation(.linear(duration: Self.routeProgressAnimationDuration), value: metrics.progress)
+
+            HStack(spacing: 8) {
+                Text("\(Self.formattedDistance(metrics.distanceRemaining)) left")
+                Text("•")
+                Text("ETA \(Self.formattedDuration(metrics.estimatedRemainingTime))")
+                Spacer(minLength: 4)
+                Text("\(Int((metrics.progress * 100).rounded()))%")
+            }
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 12) {
+                if routePlayback.state == .starting || routePlayback.state == .stopping {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(routePlayback.state == .starting ? "Starting…" : "Stopping…")
+                        .font(.subheadline)
+                    Spacer()
+                    if routePlayback.state == .starting {
+                        Button("Stop", role: .destructive) {
+                            stopRoute(returnCameraToRealLocation: false)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                } else {
+                    Button {
+                        if routePlayback.state == .playing {
+                            routePlayback.pause()
+                        } else if routePlayback.state == .paused {
+                            routePlayback.resume()
+                        } else {
+                            playRoute()
+                        }
+                    } label: {
+                        Label(
+                            routePlayback.state == .playing ? "Pause" :
+                                (routePlayback.state == .paused ? "Resume" : "Replay"),
+                            systemImage: routePlayback.state == .playing ? "pause.fill" : "play.fill"
+                        )
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Spacer()
+
+                    Button("Stop", role: .destructive) {
+                        stopRoute(returnCameraToRealLocation: false)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            if routePlayback.state == .completed {
+                Text("Arrived — Stop returns to real GPS")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private static let routeProgressAnimationDuration = RoutePlaybackController.updateInterval
+
+    private var routeStateLabel: String {
+        switch routePlayback.state {
+        case .idle: return String(localized: "Idle")
+        case .ready: return String(localized: "Ready")
+        case .starting: return String(localized: "Starting")
+        case .playing: return String(localized: "Playing")
+        case .paused: return String(localized: "Paused")
+        case .stopping: return String(localized: "Stopping")
+        case .completed: return String(localized: "Arrived")
+        case .error: return String(localized: "Stopped")
+        }
+    }
+
+    private static func formattedDistance(_ meters: Double) -> String {
+        let safeMeters = meters.isFinite ? max(meters, 0) : 0
+        if safeMeters < 1_000 {
+            return String(format: "%.0f m", safeMeters)
+        }
+        return String(format: "%.2f km", safeMeters / 1_000)
+    }
+
+    private static func formattedDuration(_ seconds: TimeInterval) -> String {
+        let safeSeconds = seconds.isFinite ? max(seconds, 0) : 0
+        let roundedMinutes = Int((safeSeconds / 60).rounded(.up))
+        if roundedMinutes < 1 { return "<1 min" }
+        if roundedMinutes < 60 { return "\(roundedMinutes) min" }
+        let hours = roundedMinutes / 60
+        let minutes = roundedMinutes % 60
+        return minutes == 0 ? "\(hours) hr" : "\(hours) hr \(minutes) min"
+    }
+
     /// Shows a transient, non-modal message in the bottom control area (above
     /// the Stop / Simulate buttons, or in place of the "Tap map to drop pin"
     /// hint when there is no pin) and clears it automatically after
@@ -1295,6 +1604,74 @@ struct LocationSimulationView: View {
         let workItem = DispatchWorkItem { statusMessage = nil }
         statusMessageWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.statusMessageDuration, execute: workItem)
+    }
+
+    private func toggleRouteMode() {
+        guard !hasActiveSimulation, !isBusy, routePlayback.canEditRoute else { return }
+        interactionMode = interactionMode == .route ? .point : .route
+        dismissSearch()
+        Haptics.light()
+    }
+
+    private func addWaypoint(_ coordinate: CLLocationCoordinate2D, recenter: Bool) {
+        guard routePlayback.canEditRoute,
+              let point = try? RoutePoint(
+                  latitude: coordinate.latitude,
+                  longitude: coordinate.longitude
+              ) else { return }
+        routePoints.append(point)
+        syncPreparedRoute()
+        if recenter { recenterCamera(on: coordinate) }
+        Haptics.light()
+    }
+
+    private func undoLastWaypoint() {
+        guard routePlayback.canEditRoute, !routePoints.isEmpty else { return }
+        routePoints.removeLast()
+        syncPreparedRoute()
+        Haptics.light()
+    }
+
+    private func clearRoute() {
+        guard routePlayback.canEditRoute else { return }
+        routePoints.removeAll()
+        routeIdentifier = LocationRoute.makeIdentifier()
+        routePlayback.removePreparedRoute()
+        Haptics.light()
+    }
+
+    private func syncPreparedRoute() {
+        if let preparedRoute {
+            routePlayback.prepare(preparedRoute)
+        } else {
+            routePlayback.removePreparedRoute()
+        }
+    }
+
+    private func playRoute() {
+        guard pairingExists, let route = preparedRoute, routePlayback.canEditRoute else { return }
+        Task { await routePlayback.play(route) }
+    }
+
+    private func stopRoute(returnCameraToRealLocation: Bool) {
+        guard routePlayback.canStop else { return }
+        if returnCameraToRealLocation {
+            isReturningToRealLocation = true
+        }
+        Task {
+            let didClear = await routePlayback.stop()
+            if returnCameraToRealLocation {
+                isReturningToRealLocation = false
+            }
+            guard didClear else { return }
+            currentLocationProvider.refreshTracking()
+            if returnCameraToRealLocation {
+                position = .userLocation(fallback: .automatic)
+            }
+            showStatusMessage(
+                String(localized: "Simulation stopped — map is waiting for your real location (slower indoors)")
+            )
+        }
     }
 
     private func simulate() {
@@ -1678,6 +2055,10 @@ struct LocationSimulationView: View {
     ///   point that is off screen. Pass `false` for map taps, where the point is
     ///   already visible and moving the camera would destroy the user's zoom.
     private func applySelection(_ coordinate: CLLocationCoordinate2D, recenter: Bool = true) {
+        if interactionMode == .route {
+            addWaypoint(coordinate, recenter: recenter)
+            return
+        }
         self.coordinate = coordinate
         if recenter {
             recenterCamera(on: coordinate)
@@ -1717,6 +2098,10 @@ struct LocationSimulationView: View {
     /// guaranteed to be running at the moment the camera is handed back to
     /// `.userLocation` below.
     private func returnToRealLocation() {
+        if routePlayback.canStop {
+            stopRoute(returnCameraToRealLocation: true)
+            return
+        }
         // Mirrors `clear()`'s own guard, so the spinner flag below can never be
         // left set by a call that clear() drops on the floor.
         guard hasActiveSimulation, pairingExists, !isBusy else { return }

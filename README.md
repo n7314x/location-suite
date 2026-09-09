@@ -45,3 +45,7 @@ signing files are stored in this repository.
 
 See [Mobile milestone 1](docs/ios/mobile-milestone-1.md) for the architecture,
 build details, permissions, installation steps, and real-device test checklist.
+
+Manual waypoint walking routes, their shared v1 JSON contract, playback
+lifecycle, and background-execution boundary are documented in
+[Route engine milestone 1](docs/ios/route-engine-milestone-1.md).
