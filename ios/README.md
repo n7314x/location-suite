@@ -10,7 +10,7 @@ A minimal iOS app that does one thing: **simulate your device's GPS location** â
 - **Locate Me** button: centers the map on your real GPS position
 - **Return to Real Location** button: clears the simulated location and restores your device's real GPS position (only enabled while a simulation is active)
 - Bookmarks for frequent locations
-- Keeps simulating in the background (silent-audio + low-accuracy-location keep-alive)
+- Keeps simulating in the background (low-accuracy background-location keep-alive plus periodic session resends)
 - URL scheme: `tlocation://simulate-location?lat=37.3349&lon=-122.0090`, `tlocation://clear-location`
 
 ## Requirements

@@ -456,12 +456,12 @@
 					"$(PROJECT_DIR)/TLocation/idevice",
 				);
 				INFOPLIST_FILE = TLocation/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = TLocation;
+				INFOPLIST_KEY_CFBundleDisplayName = "Location Suite";
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "TLocation needs access to devices on your local network to connect to this device and simulate its location.";
-				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "TLocation uses your location to center the map on your position and to keep location simulation running in the background.";
-				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "TLocation uses your location to center the map on your position and to keep location simulation running in the background.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Location Suite needs access to devices on your local network to connect to this device and simulate its location.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Location Suite uses your location to center the map on your position and to keep location simulation running in the background.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Location Suite uses your location to center the map on your position and to keep location simulation running in the background.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -520,12 +520,12 @@
 					"$(PROJECT_DIR)/TLocation/idevice",
 				);
 				INFOPLIST_FILE = TLocation/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = TLocation;
+				INFOPLIST_KEY_CFBundleDisplayName = "Location Suite";
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "TLocation needs access to devices on your local network to connect to this device and simulate its location.";
-				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "TLocation uses your location to center the map on your position and to keep location simulation running in the background.";
-				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "TLocation uses your location to center the map on your position and to keep location simulation running in the background.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Location Suite needs access to devices on your local network to connect to this device and simulate its location.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Location Suite uses your location to center the map on your position and to keep location simulation running in the background.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Location Suite uses your location to center the map on your position and to keep location simulation running in the background.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;

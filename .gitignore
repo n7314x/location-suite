@@ -24,3 +24,27 @@ data/*.sqlite3
 # Build outputs
 build/
 DerivedData/
+*.xcarchive/
+*.ipa
+*.dSYM
+Payload/
+
+# Apple signing material and device pairing records
+*.mobileprovision
+*.p12
+*.pfx
+*.cer
+*.key
+*.pem
+*.mobiledevicepairing
+*.mobiledevicepair
+pairingFile.plist
+rp_pairing_file.plist
+
+# Local databases outside the default data directory
+*.db
+*.sqlite
+*.sqlite3
+
+# Xcode user state
+xcuserdata/

@@ -33,3 +33,15 @@ Place search is proxied by the backend through Photon, using OpenStreetMap
 data. The public Photon demo is suitable for moderate development use but has
 no availability guarantee. Set `LOCATION_SUITE_SEARCH_BASE_URL` to switch to a
 self-hosted or compatible Photon instance without changing the frontend.
+
+## iOS IPA
+
+The `Build iOS IPA` GitHub Actions workflow archives the existing TLocation-derived
+device target without code signing, packages `Payload/TLocation.app` as
+`LocationSuite.ipa`, validates the package, and uploads it in the
+`LocationSuite-IPA` workflow artifact. SideStore supplies the personal-development
+signature and provisioning profile during installation; no Apple credentials or
+signing files are stored in this repository.
+
+See [Mobile milestone 1](docs/ios/mobile-milestone-1.md) for the architecture,
+build details, permissions, installation steps, and real-device test checklist.
