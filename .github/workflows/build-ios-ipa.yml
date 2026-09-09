@@ -55,7 +55,8 @@ jobs:
 
           plutil -lint ios/TLocation/Info.plist
           plutil -lint ios/TLocation/TLocation.entitlements
-          plutil -lint ios/TLocation/TLocation.icon/icon.json
+          python3 -m json.tool ios/TLocation/TLocation.icon/icon.json >/dev/null
+          python3 -m json.tool ios/TLocation/InfoPlist.xcstrings >/dev/null
 
           library_architectures="$(lipo -archs ios/TLocation/idevice/libidevice_ffi.a)"
           echo "libidevice_ffi.a architectures: $library_architectures"
