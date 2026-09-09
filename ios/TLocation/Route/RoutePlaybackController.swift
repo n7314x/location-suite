@@ -140,9 +140,12 @@ final class RoutePlaybackController: ObservableObject {
             guard run == generation, state == .starting else { return }
             updateInFlight = false
             heldCoordinate = initialCoordinate
+            let wasAlreadyActive = isSimulationActive
             isSimulationActive = true
             lastDeviceUpdateTime = ProcessInfo.processInfo.systemUptime
-            activityManager.simulationDidStart()
+            if !wasAlreadyActive {
+                activityManager.simulationDidStart()
+            }
             state = .playing
             lastAdvanceTime = ProcessInfo.processInfo.systemUptime
             ensureTimerIfNeeded()
