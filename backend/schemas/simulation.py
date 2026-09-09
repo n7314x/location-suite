@@ -8,3 +8,6 @@ class SimulationSnapshot(BaseModel):
     operationId: str | None = None
     location: Location | None = None
     error: str | None = None
+    maintenanceActive: bool = False
+    consecutiveFailures: int = 0
+    lastSuccessfulUpdate: str | None = None

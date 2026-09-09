@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -7,10 +9,21 @@ from backend.api.routes import (
     simulation,
     tunnel,
 )
+from backend.simulation.manager import simulation_manager
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        simulation_manager.shutdown()
+
 
 app = FastAPI(
     title="Location Suite API",
     version="0.3.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

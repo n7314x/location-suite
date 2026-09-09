@@ -36,4 +36,7 @@ export type SimulationResponse = {
   operationId: string | null
   location: Coordinates | null
   error: string | null
+  maintenanceActive: boolean
+  consecutiveFailures: number
+  lastSuccessfulUpdate: string | null
 }

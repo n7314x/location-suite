@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 
 from backend.core.config import PMD3
+
+
+_command_lock = threading.Lock()
 
 
 @dataclass
@@ -49,39 +53,43 @@ def run_pmd3(
     args: list[str],
     timeout: int = 30,
 ) -> CommandResult:
-    if not PMD3.exists():
+    # Keep short-lived CLI probes/enumeration in one lane. Persistent location
+    # simulation uses the Python DVT API directly and never holds this lock, so
+    # status polling remains available while a simulation session is open.
+    with _command_lock:
+        if not PMD3.exists():
+            return CommandResult(
+                returncode=None,
+                stdout="",
+                stderr=f"pymobiledevice3 not found at {PMD3}",
+            )
+
+        try:
+            result = subprocess.run(
+                [str(PMD3), *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+
+            return CommandResult(
+                returncode=None,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=True,
+            )
+
         return CommandResult(
-            returncode=None,
-            stdout="",
-            stderr=f"pymobiledevice3 not found at {PMD3}",
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
         )
-
-    try:
-        result = subprocess.run(
-            [str(PMD3), *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-
-        return CommandResult(
-            returncode=None,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=True,
-        )
-
-    return CommandResult(
-        returncode=result.returncode,
-        stdout=result.stdout,
-        stderr=result.stderr,
-    )
