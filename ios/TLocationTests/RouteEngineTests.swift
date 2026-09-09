@@ -112,6 +112,17 @@ struct RouteGeometryTests {
         let midpoint = RouteGeometry.interpolate(from: west, to: east, fraction: 0.5)
         #expect(abs(abs(midpoint.longitude) - 180) < 0.000_001)
     }
+
+    @Test func interpolationNearThePoleAlwaysProducesAValidCoordinate() throws {
+        let first = try point(89.999_999, -120)
+        let second = try point(89.999_999, 120)
+        let midpoint = RouteGeometry.interpolate(from: first, to: second, fraction: 0.5)
+
+        #expect(midpoint.latitude.isFinite)
+        #expect(midpoint.longitude.isFinite)
+        #expect((-90...90).contains(midpoint.latitude))
+        #expect((-180...180).contains(midpoint.longitude))
+    }
 }
 
 struct WalkingPlaybackEngineTests {

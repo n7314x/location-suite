@@ -143,9 +143,10 @@ struct RouteGeometry: Equatable, Sendable {
                 from: radians(start.longitude),
                 to: radians(end.longitude)
             ))
-            return try! RoutePoint(
+            return validatedInterpolatedPoint(
                 latitude: latitude,
-                longitude: normalizedLongitude(start.longitude + longitudeDelta * amount)
+                longitude: normalizedLongitude(start.longitude + longitudeDelta * amount),
+                fallback: amount < 0.5 ? start : end
             )
         }
 
@@ -157,7 +158,11 @@ struct RouteGeometry: Equatable, Sendable {
         let latitude = atan2(z, sqrt(x * x + y * y))
         let longitude = atan2(y, x)
 
-        return try! RoutePoint(latitude: degrees(latitude), longitude: degrees(longitude))
+        return validatedInterpolatedPoint(
+            latitude: degrees(latitude),
+            longitude: degrees(longitude),
+            fallback: amount < 0.5 ? start : end
+        )
     }
 
     private static func unitVector(for point: RoutePoint) -> (x: Double, y: Double, z: Double) {
@@ -190,6 +195,23 @@ struct RouteGeometry: Equatable, Sendable {
         while value > 180 { value -= 360 }
         while value < -180 { value += 360 }
         return value
+    }
+
+    /// `atan2` mathematically produces a latitude in -90...90, but floating
+    /// point conversion at a pole can overshoot by a few ulps. Clamp that noise
+    /// before passing through the same validation as every other route point;
+    /// the fallback makes this total even if a future math change yields a
+    /// non-finite value.
+    private static func validatedInterpolatedPoint(
+        latitude: Double,
+        longitude: Double,
+        fallback: RoutePoint
+    ) -> RoutePoint {
+        guard latitude.isFinite, longitude.isFinite else { return fallback }
+        return (try? RoutePoint(
+            latitude: min(max(latitude, -90), 90),
+            longitude: min(max(longitude, -180), 180)
+        )) ?? fallback
     }
 
     private static func radians(_ degrees: Double) -> Double { degrees * .pi / 180 }
