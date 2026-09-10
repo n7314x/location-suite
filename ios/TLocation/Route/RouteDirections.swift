@@ -72,7 +72,14 @@ struct RouteDirectionsResolver: Sendable {
             } catch is CancellationError {
                 throw RouteDirectionsError.cancelled
             } catch let error as RouteDirectionsError {
-                throw error
+                switch error {
+                case .noRoute:
+                    throw RouteDirectionsError.noRoute(index: index)
+                case .segmentFailed(_, let message):
+                    throw RouteDirectionsError.segmentFailed(index: index, message: message)
+                case .cancelled, .superseded:
+                    throw error
+                }
             } catch {
                 throw RouteDirectionsError.segmentFailed(
                     index: index,
