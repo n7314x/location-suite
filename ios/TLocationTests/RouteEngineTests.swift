@@ -311,6 +311,7 @@ private actor FakeRouteSink: RouteLocationSimulationSink {
     private let ownership: LocationSimulationOwnership
     private(set) var coordinates: [RoutePoint] = []
     private(set) var clearCount = 0
+    private(set) var disconnectCount = 0
     private(set) var sessionWasOpenForCoordinate: [Bool] = []
     private var nextFailure: RoutePlaybackFailure?
     private var blockNextUpdate = false
@@ -353,6 +354,10 @@ private actor FakeRouteSink: RouteLocationSimulationSink {
 
     func clear() async throws {
         clearCount += 1
+    }
+
+    func disconnect() async throws {
+        disconnectCount += 1
         ownership.setSessionOpen(false)
     }
 
@@ -784,7 +789,7 @@ struct RoutePlaybackControllerTests {
         #expect(clearCount == 0)
     }
 
-    @Test func explicitReturnIsTheOnlyOperationThatClosesWarmSession() async throws {
+    @Test func explicitReturnClearsButPreservesWarmSession() async throws {
         let ownership = LocationSimulationOwnership()
         ownership.setSessionOpen(true)
         let (controller, sink, _, _) = makeController(ownership: ownership)
@@ -796,8 +801,12 @@ struct RoutePlaybackControllerTests {
         let countAfterReturn = await sink.clearCount
         #expect(countBeforeReturn == 0)
         #expect(returned)
-        #expect(!ownership.isSessionOpen)
+        #expect(ownership.isSessionOpen)
         #expect(countAfterReturn == 1)
+
+        await controller.play(try standardRoute(id: "route_after_return"))
+        #expect(controller.state == .playing)
+        #expect(ownership.isSessionOpen)
     }
 
     @Test func returnFromPointInvalidatesProducerAndClearsExactlyOnce() async throws {
@@ -812,7 +821,24 @@ struct RoutePlaybackControllerTests {
         let clearCount = await sink.clearCount
         #expect(returnedLease == pointLease)
         #expect(ownership.currentProducer == .none)
-        #expect(!ownership.isSessionOpen)
+        #expect(ownership.isSessionOpen)
         #expect(clearCount == 1)
+    }
+
+    @Test func disconnectSessionFullyTearsDownAndRetiresProducer() async throws {
+        let ownership = LocationSimulationOwnership()
+        ownership.setSessionOpen(true)
+        let (controller, sink, activity, _) = makeController(ownership: ownership)
+        await controller.play(try standardRoute())
+
+        let disconnected = await controller.disconnectSession()
+
+        #expect(disconnected)
+        #expect(!ownership.isSessionOpen)
+        #expect(ownership.currentProducer == .none)
+        #expect(!controller.isSimulationActive)
+        #expect(activity.ends == 1)
+        let disconnectCount = await sink.disconnectCount
+        #expect(disconnectCount == 1)
     }
 }

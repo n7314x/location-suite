@@ -65,6 +65,7 @@ protocol RouteLocationSimulationSink: Sendable {
         lease: LocationSimulationProducerLease
     ) async throws
     func clear() async throws
+    func disconnect() async throws
 }
 
 @MainActor
@@ -325,6 +326,39 @@ final class RoutePlaybackController: ObservableObject {
             // A failed explicit clear must never start resending and accidentally
             // resurrect a simulation the user asked to end.
             finishClear(lease: lease, connectionUnavailable: failure.marksConnectionUnavailable)
+            state = .error(RoutePlaybackError(reason: failure.reason, message: failure.message))
+            return false
+        }
+    }
+
+    /// Clears any active fake coordinate and intentionally tears down the warm
+    /// transport. This destructive lifecycle operation is exposed in Settings.
+    @discardableResult
+    func disconnectSession() async -> Bool {
+        generation &+= 1
+        let disconnectGeneration = generation
+        let lease = producerLease
+        ownership.invalidateAll()
+        producerLease = nil
+        state = .clearing
+        recoveryState = nil
+        updateInFlight = true
+        lastAdvanceTime = nil
+
+        do {
+            try await sink.disconnect()
+            guard disconnectGeneration == generation else { return false }
+            updateInFlight = false
+            finishClear(lease: lease, connectionUnavailable: false)
+            return true
+        } catch {
+            guard disconnectGeneration == generation else { return false }
+            updateInFlight = false
+            let failure = normalizedFailure(
+                error,
+                fallback: "The session was disconnected, but real GPS could not be confirmed."
+            )
+            finishClear(lease: lease, connectionUnavailable: true)
             state = .error(RoutePlaybackError(reason: failure.reason, message: failure.message))
             return false
         }

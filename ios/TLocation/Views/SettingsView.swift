@@ -138,6 +138,8 @@ struct SettingsView: View {
     /// change the user makes over in system Settings.
     @ObservedObject private var backgroundLocation = BackgroundLocationManager.shared
     @State private var simulationSessionOpen = LocationSimulationSession.isOpen
+    @State private var simulationActive = LocationSimulationSession.isActive
+    @State private var isDisconnectingSession = false
 
     /// Watched, not owned. Holds the last signing expiry read from the device;
     /// this view shows it and asks for a refresh, and never reads the app bundle.
@@ -223,6 +225,21 @@ struct SettingsView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
+
+                    Button(role: .destructive) {
+                        isDisconnectingSession = true
+                        NotificationCenter.default.post(
+                            name: .disconnectSimulationSessionRequested,
+                            object: nil
+                        )
+                    } label: {
+                        Label("Disconnect Session", systemImage: "bolt.slash")
+                    }
+                    .disabled(!simulationSessionOpen || isDisconnectingSession)
+
+                    Text("Disconnect Session returns to real GPS and closes the warm developer connection. Return on the map keeps it available for later LTE use.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Bookmarks") {
@@ -286,20 +303,28 @@ struct SettingsView: View {
                 Section("Connection Diagnostics") {
                     diagnosticRow("Underlying Network", value: tunnel.underlyingNetwork.rawValue)
                     diagnosticRow(
-                        "LocalDevVPN Endpoint Reachable",
+                        "Fresh LocalDevVPN Endpoint Reachable",
                         value: tunnel.endpointReachability.rawValue
                     )
                     diagnosticRow(
-                        "RemotePairing Connected",
+                        "RemotePairing Transport",
                         value: tunnel.isConnected ? String(localized: "Yes") : String(localized: "No")
                     )
                     diagnosticRow(
-                        "Developer Disk Image Ready",
+                        "DDI Ready",
                         value: mounting.coolisMounted ? String(localized: "Yes") : String(localized: "No")
                     )
                     diagnosticRow(
-                        "Simulation Session Open",
+                        "Simulation Service Session",
                         value: simulationSessionOpen ? String(localized: "Yes") : String(localized: "No")
+                    )
+                    diagnosticRow(
+                        "Simulation Active",
+                        value: simulationActive ? String(localized: "Yes") : String(localized: "No")
+                    )
+                    diagnosticRow(
+                        "Coordinate Producer",
+                        value: String(describing: LocationSimulationOwnership.shared.currentProducer).capitalized
                     )
                     diagnosticRow("Target", value: "\(DeviceConnectionContext.targetIPAddress):49152")
 
@@ -364,6 +389,8 @@ struct SettingsView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .locationSimulationSessionChanged)) { _ in
                 simulationSessionOpen = LocationSimulationSession.isOpen
+                simulationActive = LocationSimulationSession.isActive
+                if !simulationSessionOpen { isDisconnectingSession = false }
             }
         }
         // The exporter lives on its own invisible subview (rather than chained

@@ -35,6 +35,10 @@ extension Notification.Name {
     /// use this edge to distinguish a warm live session from the ability to
     /// create a fresh TCP/RemotePairing connection.
     static let locationSimulationSessionChanged = Notification.Name("vn.truongkma.tlocation.locationSimulationSessionChanged")
+
+    /// Ask the map owner to retire every producer, restore real GPS, and destroy
+    /// the warm transport. This is separate from Return/clear by design.
+    static let disconnectSimulationSessionRequested = Notification.Name("vn.truongkma.tlocation.disconnectSimulationSessionRequested")
 }
 
 enum LocationSimulationRequest {

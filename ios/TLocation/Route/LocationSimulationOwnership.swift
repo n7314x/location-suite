@@ -9,7 +9,7 @@ import Foundation
 ///
 /// Producer ownership is deliberately independent from the device session. A
 /// point can hand its lease to a route (and back again) while `sessionOpen`
-/// remains true. Only an explicit Return operation closes that session.
+/// remains true. Return preserves it; only Disconnect Session closes it.
 enum LocationSimulationProducer: Equatable, Sendable {
     case none
     case point

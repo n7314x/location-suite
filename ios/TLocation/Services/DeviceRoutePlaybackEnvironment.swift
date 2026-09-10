@@ -60,6 +60,11 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
         guard code == 0 else { throw Self.failure(for: code, clearing: true) }
     }
 
+    func disconnect() async throws {
+        let code = await runOnLocationCommandQueue { disconnect_location_simulation_session() }
+        guard code == 0 else { throw Self.failure(for: code, clearing: true) }
+    }
+
     private func runOnLocationCommandQueue<T: Sendable>(
         _ operation: @escaping @Sendable () -> T
     ) async -> T {

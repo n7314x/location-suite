@@ -312,6 +312,8 @@ private enum LocationSimulationState {
     static var locationSimulation: OpaquePointer?
 
     static func cleanup() {
+        // `location_simulation_new` borrows its RemoteServerClient. Release the
+        // borrowing child first, then its server and RSD transport parents.
         if let locationSimulation {
             location_simulation_free(locationSimulation)
             self.locationSimulation = nil
@@ -328,9 +330,9 @@ private enum LocationSimulationState {
             adapter_free(adapter)
             self.adapter = nil
         }
-        // Every teardown goes through here — the rebuild in `simulate_location`,
-        // each failure path, and `clear_simulated_location` — so this is the one
-        // place that has to retract the flag.
+        // Every destructive teardown goes through here — rebuild failures and
+        // explicit Disconnect Session — so both service and activity retract.
+        LocationSimulationSession.set(active: false)
         LocationSimulationSession.set(open: false)
     }
 }
@@ -367,6 +369,7 @@ private enum LocationSimulationState {
 enum LocationSimulationSession {
     private static let lock = NSLock()
     private static var open = false
+    private static var active = false
     private static var maintained = false
 
     static var isOpen: Bool {
@@ -377,6 +380,12 @@ enum LocationSimulationSession {
         lock.lock()
         defer { lock.unlock() }
         return maintained
+    }
+
+    static var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active
     }
 
     /// Called by the map's resend loop as it starts and stops. Main thread only,
@@ -400,6 +409,15 @@ enum LocationSimulationSession {
         LocationSimulationOwnership.shared.setSessionOpen(newValue)
         if didChange { postSessionChanged() }
         if didClose { postSessionEnded() }
+    }
+
+    fileprivate static func set(active newValue: Bool) {
+        lock.lock()
+        let didChange = active != newValue
+        active = newValue
+        lock.unlock()
+
+        if didChange { postSessionChanged() }
     }
 
     /// Posted off the lock (a notification handler must never run under it) and
@@ -434,6 +452,7 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
             idevice_error_free(ffiError)
             LocationSimulationState.cleanup()
         } else {
+            LocationSimulationSession.set(active: true)
             return LocationSimulationStatus.ok
         }
     }
@@ -520,30 +539,9 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         return LocationSimulationStatus.locationSimulation
     }
 
-    // UNRESOLVED — do not "fix" this without checking upstream first.
-    //
-    // Dropping the remote-server handle here assumes `location_simulation_new`
-    // took ownership of it, so freeing it in `cleanup()` would be a double free.
-    // The header does not say that. `idevice.h`'s doc comment for
-    // `location_simulation_new` (the `RemoteServerHandle *server` overload)
-    // lists only "`server` must be a valid pointer to a handle allocated by this
-    // library" and documents no transfer — while the iOS-16-and-below sibling
-    // `lockdown_location_simulation_new` in the same header states outright that
-    // "Ownership of the `IdeviceHandle` is transferred to this function". A
-    // library that says so where it means it, and is silent here, points the
-    // other way: this nil-out probably leaks one remote-server handle and its
-    // socket per session, for the life of the process.
-    //
-    // It is left exactly as it is regardless, because the two mistakes are not
-    // symmetric. Leaking a handle per session costs a socket; freeing a handle
-    // the Rust side still owns is a double free and a crash on a user's device,
-    // on the *success* path of the app's main feature. This line predates all
-    // recorded history here and has never been observed to misbehave, so the
-    // only thing that can settle it is reading the upstream Rust implementation
-    // of `location_simulation_new` (does it consume the `RemoteServerHandle` via
-    // `Box::from_raw`, or borrow it?) — not reasoning about the header, and not
-    // an experiment on a device.
-    LocationSimulationState.remoteServer = nil
+    // Confirmed against jkcoxson/idevice's Rust FFI implementation: this call
+    // obtains `&mut (*server).0`; it does not consume the server's Box. Retain
+    // the pointer and free it exactly once after the borrowing child.
 
     // The session handle now exists. Published here rather than after the
     // `location_simulation_set` below because from this point on there is
@@ -569,6 +567,8 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         return LocationSimulationStatus.locationSet
     }
 
+    LocationSimulationSession.set(active: true)
+
     // Only the freshly built session is logged. The early return above — the
     // path the 4-second resend loop takes on every tick — deliberately stays
     // silent, so this line marks a user-initiated simulation (or a rebuild
@@ -580,26 +580,9 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
     return LocationSimulationStatus.ok
 }
 
-/// How long the connection stack is held open after a successful
-/// `location_simulation_clear` before it is torn down.
-///
-/// `location_simulation_clear` is documented in `idevice.h` only as "Clears the
-/// location set … an IdeviceFfiError on error, null on success" — nothing
-/// promises the device has *acted* on the clear by the time it returns, and
-/// `location_simulation_free`/`remote_server_free`/`rsd_handshake_free`/
-/// `adapter_free` document no ordering requirement beyond "the handle must be
-/// valid or NULL". Freeing the handle and collapsing the tunnel microseconds
-/// later was therefore able to abort the clear in flight while the call still
-/// reported success — matching the observed symptom of a successful return with
-/// the device still simulating, intermittently.
-///
-/// 300 ms is roughly two orders of magnitude more than a round trip over the
-/// local RSD tunnel (single-digit milliseconds), which is ample headroom for a
-/// race that only lost occasionally, while staying under the ~400 ms at which a
-/// button tap stops feeling immediate. It is spent on the serial
-/// `LocationSimulationCommandQueue`, never on the main thread.
-private let locationClearSettleInterval: TimeInterval = 0.3
-
+/// Returns to real GPS while preserving the proven warm DVT/RSD transport and
+/// LocationSimulation channel. Upstream waits for the clear reply and leaves
+/// this handle valid for a later `set`.
 func clear_simulated_location() -> Int32 {
     guard let locationSimulation = LocationSimulationState.locationSimulation else {
         LogManager.shared.addErrorLog(
@@ -613,20 +596,40 @@ func clear_simulated_location() -> Int32 {
             "clear_simulated_location failed (code \(LocationSimulationStatus.locationClear)): the device rejected the clear — \(IdeviceBridge.detail(from: ffiError))"
         )
         idevice_error_free(ffiError)
-        // A rejected clear means the session is of no further use, so it is torn
-        // down immediately: a non-zero return still leaves nothing allocated.
+        // A failed real service operation is authoritative evidence that this
+        // warm session is no longer usable.
         LocationSimulationState.cleanup()
         return LocationSimulationStatus.locationClear
     }
 
-    // See `locationClearSettleInterval`: give the device the connection it needs
-    // to actually process the clear before the stack that carries it is freed.
-    Thread.sleep(forTimeInterval: locationClearSettleInterval)
-    LocationSimulationState.cleanup()
+    LocationSimulationSession.set(active: false)
 
     LogManager.shared.addInfoLog(
-        "clear_simulated_location: the device accepted the clear; session closed after a \(Int(locationClearSettleInterval * 1000)) ms settle"
+        "clear_simulated_location: the device accepted the clear; warm session retained"
     )
 
     return LocationSimulationStatus.ok
+}
+
+/// Intentionally destroys the warm connection. If a fake coordinate is active,
+/// ask the device to restore real GPS first; resources are released either way.
+func disconnect_location_simulation_session() -> Int32 {
+    var result = LocationSimulationStatus.ok
+    if LocationSimulationSession.isActive,
+       let locationSimulation = LocationSimulationState.locationSimulation,
+       let ffiError = location_simulation_clear(locationSimulation) {
+        LogManager.shared.addErrorLog(
+            "disconnect_location_simulation_session: clear failed before teardown — \(IdeviceBridge.detail(from: ffiError))"
+        )
+        idevice_error_free(ffiError)
+        result = LocationSimulationStatus.locationClear
+    }
+
+    LocationSimulationState.cleanup()
+    LogManager.shared.addInfoLog(
+        result == LocationSimulationStatus.ok
+            ? "disconnect_location_simulation_session: session disconnected"
+            : "disconnect_location_simulation_session: session disconnected after clear failure"
+    )
+    return result
 }

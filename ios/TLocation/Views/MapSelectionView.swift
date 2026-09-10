@@ -1314,6 +1314,9 @@ struct LocationSimulationView: View {
                 clear()
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .disconnectSimulationSessionRequested)) { _ in
+            disconnectSession()
+        }
         .onChange(of: routePlayback.state) { _, newState in
             guard case .error(let playbackError) = newState else { return }
             presentAlert(.message(
@@ -1882,6 +1885,21 @@ struct LocationSimulationView: View {
             // or no authorization yet) — see `refreshTracking()`.
             currentLocationProvider.refreshTracking()
             onCleared?()
+        }
+    }
+
+    private func disconnectSession() {
+        LocationSimulationOwnership.shared.invalidateAll()
+        stopPointProducer()
+
+        Task {
+            let disconnected = await routePlayback.disconnectSession()
+            currentLocationProvider.refreshTracking()
+            position = .userLocation(fallback: .automatic)
+            markTunnelDisconnected()
+            if disconnected {
+                showStatusMessage(String(localized: "Simulation session disconnected"))
+            }
         }
     }
 
