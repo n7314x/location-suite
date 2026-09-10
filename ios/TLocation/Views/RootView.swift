@@ -105,7 +105,15 @@ struct RootView: View {
     private let statusTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     private var isReady: Bool {
-        pairingExists && tunnel.isConnected && mounting.coolisMounted
+        pairingExists
+            && (
+                LocationSimulationSession.isMaintained
+                    || PhoneLocalConnectionPolicy.isReady(
+                        endpointReachability: tunnel.endpointReachability,
+                        remotePairingConnected: tunnel.isConnected
+                    )
+            )
+            && mounting.coolisMounted
     }
 
     var body: some View {
@@ -370,7 +378,7 @@ struct RootView: View {
                 readinessRow(
                     title: String(localized: "Connected to this device"),
                     isDone: tunnel.isConnected,
-                    guidance: String(localized: "Open LocalDevVPN and connect the VPN, and make sure Wi-Fi is joined to a network.")
+                    guidance: String(localized: "Connect LocalDevVPN, then Retry. Location Suite tests the phone-local endpoint directly on Wi-Fi, cellular, or offline paths.")
                 )
                 readinessRow(
                     title: String(localized: "Developer Disk Image mounted"),

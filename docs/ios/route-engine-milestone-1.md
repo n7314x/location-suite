@@ -37,22 +37,30 @@ slow connection cannot create an unbounded update backlog. Elapsed advancement
 per accepted tick is capped at one second, preventing an app suspension or slow
 reconnect from turning into a large location jump.
 
-Natural walking cruises at 1.4 m/s, uses a four-second smooth acceleration,
-adds a deterministic 2.5% low-frequency pace variation, and smoothly slows over
-the last six metres. A small nonzero crawl plus a five-centimetre completion
-threshold guarantees exact completion rather than an asymptotic stall.
+Natural walking targets 1.4 m/s at 1.0x. The compact route control offers
+0.5x, 1.0x, 1.5x, 2.0x, and 3.0x presets, including while the route is moving.
+Acceleration and deceleration limits make a new setting take effect smoothly.
+A seeded, deterministic-in-tests pace profile combines low-frequency drift with
+several-second slowdown and speedup envelopes. Randomness affects velocity only,
+never coordinates. The engine also slows over the last six metres; a small
+nonzero crawl plus a five-centimetre completion threshold guarantees exact
+completion rather than an asymptotic stall.
 
 Pause freezes distance, elapsed playback time, segment, and route coordinate.
-While paused—and after completion—the controller resends the held coordinate
-every four seconds through the same open session. Completion leaves the fake
-location at the destination. Only Stop calls the proven
+Stop Route also freezes those values, enters the explicit `stopped`/Holding
+state, and deliberately retains the fake coordinate and simulation handle.
+While paused, stopped, connection-interrupted, or completed, the controller
+resends only the held coordinate every four seconds through the same open
+session. Completion leaves the fake location at the destination. Only the
+separate Return to Real Location action calls the proven
 `location_simulation_clear` lifecycle and returns the phone to real GPS.
 
 The controller is main-actor isolated. A generation number invalidates stale
-async results, only one timer exists, and an in-flight coordinate update is
-serialized ahead of Stop's clear on `LocationSimulationCommandQueue`. Thus an
-old route cannot update the device after the clear or mutate a newer playback
-run.
+async results, only one timer exists, and device sets and clears are serialized
+on `LocationSimulationCommandQueue`. Stop's final exact hold is ordered after
+any older update; Return to Real Location's clear is ordered after every older
+set. Thus an old route cannot update the device after the clear or mutate a
+newer playback run.
 
 ## Background execution boundary
 

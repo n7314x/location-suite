@@ -431,6 +431,7 @@ struct LocationSimulationView: View {
     /// resending the exact same fix every time. Off by default; see
     /// `jitteredCoordinate(around:)` and `startResendLoop(with:)`.
     @AppStorage("naturalGPSDrift") private var naturalGPSDrift = false
+    @AppStorage(UserDefaults.Keys.routeSpeedMultiplier) private var routeSpeedMultiplier = 1.0
 
     @State private var coordinate: CLLocationCoordinate2D?
     @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
@@ -556,7 +557,7 @@ struct LocationSimulationView: View {
     }
 
     private var hasActiveSimulation: Bool {
-        simulatedCoordinate != nil || routePlayback.isSimulationActive
+        simulatedCoordinate != nil || routePlayback.canReturnToRealLocation
     }
 
     private var preparedRoute: LocationRoute? {
@@ -1290,8 +1291,8 @@ struct LocationSimulationView: View {
             if LocationSimulationRequest.isAlreadyApplied(notification) {
                 routePlayback.relinquishWithoutClearing()
                 adoptExternalClear()
-            } else if routePlayback.canStop {
-                stopRoute(returnCameraToRealLocation: false)
+            } else if routePlayback.canReturnToRealLocation {
+                returnToRealLocation()
             } else {
                 clear()
             }
@@ -1305,6 +1306,7 @@ struct LocationSimulationView: View {
         }
         .onAppear {
             loadBookmarks()
+            routePlayback.setSpeedMultiplier(routeSpeedMultiplier)
             // A live foreground location session for as long as the map is
             // visible. Without it the only Core Location session in the app is
             // BackgroundLocationManager's, which `clear()` shuts down — leaving
@@ -1312,6 +1314,13 @@ struct LocationSimulationView: View {
             // positions with nothing to follow after "Return to Real Location".
             currentLocationProvider.startTracking()
             centerOnLaunchLocationIfNeeded()
+        }
+        .onChange(of: routeSpeedMultiplier) { _, multiplier in
+            let clamped = WalkingSpeedModel.clampedMultiplier(multiplier)
+            if clamped != multiplier {
+                routeSpeedMultiplier = clamped
+            }
+            routePlayback.setSpeedMultiplier(clamped)
         }
         .onDisappear {
             // Balances the `startTracking()` above: no GPS runs while the map
@@ -1393,9 +1402,11 @@ struct LocationSimulationView: View {
     private var routeControls: some View {
         if let metrics = routePlayback.metrics,
            routePlayback.state == .starting ||
-           routePlayback.state == .playing ||
+            routePlayback.state == .playing ||
            routePlayback.state == .paused ||
-           routePlayback.state == .stopping ||
+           routePlayback.state == .stopped ||
+           routePlayback.state.isConnectionInterrupted ||
+           routePlayback.state == .clearing ||
            routePlayback.state == .completed {
             routePlaybackControls(metrics: metrics)
         } else {
@@ -1460,9 +1471,11 @@ struct LocationSimulationView: View {
 
                 Spacer(minLength: 4)
 
+                routeSpeedMenu
+
                 if routePlayback.isSimulationActive {
-                    Button("Stop", role: .destructive) {
-                        stopRoute(returnCameraToRealLocation: false)
+                    Button("Return to Real", role: .destructive) {
+                        returnToRealLocation()
                     }
                     .buttonStyle(.bordered)
                 }
@@ -1490,11 +1503,11 @@ struct LocationSimulationView: View {
 
                 Spacer(minLength: 4)
 
-                if routePlayback.state == .playing {
-                    Text(String(format: "%.1f m/s", metrics.currentSpeed))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
+                Text(String(format: "%.1f m/s", metrics.currentSpeed))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+
+                routeSpeedMenu
             }
 
             ProgressView(value: metrics.progress)
@@ -1512,23 +1525,37 @@ struct LocationSimulationView: View {
             .foregroundStyle(.secondary)
 
             HStack(spacing: 12) {
-                if routePlayback.state == .starting || routePlayback.state == .stopping {
+                if routePlayback.state == .starting || routePlayback.state == .clearing {
                     ProgressView()
                         .controlSize(.small)
-                    Text(routePlayback.state == .starting ? "Starting…" : "Stopping…")
+                    Text(routePlayback.state == .starting ? "Starting…" : "Returning…")
                         .font(.subheadline)
                     Spacer()
                     if routePlayback.state == .starting {
-                        Button("Stop", role: .destructive) {
-                            stopRoute(returnCameraToRealLocation: false)
+                        Button("Stop Route", role: .destructive) {
+                            stopRoute()
                         }
                         .buttonStyle(.bordered)
                     }
+                } else if case .connectionInterrupted = routePlayback.state {
+                    Button {
+                        Task { await routePlayback.maintainHeldCoordinate() }
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Spacer()
+
+                    Button("Stop Route", role: .destructive) {
+                        stopRoute()
+                    }
+                    .buttonStyle(.bordered)
                 } else {
                     Button {
                         if routePlayback.state == .playing {
                             routePlayback.pause()
-                        } else if routePlayback.state == .paused {
+                        } else if routePlayback.state == .paused || routePlayback.state == .stopped {
                             routePlayback.resume()
                         } else {
                             playRoute()
@@ -1536,7 +1563,7 @@ struct LocationSimulationView: View {
                     } label: {
                         Label(
                             routePlayback.state == .playing ? "Pause" :
-                                (routePlayback.state == .paused ? "Resume" : "Replay"),
+                                ((routePlayback.state == .paused || routePlayback.state == .stopped) ? "Resume" : "Replay"),
                             systemImage: routePlayback.state == .playing ? "pause.fill" : "play.fill"
                         )
                     }
@@ -1544,19 +1571,61 @@ struct LocationSimulationView: View {
 
                     Spacer()
 
-                    Button("Stop", role: .destructive) {
-                        stopRoute(returnCameraToRealLocation: false)
+                    if routePlayback.state == .playing || routePlayback.state == .paused {
+                        Button("Stop Route", role: .destructive) {
+                            stopRoute()
+                        }
+                        .buttonStyle(.bordered)
+                    } else if routePlayback.state == .stopped || routePlayback.state == .completed {
+                        Button {
+                            clearRoute()
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityLabel("Clear Route")
                     }
-                    .buttonStyle(.bordered)
                 }
             }
 
             if routePlayback.state == .completed {
-                Text("Arrived — Stop returns to real GPS")
+                Text("Arrived — fake location is held")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            } else if routePlayback.state == .stopped {
+                Text("Route stopped — fake location is held")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if case .connectionInterrupted(let error) = routePlayback.state {
+                Text("Movement paused — \(error.message)")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(3)
             }
         }
+    }
+
+    private var routeSpeedMenu: some View {
+        Menu {
+            ForEach(WalkingSpeedModel.multiplierPresets, id: \.self) { multiplier in
+                Button {
+                    routeSpeedMultiplier = multiplier
+                } label: {
+                    if multiplier == routePlayback.speedMultiplier {
+                        Label(Self.formattedMultiplier(multiplier), systemImage: "checkmark")
+                    } else {
+                        Text(Self.formattedMultiplier(multiplier))
+                    }
+                }
+            }
+        } label: {
+            Text(Self.formattedMultiplier(routePlayback.speedMultiplier))
+                .font(.caption.weight(.semibold).monospacedDigit())
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .accessibilityLabel("Walking Speed")
+        .accessibilityValue(Self.formattedMultiplier(routePlayback.speedMultiplier))
     }
 
     private static let routeProgressAnimationDuration = RoutePlaybackController.updateInterval
@@ -1568,10 +1637,16 @@ struct LocationSimulationView: View {
         case .starting: return String(localized: "Starting")
         case .playing: return String(localized: "Playing")
         case .paused: return String(localized: "Paused")
-        case .stopping: return String(localized: "Stopping")
+        case .stopped: return String(localized: "Holding")
+        case .connectionInterrupted: return String(localized: "Reconnecting")
         case .completed: return String(localized: "Arrived")
+        case .clearing: return String(localized: "Returning")
         case .error: return String(localized: "Stopped")
         }
+    }
+
+    private static func formattedMultiplier(_ multiplier: Double) -> String {
+        String(format: "%.1fx", WalkingSpeedModel.clampedMultiplier(multiplier))
     }
 
     private static func formattedDistance(_ meters: Double) -> String {
@@ -1653,24 +1728,13 @@ struct LocationSimulationView: View {
         Task { await routePlayback.play(route) }
     }
 
-    private func stopRoute(returnCameraToRealLocation: Bool) {
-        guard routePlayback.canStop else { return }
-        if returnCameraToRealLocation {
-            isReturningToRealLocation = true
-        }
+    private func stopRoute() {
+        guard routePlayback.canStopRoute else { return }
         Task {
-            let didClear = await routePlayback.stop()
-            if returnCameraToRealLocation {
-                isReturningToRealLocation = false
+            let didHold = await routePlayback.stopRoute()
+            if didHold {
+                showStatusMessage(String(localized: "Route stopped — fake location remains held"))
             }
-            guard didClear else { return }
-            currentLocationProvider.refreshTracking()
-            if returnCameraToRealLocation {
-                position = .userLocation(fallback: .automatic)
-            }
-            showStatusMessage(
-                String(localized: "Simulation stopped — map is waiting for your real location (slower indoors)")
-            )
         }
     }
 
@@ -2098,8 +2162,16 @@ struct LocationSimulationView: View {
     /// guaranteed to be running at the moment the camera is handed back to
     /// `.userLocation` below.
     private func returnToRealLocation() {
-        if routePlayback.canStop {
-            stopRoute(returnCameraToRealLocation: true)
+        if routePlayback.canReturnToRealLocation {
+            isReturningToRealLocation = true
+            Task {
+                let didClear = await routePlayback.returnToRealLocation()
+                isReturningToRealLocation = false
+                guard didClear else { return }
+                currentLocationProvider.refreshTracking()
+                position = .userLocation(fallback: .automatic)
+                showStatusMessage(String(localized: "Simulation stopped — map is waiting for your real location (slower indoors)"))
+            }
             return
         }
         // Mirrors `clear()`'s own guard, so the spinner flag below can never be
@@ -2159,7 +2231,16 @@ struct LocationSimulationView: View {
     }
 
     private func locationUpdateCode(for coordinate: CLLocationCoordinate2D) -> Int32 {
-        simulate_location(deviceIP, coordinate.latitude, coordinate.longitude, pairingFilePath)
+        let code = simulate_location(deviceIP, coordinate.latitude, coordinate.longitude, pairingFilePath)
+        if code == 0 {
+            TunnelManager.shared.recordSimulationEndpointSuccess()
+        } else {
+            TunnelManager.shared.recordSimulationEndpointFailure(
+                code: code,
+                detail: "Point coordinate delivery failed with device code \(code)."
+            )
+        }
+        return code
     }
 }
 

@@ -21,7 +21,14 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
         let code = await runOnLocationCommandQueue {
             simulate_location(deviceIP, coordinate.latitude, coordinate.longitude, pairingFilePath)
         }
-        guard code == 0 else { throw Self.failure(for: code, clearing: false) }
+        guard code == 0 else {
+            TunnelManager.shared.recordSimulationEndpointFailure(
+                code: code,
+                detail: "Route coordinate delivery failed with device code \(code)."
+            )
+            throw Self.failure(for: code, clearing: false)
+        }
+        TunnelManager.shared.recordSimulationEndpointSuccess()
     }
 
     func clear() async throws {
@@ -118,7 +125,8 @@ extension RoutePlaybackController {
     static func deviceController() -> RoutePlaybackController {
         RoutePlaybackController(
             sink: DeviceRouteLocationSimulationSink(),
-            activityManager: DeviceRoutePlaybackActivityManager()
+            activityManager: DeviceRoutePlaybackActivityManager(),
+            speedModel: .randomNatural
         )
     }
 }

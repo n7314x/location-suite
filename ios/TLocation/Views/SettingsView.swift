@@ -141,6 +141,8 @@ struct SettingsView: View {
     /// Watched, not owned. Holds the last signing expiry read from the device;
     /// this view shows it and asks for a refresh, and never reads the app bundle.
     @ObservedObject private var signing = SigningExpiryMonitor.shared
+    @ObservedObject private var tunnel = TunnelManager.shared
+    @ObservedObject private var mounting = MountingProgress.shared
 
     @Environment(\.scenePhase) private var scenePhase
 
@@ -280,6 +282,42 @@ struct SettingsView: View {
                     }
                 }
 
+                Section("Connection Diagnostics") {
+                    diagnosticRow("Underlying Network", value: tunnel.underlyingNetwork.rawValue)
+                    diagnosticRow(
+                        "LocalDevVPN Endpoint Reachable",
+                        value: tunnel.endpointReachability.rawValue
+                    )
+                    diagnosticRow(
+                        "RemotePairing Connected",
+                        value: tunnel.isConnected ? String(localized: "Yes") : String(localized: "No")
+                    )
+                    diagnosticRow(
+                        "Developer Disk Image Ready",
+                        value: mounting.coolisMounted ? String(localized: "Yes") : String(localized: "No")
+                    )
+                    diagnosticRow("Target", value: "\(DeviceConnectionContext.targetIPAddress):49152")
+
+                    if let category = tunnel.lastConnectionFailureCategory {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Last Connection Failure")
+                            Text(category.rawValue)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.orange)
+                            if let detail = tunnel.lastConnectionFailure {
+                                Text(detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+
+                    Text("Network type is diagnostic only. Readiness is decided by the actual phone-local RemotePairing connection.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Help") {
                     Link(destination: SettingsLinks.pairingFileGuide) {
                         Label("Pairing File Guide", systemImage: "questionmark.circle")
@@ -384,6 +422,17 @@ struct SettingsView: View {
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("Existing DDI files will be removed before downloading fresh copies.")
+        }
+    }
+
+    private func diagnosticRow(_ title: LocalizedStringKey, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(title)
+            Spacer(minLength: 8)
+            Text(value)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
         }
     }
 

@@ -39,9 +39,9 @@ enum LocationIntentError: Swift.Error, CustomLocalizedStringResourceConvertible,
         case .noPairingFile:
             return "Import a pairing file in TLocation first."
         case .tunnelUnavailable(let detail):
-            return "TLocation could not reach this device. Connect LocalDevVPN and make sure Wi-Fi is joined to a network. (\(detail))"
+            return "TLocation could not reach this device through the phone-local endpoint. Connect LocalDevVPN, then try again. (\(detail))"
         case .timedOut(let step):
-            return "\(step) timed out. Connect LocalDevVPN and make sure Wi-Fi is joined to a network, then try again."
+            return "\(step) timed out. Connect LocalDevVPN and retry the phone-local endpoint."
         case .developerDiskImageNotMounted:
             return "The Developer Disk Image (DDI) is not mounted yet. Open TLocation and wait for setup to finish, then try again."
         case .invalidLatitude(let value):
