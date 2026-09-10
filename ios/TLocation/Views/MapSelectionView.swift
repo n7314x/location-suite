@@ -1772,7 +1772,7 @@ struct LocationSimulationView: View {
 
     private var routeSpeedMenu: some View {
         let profile = MovementProfile.profile(for: routeMovementMode)
-        Menu {
+        return Menu {
             ForEach(profile.multiplierPresets, id: \.self) { multiplier in
                 Button {
                     routeSpeedMultiplier = multiplier

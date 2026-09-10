@@ -127,7 +127,8 @@ struct SavedRoutesView: View {
             allowedContentTypes: [.json, .plainText, .text, .data],
             allowsMultipleSelection: false
         ) { result in
-            guard case .success(let url) = result else { return }
+            guard case .success(let urls) = result,
+                  let url = urls.first else { return }
             let didAccess = url.startAccessingSecurityScopedResource()
             defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
             do {
