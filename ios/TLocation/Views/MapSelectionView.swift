@@ -291,6 +291,7 @@ private enum PendingAlert {
     /// localized title and body.
     case message(title: String, body: String)
     case saveBookmark
+    case saveRoute
     case locationPermissionDenied
 
     /// Verbatim, because the `.message` payload arrives already localized from
@@ -300,6 +301,7 @@ private enum PendingAlert {
         switch self {
         case .message(let title, _): return title
         case .saveBookmark: return String(localized: "Save Bookmark")
+        case .saveRoute: return String(localized: "Save Route")
         case .locationPermissionDenied: return String(localized: "Location Permission Needed")
         }
     }
@@ -312,12 +314,14 @@ private enum PendingAlert {
 /// dismissal, leaving nothing to get stuck.
 private enum PendingSheet: Identifiable {
     case bookmarks
+    case savedRoutes
     case settings
 
     var id: Int {
         switch self {
         case .bookmarks: return 0
-        case .settings: return 1
+        case .savedRoutes: return 1
+        case .settings: return 2
         }
     }
 }
@@ -476,7 +480,20 @@ struct LocationSimulationView: View {
     @State private var interactionMode: MapInteractionMode = .point
     @State private var routePoints: [RoutePoint] = []
     @State private var routeIdentifier = LocationRoute.makeIdentifier()
+    @State private var routeName = ""
+    @State private var routeCreatedAt = Date()
+    @State private var routeMovementMode: RouteMovementMode = .walking
+    @State private var resolvedDirections: ResolvedDirections?
+    @State private var usesDirectRouteFallback = false
+    @State private var isResolvingRoute = false
+    @State private var routeResolutionError: String?
+    @State private var routeRevision: UInt64 = 0
+    @State private var routeResolutionTask: Task<Void, Never>?
+    @State private var routeLoopMode: RouteLoopMode = .off
+    @State private var newRouteName = ""
+    @State private var directionsCoordinator = RouteDirectionsCoordinator()
     @StateObject private var routePlayback = RoutePlaybackController.deviceController()
+    @StateObject private var savedRouteLibrary = SavedRouteLibrary.shared
 
     // Bookmarks
     @State private var bookmarks: [LocationBookmark] = []
@@ -575,21 +592,31 @@ struct LocationSimulationView: View {
     }
 
     private var preparedRoute: LocationRoute? {
-        try? LocationRoute(
+        let playbackPoints: [RoutePoint]?
+        if let resolvedDirections {
+            playbackPoints = resolvedDirections.points
+        } else if usesDirectRouteFallback {
+            playbackPoints = routePoints
+        } else {
+            playbackPoints = nil
+        }
+        guard let playbackPoints else { return nil }
+        return try? LocationRoute(
             id: routeIdentifier,
-            mode: .walking,
-            points: routePoints,
+            name: routeName.isEmpty ? nil : routeName,
+            mode: routeMovementMode,
+            points: playbackPoints,
             speedProfile: .natural,
             metadata: RouteMetadata(source: .waypoint)
         )
     }
 
     private var routeDistance: Double {
-        (try? RouteGeometry(points: routePoints).totalDistance) ?? 0
+        resolvedDirections?.distance ?? ((try? RouteGeometry(points: routePoints).totalDistance) ?? 0)
     }
 
     private var routeCoordinates: [CLLocationCoordinate2D] {
-        routePoints.map {
+        (resolvedDirections?.points ?? routePoints).map {
             CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
         }
     }
@@ -1087,7 +1114,12 @@ struct LocationSimulationView: View {
                             MapPolyline(coordinates: routeCoordinates)
                                 .stroke(
                                     Color.accentColor,
-                                    style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round)
+                                    style: StrokeStyle(
+                                        lineWidth: 4,
+                                        lineCap: .round,
+                                        lineJoin: .round,
+                                        dash: resolvedDirections == nil && !usesDirectRouteFallback ? [7, 6] : []
+                                    )
                                 )
                         }
 
@@ -1240,6 +1272,12 @@ struct LocationSimulationView: View {
                     .keyboardShortcut(.defaultAction)
                 Button("Cancel", role: .cancel) { cancelSaveBookmark() }
 
+            case .saveRoute:
+                TextField("Name", text: $newRouteName)
+                Button("Save") { saveCurrentRoute() }
+                    .keyboardShortcut(.defaultAction)
+                Button("Cancel", role: .cancel) { newRouteName = "" }
+
             case .locationPermissionDenied:
                 Button("Open Settings") {
                     if let url = URL(string: UIApplication.openSettingsURLString) {
@@ -1256,6 +1294,8 @@ struct LocationSimulationView: View {
                 Text(verbatim: body)
             case .saveBookmark:
                 Text("Enter a name for this location.")
+            case .saveRoute:
+                Text("Saved geometry can be replayed later without resolving the route again.")
             case .locationPermissionDenied:
                 Text("TLocation needs location access to find your current position. Note: while a simulated location is active, iOS reports the simulated position.")
             }
@@ -1290,6 +1330,10 @@ struct LocationSimulationView: View {
                     guard let index = bookmarks.firstIndex(where: { $0.id == id }) else { return }
                     bookmarks[index].name = newName
                     saveBookmarks()
+                }
+            case .savedRoutes:
+                SavedRoutesView(library: savedRouteLibrary) { route in
+                    loadSavedRoute(route)
                 }
             case .settings:
                 SettingsView()
@@ -1326,7 +1370,8 @@ struct LocationSimulationView: View {
         }
         .onAppear {
             loadBookmarks()
-            routePlayback.setSpeedMultiplier(routeSpeedMultiplier)
+            Task { await savedRouteLibrary.reload() }
+            routePlayback.setSpeedMultiplier(routeSpeedMultiplier, mode: routeMovementMode)
             // A live foreground location session for as long as the map is
             // visible. Without it the only Core Location session in the app is
             // BackgroundLocationManager's, which `clear()` shuts down — leaving
@@ -1336,17 +1381,18 @@ struct LocationSimulationView: View {
             centerOnLaunchLocationIfNeeded()
         }
         .onChange(of: routeSpeedMultiplier) { _, multiplier in
-            let clamped = WalkingSpeedModel.clampedMultiplier(multiplier)
+            let clamped = MovementProfile.clampedMultiplier(multiplier, mode: routeMovementMode)
             if clamped != multiplier {
                 routeSpeedMultiplier = clamped
             }
-            routePlayback.setSpeedMultiplier(clamped)
+            routePlayback.setSpeedMultiplier(clamped, mode: routeMovementMode)
         }
         .onDisappear {
             // Balances the `startTracking()` above: no GPS runs while the map
             // is off screen.
             currentLocationProvider.stopTracking()
             stopPointProducer()
+            routeResolutionTask?.cancel()
         }
     }
 
@@ -1433,8 +1479,7 @@ struct LocationSimulationView: View {
     private var routeEditorControls: some View {
         VStack(spacing: 10) {
             HStack(spacing: 10) {
-                Label("Walking", systemImage: "figure.walk")
-                    .font(.subheadline.weight(.semibold))
+                routeModeMenu
 
                 if routePoints.count >= 2 {
                     Text(Self.formattedDistance(routeDistance))
@@ -1443,6 +1488,8 @@ struct LocationSimulationView: View {
                 }
 
                 Spacer(minLength: 4)
+
+                routeAdvancedMenu
 
                 Button {
                     undoLastWaypoint()
@@ -1475,12 +1522,12 @@ struct LocationSimulationView: View {
                     Text("Tap the map to add the first waypoint")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                } else if preparedRoute == nil {
+                } else if routePoints.count < 2 {
                     Text("Add one more different waypoint")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("\(routePoints.count) waypoints")
+                    Text(routeEditorStatus)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -1503,15 +1550,110 @@ struct LocationSimulationView: View {
                     Label("Play", systemImage: "play.fill")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(preparedRoute == nil || !pairingExists || !routePlayback.canEditRoute)
+                .disabled(routePoints.count < 2 || !pairingExists || !routePlayback.canEditRoute || isResolvingRoute)
             }
         }
+    }
+
+    private var routeEditorStatus: String {
+        if isResolvingRoute { return String(localized: "Resolving with Apple Maps…") }
+        if routeResolutionError != nil {
+            return String(localized: "Directions unavailable — choose an action in the route menu")
+        }
+        if usesDirectRouteFallback { return String(localized: "Straight-line fallback selected") }
+        if resolvedDirections != nil { return String(localized: "\(routePoints.count) waypoints • Ready") }
+        return String(localized: "\(routePoints.count) waypoints • Directions needed")
+    }
+
+    private var routeModeMenu: some View {
+        Menu {
+            ForEach(RouteMovementMode.allCases, id: \.self) { mode in
+                Button {
+                    selectMovementMode(mode)
+                } label: {
+                    if mode == routeMovementMode {
+                        Label(mode.title, systemImage: "checkmark")
+                    } else {
+                        Label(mode.title, systemImage: mode.systemImage)
+                    }
+                }
+            }
+        } label: {
+            Label(routeMovementMode.title, systemImage: routeMovementMode.systemImage)
+                .font(.subheadline.weight(.semibold))
+        }
+        .disabled(!routePlayback.canEditRoute)
+        .accessibilityLabel("Movement Mode")
+        .accessibilityValue(routeMovementMode.title)
+    }
+
+    private var routeAdvancedMenu: some View {
+        Menu {
+            Button {
+                pendingSheet = .savedRoutes
+            } label: {
+                Label("Saved Routes", systemImage: "tray.full")
+            }
+
+            Button {
+                beginSaveRoute()
+            } label: {
+                Label("Save Route", systemImage: "square.and.arrow.down")
+            }
+            .disabled(routePoints.count < 2)
+
+            Button {
+                resolveRoute()
+            } label: {
+                Label("Resolve with Apple Maps", systemImage: "map")
+            }
+            .disabled(routePoints.count < 2 || isResolvingRoute)
+
+            Button {
+                reverseRoute()
+            } label: {
+                Label("Reverse Route", systemImage: "arrow.left.arrow.right")
+            }
+            .disabled(routePoints.count < 2 || isResolvingRoute)
+
+            Button {
+                toggleRouteLoop()
+            } label: {
+                Label(
+                    routeLoopMode == .infinite ? "Turn Loop Off" : "Loop Back and Forth",
+                    systemImage: routeLoopMode == .infinite ? "repeat.circle.fill" : "repeat"
+                )
+            }
+            .disabled(routePoints.count < 2)
+
+            Button {
+                startRouteFromCurrentSimulation()
+            } label: {
+                Label("Start from Simulated Position", systemImage: "location.fill.viewfinder")
+            }
+            .disabled(currentSimulatedRoutePoint == nil)
+
+            Divider()
+
+            Button {
+                useDirectRouteFallback()
+            } label: {
+                Label("Use Straight Lines", systemImage: "line.diagonal")
+            }
+            .disabled(routePoints.count < 2 || isResolvingRoute)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .frame(width: 32, height: 32)
+        }
+        .buttonStyle(.plain)
+        .disabled(!routePlayback.canEditRoute)
+        .accessibilityLabel("Route Actions")
     }
 
     private func routePlaybackControls(metrics: RouteMetrics) -> some View {
         VStack(spacing: 9) {
             HStack(spacing: 8) {
-                Label("Walking", systemImage: "figure.walk")
+                Label(routeMovementMode.title, systemImage: routeMovementMode.systemImage)
                     .font(.subheadline.weight(.semibold))
 
                 Text(routeStateLabel)
@@ -1525,6 +1667,10 @@ struct LocationSimulationView: View {
                     .foregroundStyle(.secondary)
 
                 routeSpeedMenu
+
+                if routePlayback.canEditRoute {
+                    routeAdvancedMenu
+                }
             }
 
             ProgressView(value: metrics.progress)
@@ -1535,6 +1681,8 @@ struct LocationSimulationView: View {
                 Text("\(Self.formattedDistance(metrics.distanceRemaining)) left")
                 Text("•")
                 Text("ETA \(Self.formattedDuration(metrics.estimatedRemainingTime))")
+                Text("•")
+                Text("\(Self.formattedDuration(metrics.elapsedTime)) elapsed")
                 Spacer(minLength: 4)
                 Text("\(Int((metrics.progress * 100).rounded()))%")
             }
@@ -1623,8 +1771,9 @@ struct LocationSimulationView: View {
     }
 
     private var routeSpeedMenu: some View {
+        let profile = MovementProfile.profile(for: routeMovementMode)
         Menu {
-            ForEach(WalkingSpeedModel.multiplierPresets, id: \.self) { multiplier in
+            ForEach(profile.multiplierPresets, id: \.self) { multiplier in
                 Button {
                     routeSpeedMultiplier = multiplier
                 } label: {
@@ -1641,7 +1790,7 @@ struct LocationSimulationView: View {
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
-        .accessibilityLabel("Walking Speed")
+        .accessibilityLabel("\(routeMovementMode.title) Speed")
         .accessibilityValue(Self.formattedMultiplier(routePlayback.speedMultiplier))
     }
 
@@ -1663,7 +1812,7 @@ struct LocationSimulationView: View {
     }
 
     private static func formattedMultiplier(_ multiplier: Double) -> String {
-        String(format: "%.1fx", WalkingSpeedModel.clampedMultiplier(multiplier))
+        String(format: multiplier == 0.25 ? "%.2fx" : "%.1fx", multiplier)
     }
 
     private static func formattedDistance(_ meters: Double) -> String {
@@ -1721,7 +1870,7 @@ struct LocationSimulationView: View {
                   longitude: coordinate.longitude
               ) else { return }
         routePoints.append(point)
-        syncPreparedRoute()
+        invalidateResolvedRoute()
         if recenter { recenterCamera(on: coordinate) }
         Haptics.light()
     }
@@ -1729,16 +1878,38 @@ struct LocationSimulationView: View {
     private func undoLastWaypoint() {
         guard routePlayback.canEditRoute, !routePoints.isEmpty else { return }
         routePoints.removeLast()
-        syncPreparedRoute()
+        invalidateResolvedRoute()
         Haptics.light()
     }
 
     private func clearRoute() {
         guard routePlayback.canEditRoute else { return }
+        routeResolutionTask?.cancel()
+        routeResolutionTask = nil
+        routeRevision &+= 1
         routePoints.removeAll()
         routeIdentifier = LocationRoute.makeIdentifier()
+        routeName = ""
+        routeCreatedAt = Date()
+        resolvedDirections = nil
+        usesDirectRouteFallback = false
+        isResolvingRoute = false
+        routeResolutionError = nil
+        routeLoopMode = .off
+        routePlayback.setLoopMode(.off)
         routePlayback.removePreparedRoute()
         Haptics.light()
+    }
+
+    private func invalidateResolvedRoute() {
+        routeResolutionTask?.cancel()
+        routeResolutionTask = nil
+        routeRevision &+= 1
+        resolvedDirections = nil
+        usesDirectRouteFallback = false
+        isResolvingRoute = false
+        routeResolutionError = nil
+        routePlayback.removePreparedRoute()
     }
 
     private func syncPreparedRoute() {
@@ -1750,8 +1921,12 @@ struct LocationSimulationView: View {
     }
 
     private func playRoute() {
-        guard pairingExists, let route = preparedRoute, routePlayback.canEditRoute else { return }
-        Task {
+        guard pairingExists, routePlayback.canEditRoute else { return }
+        guard let route = preparedRoute else {
+            resolveRoute(playWhenReady: true)
+            return
+        }
+        Task { @MainActor in
             await routePlayback.play(route) {
                 // The route lease is already current and its shared maintenance
                 // activity is already active. Retiring point mode here prevents
@@ -1759,6 +1934,207 @@ struct LocationSimulationView: View {
                 stopPointProducer()
             }
         }
+    }
+
+    private func resolveRoute(playWhenReady: Bool = false) {
+        guard routePlayback.canEditRoute, routePoints.count >= 2 else { return }
+        routeResolutionTask?.cancel()
+        routeRevision &+= 1
+        let revision = routeRevision
+        let anchors = routePoints
+        let mode = routeMovementMode
+        resolvedDirections = nil
+        usesDirectRouteFallback = false
+        routeResolutionError = nil
+        isResolvingRoute = true
+        routePlayback.removePreparedRoute()
+
+        routeResolutionTask = Task { @MainActor in
+            do {
+                let result = try await directionsCoordinator.resolve(
+                    anchors: anchors,
+                    mode: mode,
+                    provider: MapKitDirectionsProvider()
+                )
+                guard !Task.isCancelled, revision == routeRevision else { return }
+                resolvedDirections = result
+                usesDirectRouteFallback = false
+                isResolvingRoute = false
+                routeResolutionTask = nil
+                syncPreparedRoute()
+                if playWhenReady { playRoute() }
+            } catch {
+                guard revision == routeRevision else { return }
+                isResolvingRoute = false
+                routeResolutionTask = nil
+                if Task.isCancelled || error is CancellationError || error as? RouteDirectionsError == .cancelled {
+                    return
+                }
+                let message = error.localizedDescription
+                routeResolutionError = message
+                presentAlert(.message(
+                    title: String(localized: "Directions Unavailable"),
+                    body: String(localized: "\(message) You can edit the waypoints and retry, or explicitly choose Use Straight Lines from the route menu.")
+                ))
+            }
+        }
+    }
+
+    private func selectMovementMode(_ mode: RouteMovementMode) {
+        guard routePlayback.canEditRoute, mode != routeMovementMode else { return }
+        routeMovementMode = mode
+        routeSpeedMultiplier = MovementProfile.clampedMultiplier(routeSpeedMultiplier, mode: mode)
+        routePlayback.setSpeedMultiplier(routeSpeedMultiplier, mode: mode)
+        invalidateResolvedRoute()
+        Haptics.light()
+    }
+
+    private func useDirectRouteFallback() {
+        guard routePlayback.canEditRoute,
+              let geometry = try? RouteGeometry(points: routePoints) else { return }
+        routeResolutionTask?.cancel()
+        routeResolutionTask = nil
+        routeRevision &+= 1
+        resolvedDirections = ResolvedDirections(
+            points: geometry.points,
+            distance: geometry.totalDistance,
+            expectedTravelTime: nil
+        )
+        usesDirectRouteFallback = true
+        isResolvingRoute = false
+        routeResolutionError = nil
+        syncPreparedRoute()
+        Haptics.light()
+    }
+
+    private func reverseRoute() {
+        guard routePlayback.canEditRoute, routePoints.count >= 2 else { return }
+        let shouldResolve = resolvedDirections != nil && !usesDirectRouteFallback
+        let shouldUseDirectFallback = usesDirectRouteFallback
+        routePoints.reverse()
+        invalidateResolvedRoute()
+        if shouldResolve {
+            resolveRoute()
+        } else if shouldUseDirectFallback {
+            useDirectRouteFallback()
+        }
+        Haptics.light()
+    }
+
+    private func toggleRouteLoop() {
+        routeLoopMode = routeLoopMode == .off ? .infinite : .off
+        routePlayback.setLoopMode(routeLoopMode)
+        showStatusMessage(
+            routeLoopMode == .infinite
+                ? String(localized: "Loop enabled — route alternates forward and reverse without teleporting")
+                : String(localized: "Loop disabled")
+        )
+    }
+
+    private var currentSimulatedRoutePoint: RoutePoint? {
+        if routePlayback.isSimulationActive, let point = routePlayback.metrics?.currentCoordinate {
+            return point
+        }
+        guard let simulatedCoordinate else { return nil }
+        return try? RoutePoint(
+            latitude: simulatedCoordinate.latitude,
+            longitude: simulatedCoordinate.longitude
+        )
+    }
+
+    private func startRouteFromCurrentSimulation() {
+        guard routePlayback.canEditRoute, let point = currentSimulatedRoutePoint else { return }
+        if let first = routePoints.first,
+           RouteGeometry.distance(from: point, to: first) < RouteGeometry.minimumSegmentLength {
+            return
+        }
+        routePoints.insert(point, at: 0)
+        invalidateResolvedRoute()
+        Haptics.light()
+    }
+
+    private func beginSaveRoute() {
+        guard routePoints.count >= 2 else { return }
+        newRouteName = routeName.isEmpty ? "Route \(savedRouteLibrary.routes.count + 1)" : routeName
+        pendingAlert = .saveRoute
+    }
+
+    private func saveCurrentRoute() {
+        defer { newRouteName = "" }
+        guard routePoints.count >= 2 else { return }
+        do {
+            let geometry: ResolvedRouteGeometry?
+            if let resolvedDirections {
+                geometry = try ResolvedRouteGeometry(
+                    points: resolvedDirections.points,
+                    distance: resolvedDirections.distance,
+                    expectedTravelTime: resolvedDirections.expectedTravelTime,
+                    provider: usesDirectRouteFallback ? "direct" : "mapKit"
+                )
+            } else {
+                geometry = nil
+            }
+            let document = try LocationRouteDocument(
+                id: routeIdentifier,
+                name: newRouteName,
+                createdAt: routeCreatedAt,
+                modifiedAt: Date(),
+                movementMode: routeMovementMode,
+                anchors: routePoints,
+                resolvedGeometry: geometry,
+                defaultSpeedMultiplier: routeSpeedMultiplier,
+                source: RouteDocumentSourceMetadata(client: "ios")
+            )
+            Task { @MainActor in
+                if await savedRouteLibrary.save(document) {
+                    routeName = document.name
+                    showStatusMessage(String(localized: "Route saved"))
+                }
+            }
+        } catch {
+            presentAlert(.message(
+                title: String(localized: "Could Not Save Route"),
+                body: error.localizedDescription
+            ))
+        }
+    }
+
+    private func loadSavedRoute(_ document: LocationRouteDocument) {
+        guard routePlayback.canEditRoute else { return }
+        routeResolutionTask?.cancel()
+        routeResolutionTask = nil
+        routeRevision &+= 1
+        interactionMode = .route
+        routeIdentifier = document.id
+        routeName = document.name
+        routeCreatedAt = document.createdAt
+        routeMovementMode = document.movementMode
+        routePoints = document.anchors
+        routeSpeedMultiplier = document.defaultSpeedMultiplier
+        routePlayback.setSpeedMultiplier(document.defaultSpeedMultiplier, mode: document.movementMode)
+        if let geometry = document.resolvedGeometry {
+            resolvedDirections = ResolvedDirections(
+                points: geometry.points,
+                distance: geometry.distance,
+                expectedTravelTime: geometry.expectedTravelTime
+            )
+            usesDirectRouteFallback = geometry.provider == "direct"
+        } else {
+            resolvedDirections = nil
+            usesDirectRouteFallback = false
+        }
+        isResolvingRoute = false
+        routeResolutionError = nil
+        routeLoopMode = .off
+        routePlayback.setLoopMode(.off)
+        syncPreparedRoute()
+        if let first = document.anchors.first {
+            recenterCamera(on: CLLocationCoordinate2D(
+                latitude: first.latitude,
+                longitude: first.longitude
+            ))
+        }
+        showStatusMessage(String(localized: "Loaded \(document.name)"))
     }
 
     private func stopRoute() {

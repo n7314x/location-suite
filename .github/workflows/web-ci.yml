@@ -1,0 +1,55 @@
+name: Validate web route editor
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "contracts/**"
+      - ".github/workflows/web-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "contracts/**"
+      - ".github/workflows/web-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Test route contract
+        working-directory: web
+        run: pnpm test
+
+      - name: Lint
+        working-directory: web
+        run: pnpm lint
+
+      - name: Typecheck and build
+        working-directory: web
+        run: pnpm build

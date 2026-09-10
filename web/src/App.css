@@ -127,6 +127,10 @@
   color: #fff;
 }
 
+.app-mode-switcher {
+  margin-bottom: 18px;
+}
+
 .sidebar-section {
   margin-top: 24px;
 }
@@ -156,6 +160,111 @@
   outline: none;
   background: #191c21;
   color: #f5f6f7;
+}
+
+.sidebar-section select {
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 11px;
+  border: 1px solid #30353d;
+  border-radius: 8px;
+  outline: none;
+  background: #191c21;
+  color: #f5f6f7;
+}
+
+.route-help {
+  margin: 0;
+  color: #8f97a2;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.route-fields {
+  margin-top: 18px;
+}
+
+.route-fields input[type='range'] {
+  padding: 0;
+  accent-color: #2387ff;
+}
+
+.route-summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  color: #b9c0c9;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.route-summary strong {
+  grid-column: 1 / -1;
+  color: #63d792;
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.route-anchor-list {
+  display: grid;
+  gap: 6px;
+  max-height: 250px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.route-anchor-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 9px;
+  border: 1px solid #2b3038;
+  border-radius: 8px;
+  background: #181b20;
+  color: #aeb5bf;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.route-anchor-list button {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 6px;
+  background: #262b32;
+  color: #aeb5bf;
+  cursor: pointer;
+}
+
+.route-actions {
+  grid-template-columns: 1fr 1fr;
+}
+
+.route-actions .primary-button {
+  grid-column: 1 / -1;
+}
+
+.route-file-input {
+  display: none;
+}
+
+.route-anchor-label {
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  color: white !important;
+  box-shadow: none !important;
+  font-size: 9px !important;
+  font-weight: 700 !important;
+}
+
+.route-anchor-label::before {
+  display: none;
 }
 
 .sidebar-section input:focus {

@@ -50,20 +50,6 @@ export function PointPanel({
 }: Props) {
   return (
     <div className="point-panel">
-      <div className="mode-switcher">
-        <button className="mode-button active">
-          Point
-        </button>
-
-        <button
-          className="mode-button"
-          disabled
-          title="Route mode is coming next"
-        >
-          Route
-        </button>
-      </div>
-
       <SearchBox onSelect={onPlaceSelect} />
 
       <section className="sidebar-section">

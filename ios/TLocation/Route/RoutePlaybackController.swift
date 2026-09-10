@@ -194,8 +194,11 @@ final class RoutePlaybackController: ObservableObject {
         if !isSimulationActive { invalidateTimer() }
     }
 
-    func setSpeedMultiplier(_ requestedMultiplier: Double) {
-        let mode = route?.mode ?? .walking
+    func setSpeedMultiplier(
+        _ requestedMultiplier: Double,
+        mode requestedMode: RouteMovementMode? = nil
+    ) {
+        let mode = requestedMode ?? route?.mode ?? .walking
         let multiplier = MovementProfile.clampedMultiplier(requestedMultiplier, mode: mode)
         speedMultiplier = multiplier
         engine?.setSpeedMultiplier(multiplier)

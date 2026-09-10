@@ -17,6 +17,8 @@ import {
 
 import { StatusPills } from './features/device/StatusPills'
 import { LocationMap } from './features/map/LocationMap'
+import { RouteEditor } from './features/routes/RouteEditor'
+import { iso8601Now, newRouteDraft } from './features/routes/routeDocument'
 import { PointPanel } from './features/simulation/PointPanel'
 
 import type {
@@ -28,6 +30,10 @@ import type {
   SimulationResponse,
   TunnelResponse,
 } from './types/api'
+import type {
+  LocationRouteDocumentV1,
+  RouteDraft,
+} from './features/routes/routeDocument'
 
 import './App.css'
 
@@ -37,11 +43,14 @@ const DEFAULT_LOCATION: Coordinates = {
 }
 
 function App() {
+  const [appMode, setAppMode] = useState<'point' | 'route'>('point')
   const [selected, setSelected] =
     useState<Coordinates>(DEFAULT_LOCATION)
   const [selectedName, setSelectedName] =
     useState<string | null>('Statue of Liberty')
   const [flyToVersion, setFlyToVersion] = useState(0)
+  const [routeFitVersion, setRouteFitVersion] = useState(0)
+  const [routeDraft, setRouteDraft] = useState<RouteDraft>(() => newRouteDraft())
 
   const [favorites, setFavorites] = useState<Favorite[]>([])
   const [history, setHistory] = useState<HistoryItem[]>([])
@@ -187,6 +196,30 @@ function App() {
     setSelectedName(null)
   }
 
+  function handleMapSelection(coordinates: Coordinates) {
+    changeCoordinates(coordinates)
+    if (appMode !== 'route') return
+    if (routeDraft.anchors.length >= 500) {
+      setError('A route can contain at most 500 anchors.')
+      return
+    }
+    setRouteDraft((current) => {
+      return {
+        ...current,
+        anchors: [...current.anchors, coordinates],
+        modifiedAt: iso8601Now(),
+        resolvedGeometry: undefined,
+      }
+    })
+  }
+
+  function handleRouteImport(document: LocationRouteDocumentV1) {
+    const first = document.anchors[0]
+    setSelected(first)
+    setSelectedName(document.name)
+    setRouteFitVersion((version) => version + 1)
+  }
+
   async function handleSaveFavorite(name: string | null) {
     setError(null)
     try {
@@ -293,33 +326,62 @@ function App() {
             </div>
           )}
 
-          <PointPanel
-            selected={selected}
-            selectedName={selectedName}
-            favorites={favorites}
-            history={history}
-            simulation={simulation}
-            enabled={ready}
-            busy={busy}
-            onChange={changeCoordinates}
-            onPlaceSelect={selectPlace}
-            onSavedPlaceSelect={selectSavedPlace}
-            onSaveFavorite={(name) => void handleSaveFavorite(name)}
-            onRenameFavorite={(id, name) =>
-              void handleRenameFavorite(id, name)
-            }
-            onDeleteFavorite={(id) => void handleDeleteFavorite(id)}
-            onClearHistory={() => void handleClearHistory()}
-            onTeleport={() => void handleTeleport()}
-            onClear={() => void handleClear()}
-          />
+          <div className="mode-switcher app-mode-switcher">
+            <button
+              type="button"
+              className={`mode-button ${appMode === 'point' ? 'active' : ''}`}
+              onClick={() => setAppMode('point')}
+            >
+              Point
+            </button>
+            <button
+              type="button"
+              className={`mode-button ${appMode === 'route' ? 'active' : ''}`}
+              onClick={() => setAppMode('route')}
+            >
+              Route
+            </button>
+          </div>
+
+          {appMode === 'point' ? (
+            <PointPanel
+              selected={selected}
+              selectedName={selectedName}
+              favorites={favorites}
+              history={history}
+              simulation={simulation}
+              enabled={ready}
+              busy={busy}
+              onChange={changeCoordinates}
+              onPlaceSelect={selectPlace}
+              onSavedPlaceSelect={selectSavedPlace}
+              onSaveFavorite={(name) => void handleSaveFavorite(name)}
+              onRenameFavorite={(id, name) =>
+                void handleRenameFavorite(id, name)
+              }
+              onDeleteFavorite={(id) => void handleDeleteFavorite(id)}
+              onClearHistory={() => void handleClearHistory()}
+              onTeleport={() => void handleTeleport()}
+              onClear={() => void handleClear()}
+            />
+          ) : (
+            <RouteEditor
+              draft={routeDraft}
+              onChange={setRouteDraft}
+              onImport={handleRouteImport}
+            />
+          )}
         </aside>
 
         <section className="map-area">
           <LocationMap
             selected={selected}
             flyToVersion={flyToVersion}
-            onSelect={changeCoordinates}
+            editingRoute={appMode === 'route'}
+            routeAnchors={routeDraft.anchors}
+            routeGeometry={routeDraft.resolvedGeometry?.points}
+            routeFitVersion={routeFitVersion}
+            onSelect={handleMapSelection}
           />
 
           <div className="map-coordinate-pill">
