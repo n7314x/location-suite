@@ -20,7 +20,7 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
     ) async throws {
         let pairingFilePath = PairingFileStore.prepareURL().path
         let deviceIP = DeviceConnectionContext.targetIPAddress
-        let outcome = await runOnLocationCommandQueue {
+        let outcome: CoordinateOutcome = await runOnLocationCommandQueue {
             guard LocationSimulationOwnership.shared.isCurrent(lease) else {
                 return .superseded
             }
@@ -56,7 +56,7 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
     }
 
     func clear() async throws {
-        let code = await runOnLocationCommandQueue(clear_simulated_location)
+        let code = await runOnLocationCommandQueue { clear_simulated_location() }
         guard code == 0 else { throw Self.failure(for: code, clearing: true) }
     }
 
