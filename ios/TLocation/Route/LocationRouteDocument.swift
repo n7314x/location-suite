@@ -8,6 +8,15 @@
 
 import Foundation
 
+private enum RouteDocumentDate {
+    /// JSONEncoder's stable ISO-8601 strategy writes whole seconds. Normalize at
+    /// the model boundary so a freshly-created document and its decoded copy
+    /// have identical values instead of differing only by discarded fractions.
+    static func normalized(_ date: Date) -> Date {
+        Date(timeIntervalSince1970: date.timeIntervalSince1970.rounded(.down))
+    }
+}
+
 struct RouteDocumentSourceMetadata: Codable, Equatable, Sendable {
     var client: String?
     var originalIdentifier: String?
@@ -43,7 +52,7 @@ struct ResolvedRouteGeometry: Codable, Equatable, Sendable {
         self.distance = measuredDistance
         self.expectedTravelTime = expectedTravelTime
         self.provider = provider
-        self.resolvedAt = resolvedAt
+        self.resolvedAt = RouteDocumentDate.normalized(resolvedAt)
     }
 
     init(from decoder: Decoder) throws {
@@ -107,8 +116,8 @@ struct LocationRouteDocument: Codable, Equatable, Identifiable, Sendable {
         self.version = version
         self.id = id
         self.name = trimmedName
-        self.createdAt = createdAt
-        self.modifiedAt = modifiedAt
+        self.createdAt = RouteDocumentDate.normalized(createdAt)
+        self.modifiedAt = RouteDocumentDate.normalized(modifiedAt)
         self.movementMode = movementMode
         self.anchors = anchors
         self.resolvedGeometry = resolvedGeometry
