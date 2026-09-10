@@ -278,6 +278,9 @@ struct PhoneLocalConnectionPolicyTests {
     }
 
     @Test func warmSessionOutranksFreshEndpointFailureOnCellular() {
+        let ownership = LocationSimulationOwnership()
+        ownership.setSessionOpen(true)
+        let lease = ownership.claim(.point)
         #expect(PhoneLocalConnectionPolicy.isReady(
             endpointReachability: .unreachable,
             remotePairingConnected: false,
@@ -291,6 +294,8 @@ struct PhoneLocalConnectionPolicyTests {
             pairingFilePresent: true,
             underlyingNetwork: .cellular
         ))
+        #expect(ownership.isCurrent(lease))
+        #expect(ownership.isSessionOpen)
     }
 
     @Test func trueWarmSessionLossRestoresHonestNotReadyState() {
@@ -793,5 +798,21 @@ struct RoutePlaybackControllerTests {
         #expect(returned)
         #expect(!ownership.isSessionOpen)
         #expect(countAfterReturn == 1)
+    }
+
+    @Test func returnFromPointInvalidatesProducerAndClearsExactlyOnce() async throws {
+        let ownership = LocationSimulationOwnership()
+        ownership.setSessionOpen(true)
+        let pointLease = ownership.claim(.point)
+        let sink = FakeRouteSink(ownership: ownership)
+
+        let returnedLease = ownership.invalidateAll()
+        try await sink.clear()
+
+        let clearCount = await sink.clearCount
+        #expect(returnedLease == pointLease)
+        #expect(ownership.currentProducer == .none)
+        #expect(!ownership.isSessionOpen)
+        #expect(clearCount == 1)
     }
 }
