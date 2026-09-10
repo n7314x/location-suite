@@ -327,6 +327,11 @@ private actor FakeRouteSink: RouteLocationSimulationSink {
         // coordinate; a command that had not begun is rejected by the guard.
         coordinates.append(coordinate)
         sessionWasOpenForCoordinate.append(ownership.isSessionOpen)
+        // A simulated FFI result belongs to the call that began with it. Capture
+        // before suspension so a re-entrant successor cannot consume the prior
+        // producer's queued failure.
+        let failure = nextFailure
+        nextFailure = nil
         if blockNextUpdate {
             blockNextUpdate = false
             await withCheckedContinuation { continuation in
@@ -336,8 +341,7 @@ private actor FakeRouteSink: RouteLocationSimulationSink {
         guard ownership.isCurrent(lease) else {
             throw RoutePlaybackFailure(reason: .superseded, message: "superseded")
         }
-        if let failure = nextFailure {
-            nextFailure = nil
+        if let failure {
             throw failure
         }
     }
