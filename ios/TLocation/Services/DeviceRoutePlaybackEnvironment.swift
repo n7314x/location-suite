@@ -165,8 +165,7 @@ extension RoutePlaybackController {
     static func deviceController() -> RoutePlaybackController {
         RoutePlaybackController(
             sink: DeviceRouteLocationSimulationSink(),
-            activityManager: DeviceRoutePlaybackActivityManager.shared,
-            speedModel: .randomNatural
+            activityManager: DeviceRoutePlaybackActivityManager.shared
         )
     }
 }

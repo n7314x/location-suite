@@ -9,14 +9,33 @@ import Foundation
 
 enum RouteMovementMode: String, Codable, CaseIterable, Sendable {
     case walking
+    case cycling
+    case driving
 }
 
 enum RouteSpeedProfile: String, Codable, CaseIterable, Sendable {
     case natural
 }
 
+enum RouteLoopMode: String, Codable, CaseIterable, Sendable {
+    case off
+    /// Alternates forward and reverse passes so a loop never teleports from a
+    /// distant endpoint back to its start.
+    case infinite
+}
+
+struct RoutePlaybackOptions: Codable, Equatable, Sendable {
+    var loopMode: RouteLoopMode
+
+    init(loopMode: RouteLoopMode = .off) {
+        self.loopMode = loopMode
+    }
+}
+
 enum RouteSource: String, Codable, Sendable {
     case waypoint
+    case imported
+    case web
 }
 
 struct RouteMetadata: Codable, Equatable, Sendable {
@@ -60,6 +79,8 @@ enum RouteValidationError: Error, Equatable, LocalizedError, Sendable {
     case invalidLongitude
     case tooFewPoints
     case tooFewUsablePoints
+    case invalidSpeedMultiplier
+    case invalidResolvedGeometry
 
     var errorDescription: String? {
         switch self {
@@ -73,6 +94,10 @@ enum RouteValidationError: Error, Equatable, LocalizedError, Sendable {
             return "The route contains an invalid coordinate."
         case .tooFewPoints, .tooFewUsablePoints:
             return "Add at least two different waypoints before starting."
+        case .invalidSpeedMultiplier:
+            return "The route speed setting is invalid."
+        case .invalidResolvedGeometry:
+            return "The route contains invalid resolved path geometry."
         }
     }
 }
@@ -144,7 +169,7 @@ struct LocationRoute: Codable, Equatable, Identifiable, Sendable {
         "route_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
 
-    private static func isValidIdentifier(_ id: String) -> Bool {
+    static func isValidIdentifier(_ id: String) -> Bool {
         guard id.hasPrefix("route_"), id.count <= 100 else { return false }
         let suffix = id.dropFirst("route_".count)
         guard !suffix.isEmpty else { return false }

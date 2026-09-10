@@ -64,6 +64,266 @@ struct RouteContractTests {
     }
 }
 
+struct RouteDocumentTests {
+    private func document(
+        id: String = "route_document",
+        mode: RouteMovementMode = .walking,
+        speed: Double = 1,
+        resolved: Bool = true
+    ) throws -> LocationRouteDocument {
+        let anchors = [try point(40, -79), try point(40.001, -78.999)]
+        let geometry = resolved
+            ? try ResolvedRouteGeometry(
+                points: [anchors[0], try point(40.0005, -78.9997), anchors[1]],
+                expectedTravelTime: 90
+            )
+            : nil
+        return try LocationRouteDocument(
+            id: id,
+            name: "Test Route",
+            createdAt: Date(timeIntervalSince1970: 1_800_000_000),
+            modifiedAt: Date(timeIntervalSince1970: 1_800_000_100),
+            movementMode: mode,
+            anchors: anchors,
+            resolvedGeometry: geometry,
+            defaultSpeedMultiplier: speed,
+            source: RouteDocumentSourceMetadata(client: "ios")
+        )
+    }
+
+    @Test func codableRoundTripPreservesGeometryModeSpeedAndVersion() throws {
+        let value = try document(mode: .cycling, speed: 1.5)
+        let data = try RouteDocumentCodec.encode(value)
+        let decoded = try RouteDocumentCodec.decode(data)
+
+        #expect(decoded == value)
+        #expect(decoded.version == 1)
+        #expect(decoded.movementMode == .cycling)
+        #expect(decoded.defaultSpeedMultiplier == 1.5)
+        #expect(decoded.resolvedGeometry?.points.count == 3)
+        #expect(String(decoding: data, as: UTF8.self).contains("\n"))
+    }
+
+    @Test func malformedAndFutureDocumentsAreRejected() throws {
+        #expect(throws: RouteDocumentError.malformedJSON) {
+            try RouteDocumentCodec.decode(Data("not json".utf8))
+        }
+        let current = try document()
+        var object = try #require(
+            JSONSerialization.jsonObject(with: RouteDocumentCodec.encode(current)) as? [String: Any]
+        )
+        object["version"] = 99
+        let future = try JSONSerialization.data(withJSONObject: object)
+        #expect(throws: RouteValidationError.unsupportedVersion(99)) {
+            try RouteDocumentCodec.decode(future)
+        }
+    }
+
+    @Test func reverseUpdatesAnchorsGeometryAndMetrics() throws {
+        let value = try document()
+        let reversed = try value.reversed(now: Date(timeIntervalSince1970: 1_900_000_000))
+        #expect(reversed.anchors == Array(value.anchors.reversed()))
+        #expect(reversed.resolvedGeometry?.points == value.resolvedGeometry.map { Array($0.points.reversed()) })
+        #expect(reversed.distance == value.distance)
+        #expect(reversed.modifiedAt > value.modifiedAt)
+    }
+}
+
+struct RouteDocumentStoreTests {
+    private func makeStore() -> RouteDocumentStore {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("location-suite-tests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("routes.json")
+        return RouteDocumentStore(fileURL: url)
+    }
+
+    private func document(id: String, name: String = "Stored") throws -> LocationRouteDocument {
+        try LocationRouteDocument(
+            id: id,
+            name: name,
+            createdAt: Date(timeIntervalSince1970: 1_800_000_000),
+            modifiedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            movementMode: .driving,
+            anchors: [point(1, 1), point(1.01, 1.01)],
+            resolvedGeometry: ResolvedRouteGeometry(
+                points: [point(1, 1), point(1.005, 1.004), point(1.01, 1.01)]
+            ),
+            defaultSpeedMultiplier: 0.5
+        )
+    }
+
+    @Test func saveLoadRenameDuplicateDeleteAndAtomicReplacement() async throws {
+        let store = makeStore()
+        let first = try document(id: "route_store_a")
+        try await store.save(first)
+        #expect(try await store.load() == [first])
+
+        let renamed = try await store.rename(
+            id: first.id,
+            to: "Renamed",
+            now: Date(timeIntervalSince1970: 1_800_000_200)
+        )
+        #expect(renamed.name == "Renamed")
+        #expect(renamed.movementMode == .driving)
+        #expect(renamed.defaultSpeedMultiplier == 0.5)
+        #expect(renamed.resolvedGeometry != nil)
+
+        let copy = try await store.duplicate(
+            id: first.id,
+            now: Date(timeIntervalSince1970: 1_800_000_300)
+        )
+        #expect(copy.id != first.id)
+        #expect(copy.source?.originalIdentifier == first.id)
+        #expect(try await store.load().count == 2)
+
+        try await store.delete(id: copy.id)
+        #expect(try await store.load() == [renamed])
+
+        let replacement = try document(id: "route_store_b", name: "Replacement")
+        try await store.replaceAll([replacement])
+        #expect(try await store.load() == [replacement])
+    }
+
+    @Test func migratesLegacyTopLevelArrayIntoVersionedEnvelope() async throws {
+        let store = makeStore()
+        let value = try document(id: "route_legacy")
+        let url = await store.fileURL
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try RouteDocumentCodec.makeEncoder().encode([value]).write(to: url, options: .atomic)
+
+        #expect(try await store.load() == [value])
+        let object = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        )
+        #expect(object["version"] as? Int == 1)
+        #expect((object["routes"] as? [Any])?.count == 1)
+    }
+}
+
+private enum FakeDirectionsFailure: Error { case unavailable }
+
+private actor FakeDirectionsProvider: RouteDirectionsProviding {
+    private var segments: [Result<RouteDirectionsSegment, FakeDirectionsFailure>]
+
+    init(_ segments: [Result<RouteDirectionsSegment, FakeDirectionsFailure>]) {
+        self.segments = segments
+    }
+
+    func route(
+        from start: RoutePoint,
+        to end: RoutePoint,
+        mode: RouteMovementMode
+    ) async throws -> RouteDirectionsSegment {
+        guard !segments.isEmpty else { throw FakeDirectionsFailure.unavailable }
+        return try segments.removeFirst().get()
+    }
+}
+
+private actor BlockingDirectionsProvider: RouteDirectionsProviding {
+    private var continuation: CheckedContinuation<RouteDirectionsSegment, Never>?
+    private var blocked = false
+
+    func route(
+        from start: RoutePoint,
+        to end: RoutePoint,
+        mode: RouteMovementMode
+    ) async throws -> RouteDirectionsSegment {
+        blocked = true
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func isBlocked() -> Bool { blocked }
+
+    func release(_ segment: RouteDirectionsSegment) {
+        continuation?.resume(returning: segment)
+        continuation = nil
+    }
+}
+
+struct RouteDirectionsTests {
+    @Test func assemblesMultiAnchorRouteWithoutDuplicateBoundaries() async throws {
+        let a = try point(0, 0)
+        let b = try point(0, 0.001)
+        let c = try point(0.001, 0.001)
+        let provider = FakeDirectionsProvider([
+            .success(RouteDirectionsSegment(points: [a, b], expectedTravelTime: 10)),
+            .success(RouteDirectionsSegment(points: [b, c], expectedTravelTime: 20))
+        ])
+        let resolved = try await RouteDirectionsResolver().resolve(
+            anchors: [a, b, c],
+            mode: .walking,
+            provider: provider
+        )
+        #expect(resolved.points == [a, b, c])
+        #expect(resolved.expectedTravelTime == 30)
+        #expect(resolved.distance > 200)
+    }
+
+    @Test func partialSegmentFailureIsReported() async throws {
+        let a = try point(0, 0)
+        let b = try point(0, 0.001)
+        let c = try point(0.001, 0.001)
+        let provider = FakeDirectionsProvider([
+            .success(RouteDirectionsSegment(points: [a, b])),
+            .failure(.unavailable)
+        ])
+        do {
+            _ = try await RouteDirectionsResolver().resolve(
+                anchors: [a, b, c],
+                mode: .walking,
+                provider: provider
+            )
+            Issue.record("Expected the second segment to fail")
+        } catch let error as RouteDirectionsError {
+            guard case .segmentFailed(let index, _) = error else {
+                Issue.record("Expected a segment failure")
+                return
+            }
+            #expect(index == 1)
+        }
+    }
+
+    @Test func cancellationAndStaleResultAreIgnored() async throws {
+        let a = try point(0, 0)
+        let b = try point(0, 0.001)
+        let segment = RouteDirectionsSegment(points: [a, b])
+
+        let cancellationProvider = BlockingDirectionsProvider()
+        let cancelled = Task {
+            try await RouteDirectionsResolver().resolve(
+                anchors: [a, b], mode: .walking, provider: cancellationProvider
+            )
+        }
+        while !(await cancellationProvider.isBlocked()) { await Task.yield() }
+        cancelled.cancel()
+        await cancellationProvider.release(segment)
+        do {
+            _ = try await cancelled.value
+            Issue.record("Expected cancellation")
+        } catch let error as RouteDirectionsError {
+            #expect(error == .cancelled)
+        }
+
+        let coordinator = RouteDirectionsCoordinator()
+        let staleProvider = BlockingDirectionsProvider()
+        let stale = Task {
+            try await coordinator.resolve(anchors: [a, b], mode: .walking, provider: staleProvider)
+        }
+        while !(await staleProvider.isBlocked()) { await Task.yield() }
+        await coordinator.cancel()
+        await staleProvider.release(segment)
+        do {
+            _ = try await stale.value
+            Issue.record("Expected stale result rejection")
+        } catch let error as RouteDirectionsError {
+            #expect(error == .superseded)
+        }
+    }
+}
+
 struct RouteGeometryTests {
     private let start = try! RoutePoint(latitude: 0, longitude: 0)
     private let end = try! RoutePoint(latitude: 0, longitude: 0.001)
@@ -238,6 +498,80 @@ struct WalkingSpeedModelTests {
         #expect(completed.estimatedRemainingTime == 0)
         #expect(completed.currentCoordinate == shortRoute.points.last)
         #expect(completed.currentSpeed == 0)
+    }
+}
+
+struct MovementProfileTests {
+    @Test func allModeProfilesStayFiniteBoundedAndSane() throws {
+        for mode in RouteMovementMode.allCases {
+            let profile = MovementProfile.profile(for: mode, seed: 44)
+            #expect(profile.cruisingSpeed > 0)
+            #expect(profile.maximumReasonableSpeed >= profile.cruisingSpeed)
+            #expect(profile.maximumAcceleration > 0)
+            #expect(profile.maximumDeceleration > 0)
+            #expect(profile.clampedMultiplier(-10) == profile.multiplierRange.lowerBound)
+            #expect(profile.clampedMultiplier(100) == profile.multiplierRange.upperBound)
+            #expect(profile.clampedMultiplier(.nan) == 1)
+
+            for step in 0...1_000 {
+                let factor = profile.variationFactor(at: Double(step) * 0.1)
+                let desired = profile.desiredSpeed(
+                    elapsedTime: Double(step) * 0.1,
+                    distanceRemaining: 1_000,
+                    multiplier: profile.multiplierRange.upperBound
+                )
+                #expect(factor.isFinite)
+                #expect(factor >= profile.minimumVariationFactor)
+                #expect(factor <= profile.maximumVariationFactor)
+                #expect(desired.isFinite)
+                #expect(desired >= 0)
+                #expect(desired <= profile.maximumReasonableSpeed)
+            }
+        }
+    }
+
+    @Test func cyclingAndDrivingAccelerateSmoothlyAndCompleteExactly() throws {
+        for mode in [RouteMovementMode.cycling, .driving] {
+            let value = try LocationRoute(
+                id: "route_\(mode.rawValue)",
+                mode: mode,
+                points: [point(0, 0), point(0, 0.001)]
+            )
+            var engine = try RoutePlaybackEngine(route: value)
+            let profile = engine.speedModel
+            var prior = engine.metrics
+            for _ in 0..<10_000 where !engine.isComplete {
+                let next = engine.advance(by: 0.1)
+                #expect(next.currentSpeed >= 0)
+                #expect(next.currentSpeed.isFinite)
+                #expect(next.distanceTraveled >= prior.distanceTraveled)
+                #expect(next.distanceTraveled - prior.distanceTraveled <= profile.maximumReasonableSpeed * 0.1 + 0.001)
+                #expect(next.currentSpeed - prior.currentSpeed <= profile.maximumAcceleration * 0.1 + 0.000_001)
+                prior = next
+            }
+            #expect(engine.isComplete)
+            #expect(engine.metrics.progress == 1)
+            #expect(engine.metrics.currentCoordinate == value.points.last)
+            #expect(engine.metrics.estimatedRemainingTime == 0)
+        }
+    }
+
+    @Test func infiniteLoopPingPongsWithoutEndpointTeleport() throws {
+        let value = try route([point(0, 0), point(0, 0.00001)], id: "route_loop")
+        var engine = try RoutePlaybackEngine(
+            route: value,
+            options: RoutePlaybackOptions(loopMode: .infinite)
+        )
+        var positions: [RoutePoint] = [engine.metrics.currentCoordinate]
+        for _ in 0..<400 where engine.metrics.completedPasses < 2 {
+            positions.append(engine.advance(by: 0.25).currentCoordinate)
+        }
+
+        #expect(engine.metrics.completedPasses >= 2)
+        #expect(!engine.isComplete)
+        for pair in zip(positions, positions.dropFirst()) {
+            #expect(RouteGeometry.distance(from: pair.0, to: pair.1) < 1)
+        }
     }
 }
 

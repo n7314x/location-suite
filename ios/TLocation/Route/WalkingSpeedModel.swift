@@ -5,18 +5,13 @@
 
 import Foundation
 
-/// A deterministic, continuously differentiable walking-pace profile.
-///
-/// Production controllers use a fresh random seed for each controller lifetime;
-/// tests pass a known seed. Randomness selects phases, event timing, amplitude,
-/// and event direction only. It is never applied to coordinates or sampled on a
-/// per-tick basis, so the resulting velocity has no jitter.
-struct WalkingSpeedModel: Equatable, Sendable {
-    static let minimumMultiplier = 0.5
-    static let maximumMultiplier = 3.0
-    static let multiplierPresets = [0.5, 1.0, 1.5, 2.0, 3.0]
-
+/// One shared, deterministic movement profile used by every route mode.
+/// Variation changes velocity only; coordinates always stay on route geometry.
+struct MovementProfile: Equatable, Sendable {
+    let mode: RouteMovementMode
     let cruisingSpeed: Double
+    let multiplierRange: ClosedRange<Double>
+    let multiplierPresets: [Double]
     let decelerationDistance: Double
     let normalVariationFraction: Double
     let eventAmplitudeRange: ClosedRange<Double>
@@ -26,14 +21,21 @@ struct WalkingSpeedModel: Equatable, Sendable {
     let maximumVariationFactor: Double
     let maximumAcceleration: Double
     let maximumDeceleration: Double
+    let maximumReasonableSpeed: Double
     let seed: UInt64
 
-    static let natural = WalkingSpeedModel(seed: 0)
+    static let minimumMultiplier = 0.5
+    static let maximumMultiplier = 3.0
+    static let multiplierPresets = [0.5, 1.0, 1.5, 2.0, 3.0]
 
-    static var randomNatural: WalkingSpeedModel {
-        WalkingSpeedModel(seed: UInt64.random(in: UInt64.min...UInt64.max))
+    static let natural = MovementProfile(seed: 0)
+
+    static var randomNatural: MovementProfile {
+        MovementProfile(seed: UInt64.random(in: UInt64.min...UInt64.max))
     }
 
+    /// Backward-compatible walking initializer used by focused tests and older
+    /// callers. Mode-specific production profiles come from `profile(for:)`.
     init(
         cruisingSpeed: Double = 1.4,
         decelerationDistance: Double = 6,
@@ -47,7 +49,46 @@ struct WalkingSpeedModel: Equatable, Sendable {
         maximumDeceleration: Double = 0.55,
         seed: UInt64
     ) {
+        self.init(
+            mode: .walking,
+            cruisingSpeed: cruisingSpeed,
+            multiplierRange: 0.5...3,
+            multiplierPresets: [0.5, 1, 1.5, 2, 3],
+            decelerationDistance: decelerationDistance,
+            normalVariationFraction: normalVariationFraction,
+            eventAmplitudeRange: eventAmplitudeRange,
+            eventCycleDuration: eventCycleDuration,
+            eventDurationRange: eventDurationRange,
+            minimumVariationFactor: minimumVariationFactor,
+            maximumVariationFactor: maximumVariationFactor,
+            maximumAcceleration: maximumAcceleration,
+            maximumDeceleration: maximumDeceleration,
+            maximumReasonableSpeed: 5,
+            seed: seed
+        )
+    }
+
+    private init(
+        mode: RouteMovementMode,
+        cruisingSpeed: Double,
+        multiplierRange: ClosedRange<Double>,
+        multiplierPresets: [Double],
+        decelerationDistance: Double,
+        normalVariationFraction: Double,
+        eventAmplitudeRange: ClosedRange<Double>,
+        eventCycleDuration: TimeInterval,
+        eventDurationRange: ClosedRange<TimeInterval>,
+        minimumVariationFactor: Double,
+        maximumVariationFactor: Double,
+        maximumAcceleration: Double,
+        maximumDeceleration: Double,
+        maximumReasonableSpeed: Double,
+        seed: UInt64
+    ) {
+        self.mode = mode
         self.cruisingSpeed = cruisingSpeed.isFinite ? max(cruisingSpeed, 0.1) : 1.4
+        self.multiplierRange = multiplierRange
+        self.multiplierPresets = multiplierPresets
         self.decelerationDistance = decelerationDistance.isFinite ? max(decelerationDistance, 0.1) : 6
         self.normalVariationFraction = normalVariationFraction.isFinite
             ? min(max(normalVariationFraction, 0), 0.1)
@@ -70,52 +111,92 @@ struct WalkingSpeedModel: Equatable, Sendable {
             : max(durationLower, 9)
         self.eventDurationRange = durationLower...durationUpper
 
-        let lowerFactor = minimumVariationFactor.isFinite
-            ? min(max(minimumVariationFactor, 0.5), 1)
-            : 0.72
-        let upperFactor = maximumVariationFactor.isFinite
-            ? max(min(maximumVariationFactor, 1.5), 1)
-            : 1.28
-        self.minimumVariationFactor = lowerFactor
-        self.maximumVariationFactor = upperFactor
+        self.minimumVariationFactor = min(max(minimumVariationFactor, 0.5), 1)
+        self.maximumVariationFactor = max(min(maximumVariationFactor, 1.5), 1)
         self.maximumAcceleration = maximumAcceleration.isFinite ? max(maximumAcceleration, 0.05) : 0.45
         self.maximumDeceleration = maximumDeceleration.isFinite ? max(maximumDeceleration, 0.05) : 0.55
+        self.maximumReasonableSpeed = maximumReasonableSpeed.isFinite
+            ? max(maximumReasonableSpeed, self.cruisingSpeed)
+            : self.cruisingSpeed
         self.seed = seed
     }
 
-    static func clampedMultiplier(_ value: Double) -> Double {
+    static func profile(for mode: RouteMovementMode, seed: UInt64 = 0) -> MovementProfile {
+        switch mode {
+        case .walking:
+            return MovementProfile(seed: seed)
+        case .cycling:
+            return MovementProfile(
+                mode: .cycling,
+                cruisingSpeed: 5.5,
+                multiplierRange: 0.5...3,
+                multiplierPresets: [0.5, 1, 1.5, 2, 3],
+                decelerationDistance: 22,
+                normalVariationFraction: 0.055,
+                eventAmplitudeRange: 0.08...0.14,
+                eventCycleDuration: 28,
+                eventDurationRange: 7...11,
+                minimumVariationFactor: 0.78,
+                maximumVariationFactor: 1.22,
+                maximumAcceleration: 0.8,
+                maximumDeceleration: 1.25,
+                maximumReasonableSpeed: 16,
+                seed: seed
+            )
+        case .driving:
+            return MovementProfile(
+                mode: .driving,
+                cruisingSpeed: 13.9,
+                multiplierRange: 0.25...2,
+                multiplierPresets: [0.25, 0.5, 1, 1.5, 2],
+                decelerationDistance: 90,
+                normalVariationFraction: 0.018,
+                eventAmplitudeRange: 0.035...0.07,
+                eventCycleDuration: 34,
+                eventDurationRange: 8...13,
+                minimumVariationFactor: 0.88,
+                maximumVariationFactor: 1.12,
+                maximumAcceleration: 2.0,
+                maximumDeceleration: 3.2,
+                maximumReasonableSpeed: 38,
+                seed: seed
+            )
+        }
+    }
+
+    static func multiplierRange(for mode: RouteMovementMode) -> ClosedRange<Double> {
+        profile(for: mode).multiplierRange
+    }
+
+    static func clampedMultiplier(_ value: Double, mode: RouteMovementMode = .walking) -> Double {
+        let range = multiplierRange(for: mode)
         guard value.isFinite else { return 1 }
-        return min(max(value, minimumMultiplier), maximumMultiplier)
+        return min(max(value, range.lowerBound), range.upperBound)
     }
 
-    /// The long-term selected pace. ETA uses this rather than the momentary
-    /// variation so it responds to the speed control without bouncing per tick.
+    func clampedMultiplier(_ value: Double) -> Double {
+        guard value.isFinite else { return 1 }
+        return min(max(value, multiplierRange.lowerBound), multiplierRange.upperBound)
+    }
+
     func targetSpeed(multiplier: Double) -> Double {
-        cruisingSpeed * Self.clampedMultiplier(multiplier)
+        min(cruisingSpeed * clampedMultiplier(multiplier), maximumReasonableSpeed)
     }
 
-    /// Desired instantaneous speed before the engine applies acceleration and
-    /// deceleration limits. Natural variation is velocity-only and bounded.
     func desiredSpeed(
         elapsedTime: TimeInterval,
         distanceRemaining: Double,
         multiplier: Double
     ) -> Double {
         guard distanceRemaining.isFinite, distanceRemaining > 0 else { return 0 }
-
         let remainingProgress = min(max(distanceRemaining / decelerationDistance, 0), 1)
-        // Retaining a gentle crawl avoids an asymptotic approach. The engine
-        // snaps only the final centimetres to the exact destination.
-        let destinationFactor = max(0.15, smoothStep(remainingProgress))
+        let destinationFactor = max(0.12, smoothStep(remainingProgress))
         let desired = targetSpeed(multiplier: multiplier)
             * variationFactor(at: elapsedTime)
             * destinationFactor
-        return desired.isFinite ? max(desired, 0) : 0
+        return desired.isFinite ? min(max(desired, 0), maximumReasonableSpeed) : 0
     }
 
-    /// Smooth low-frequency drift plus one several-second event per cycle.
-    /// Event signs alternate, guaranteeing both slow and fast periods over a
-    /// sufficiently long walk while the seed varies their exact shape.
     func variationFactor(at requestedTime: TimeInterval) -> Double {
         let time = requestedTime.isFinite ? max(requestedTime, 0) : 0
         let phaseA = unitRandom(index: 0, salt: 0xA1) * 2 * Double.pi
@@ -127,8 +208,7 @@ struct WalkingSpeedModel: Equatable, Sendable {
 
         let eventIndex = Int(floor(time / eventCycleDuration))
         let cycleStart = Double(eventIndex) * eventCycleDuration
-        let startJitter = unitRandom(index: eventIndex, salt: 0xC3) * 3
-        let eventStart = cycleStart + 4 + startJitter
+        let eventStart = cycleStart + 4 + unitRandom(index: eventIndex, salt: 0xC3) * 3
         let durationUnit = unitRandom(index: eventIndex, salt: 0xD4)
         let duration = eventDurationRange.lowerBound
             + durationUnit * (eventDurationRange.upperBound - eventDurationRange.lowerBound)
@@ -164,3 +244,6 @@ struct WalkingSpeedModel: Equatable, Sendable {
         value * value * (3 - 2 * value)
     }
 }
+
+/// Source compatibility for the first route milestone and its tests.
+typealias WalkingSpeedModel = MovementProfile

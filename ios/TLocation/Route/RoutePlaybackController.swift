@@ -99,7 +99,9 @@ final class RoutePlaybackController: ObservableObject {
     private let sink: RouteLocationSimulationSink
     private let activityManager: RoutePlaybackActivityManaging
     private let automaticallySchedulesTicks: Bool
-    private let speedModel: WalkingSpeedModel
+    private let speedModelOverride: MovementProfile?
+    private let movementSeed: UInt64
+    private var playbackOptions = RoutePlaybackOptions()
     private let ownership: LocationSimulationOwnership
     private var timer: Timer?
     private var generation: UInt64 = 0
@@ -114,13 +116,14 @@ final class RoutePlaybackController: ObservableObject {
         sink: RouteLocationSimulationSink,
         activityManager: RoutePlaybackActivityManaging,
         automaticallySchedulesTicks: Bool = true,
-        speedModel: WalkingSpeedModel = .natural,
+        speedModel: WalkingSpeedModel? = nil,
         ownership: LocationSimulationOwnership = .shared
     ) {
         self.sink = sink
         self.activityManager = activityManager
         self.automaticallySchedulesTicks = automaticallySchedulesTicks
-        self.speedModel = speedModel
+        self.speedModelOverride = speedModel
+        self.movementSeed = speedModel?.seed ?? UInt64.random(in: UInt64.min...UInt64.max)
         self.ownership = ownership
     }
 
@@ -167,8 +170,9 @@ final class RoutePlaybackController: ObservableObject {
         do {
             let newEngine = try RoutePlaybackEngine(
                 route: newRoute,
-                speedModel: speedModel,
-                speedMultiplier: speedMultiplier
+                speedModel: speedModelOverride ?? MovementProfile.profile(for: newRoute.mode, seed: movementSeed),
+                speedMultiplier: speedMultiplier,
+                options: playbackOptions
             )
             route = newRoute
             engine = newEngine
@@ -191,10 +195,17 @@ final class RoutePlaybackController: ObservableObject {
     }
 
     func setSpeedMultiplier(_ requestedMultiplier: Double) {
-        let multiplier = WalkingSpeedModel.clampedMultiplier(requestedMultiplier)
+        let mode = route?.mode ?? .walking
+        let multiplier = MovementProfile.clampedMultiplier(requestedMultiplier, mode: mode)
         speedMultiplier = multiplier
         engine?.setSpeedMultiplier(multiplier)
         if let engine { metrics = engine.metrics }
+    }
+
+    func setLoopMode(_ mode: RouteLoopMode) {
+        guard canEditRoute else { return }
+        playbackOptions.loopMode = mode
+        if let route { _ = prepare(route) }
     }
 
     func play(
@@ -563,8 +574,9 @@ final class RoutePlaybackController: ObservableObject {
         if let route,
            let resetEngine = try? RoutePlaybackEngine(
                route: route,
-               speedModel: speedModel,
-               speedMultiplier: speedMultiplier
+               speedModel: speedModelOverride ?? MovementProfile.profile(for: route.mode, seed: movementSeed),
+               speedMultiplier: speedMultiplier,
+               options: playbackOptions
            ) {
             engine = resetEngine
             metrics = resetEngine.metrics

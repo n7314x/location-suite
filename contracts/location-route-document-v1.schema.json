@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://location-suite.local/contracts/location-route-document-v1.schema.json",
+  "title": "Location Suite Route Document v1",
+  "description": "Stable route interchange document shared by Location Suite mobile and web clients.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "id",
+    "name",
+    "createdAt",
+    "modifiedAt",
+    "movementMode",
+    "anchors",
+    "defaultSpeedMultiplier"
+  ],
+  "properties": {
+    "version": { "const": 1 },
+    "id": {
+      "type": "string",
+      "pattern": "^route_[A-Za-z0-9_-]+$",
+      "maxLength": 100
+    },
+    "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "modifiedAt": { "type": "string", "format": "date-time" },
+    "movementMode": {
+      "type": "string",
+      "enum": ["walking", "cycling", "driving"]
+    },
+    "anchors": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 500,
+      "items": { "$ref": "#/$defs/point" }
+    },
+    "resolvedGeometry": { "$ref": "#/$defs/resolvedGeometry" },
+    "defaultSpeedMultiplier": {
+      "type": "number",
+      "minimum": 0.25,
+      "maximum": 3
+    },
+    "source": { "$ref": "#/$defs/source" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "movementMode": { "const": "driving" } } },
+      "then": { "properties": { "defaultSpeedMultiplier": { "maximum": 2 } } },
+      "else": { "properties": { "defaultSpeedMultiplier": { "minimum": 0.5 } } }
+    }
+  ],
+  "$defs": {
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["latitude", "longitude"],
+      "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 }
+      }
+    },
+    "resolvedGeometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["points", "distance", "provider", "resolvedAt"],
+      "properties": {
+        "points": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 20000,
+          "items": { "$ref": "#/$defs/point" }
+        },
+        "distance": { "type": "number", "exclusiveMinimum": 0 },
+        "expectedTravelTime": { "type": "number", "minimum": 0 },
+        "provider": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "resolvedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "client": { "type": "string", "maxLength": 80 },
+        "originalIdentifier": {
+          "type": "string",
+          "pattern": "^route_[A-Za-z0-9_-]+$",
+          "maxLength": 100
+        }
+      }
+    }
+  }
+}

@@ -114,7 +114,19 @@ struct RouteGeometry: Equatable, Sendable {
             )
         }
 
-        let index = segments.firstIndex { distance <= $0.cumulativeEnd } ?? (segments.count - 1)
+        // Playback asks for this three times per second. Binary search keeps
+        // lookup logarithmic even for a detailed cached MapKit polyline.
+        var lower = 0
+        var upper = segments.count - 1
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if distance <= segments[middle].cumulativeEnd {
+                upper = middle
+            } else {
+                lower = middle + 1
+            }
+        }
+        let index = lower
         let segment = segments[index]
         let fraction = min(max((distance - segment.cumulativeStart) / segment.length, 0), 1)
         return RoutePosition(
@@ -122,6 +134,39 @@ struct RouteGeometry: Equatable, Sendable {
             segmentIndex: index,
             distanceFromStart: distance
         )
+    }
+
+    /// Nearest cumulative route distance for preview/start alignment. This is an
+    /// occasional editing operation, not a playback-tick operation.
+    func nearestDistance(to point: RoutePoint) -> Double {
+        var bestDistance = 0.0
+        var bestSeparation = Double.greatestFiniteMagnitude
+
+        for segment in segments {
+            // Local equirectangular projection is sufficiently accurate for a
+            // single polyline segment and avoids allocating MapKit objects.
+            let latitudeScale = Double.pi * Self.earthRadius / 180
+            let meanLatitude = (segment.start.latitude + segment.end.latitude + point.latitude) / 3
+            let longitudeScale = latitudeScale * cos(meanLatitude * .pi / 180)
+            let ax = segment.start.longitude * longitudeScale
+            let ay = segment.start.latitude * latitudeScale
+            let bx = segment.end.longitude * longitudeScale
+            let by = segment.end.latitude * latitudeScale
+            let px = point.longitude * longitudeScale
+            let py = point.latitude * latitudeScale
+            let dx = bx - ax
+            let dy = by - ay
+            let denominator = dx * dx + dy * dy
+            let fraction = denominator > 0
+                ? min(max(((px - ax) * dx + (py - ay) * dy) / denominator, 0), 1)
+                : 0
+            let separation = hypot(px - (ax + fraction * dx), py - (ay + fraction * dy))
+            if separation < bestSeparation {
+                bestSeparation = separation
+                bestDistance = segment.cumulativeStart + fraction * segment.length
+            }
+        }
+        return min(max(bestDistance, 0), totalDistance)
     }
 
     /// Great-circle interpolation (spherical linear interpolation), including
