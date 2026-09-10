@@ -34,12 +34,29 @@ enum RoutePlaybackState: Equatable, Sendable {
     case starting
     case playing
     case paused
-    case stopping
+    /// Route advancement has ended, but the exact fake coordinate and the
+    /// location-simulation session remain deliberately alive.
+    case stopped
+    /// Device updates cannot currently be delivered. Distance and time are
+    /// frozen while the existing timer retries only the last held coordinate.
+    case connectionInterrupted(RoutePlaybackError)
     case completed
+    /// The explicit Return to Real Location operation is in flight.
+    case clearing
     case error(RoutePlaybackError)
 }
 
+extension RoutePlaybackState {
+    var isConnectionInterrupted: Bool {
+        if case .connectionInterrupted = self { return true }
+        return false
+    }
+}
+
 protocol RouteLocationSimulationSink: Sendable {
+    /// Implementations must serialize set and clear operations in call order.
+    /// That ordering is what lets a final hold update outrank an older route
+    /// tick and lets an explicit clear outrank every older update.
     func setCoordinate(_ coordinate: RoutePoint) async throws
     func clear() async throws
 }
@@ -59,44 +76,65 @@ final class RoutePlaybackController: ObservableObject {
     @Published private(set) var state: RoutePlaybackState = .idle
     @Published private(set) var metrics: RouteMetrics?
     @Published private(set) var isSimulationActive = false
+    @Published private(set) var speedMultiplier = 1.0
+
+    private enum RecoveryState {
+        case paused
+        case stopped
+        case completed
+    }
 
     private(set) var route: LocationRoute?
     private var engine: RoutePlaybackEngine?
     private let sink: RouteLocationSimulationSink
     private let activityManager: RoutePlaybackActivityManaging
     private let automaticallySchedulesTicks: Bool
+    private let speedModel: WalkingSpeedModel
     private var timer: Timer?
     private var generation: UInt64 = 0
     private var updateInFlight = false
     private var lastAdvanceTime: TimeInterval?
     private var lastDeviceUpdateTime: TimeInterval?
     private var heldCoordinate: RoutePoint?
+    private var recoveryState: RecoveryState?
 
     init(
         sink: RouteLocationSimulationSink,
         activityManager: RoutePlaybackActivityManaging,
-        automaticallySchedulesTicks: Bool = true
+        automaticallySchedulesTicks: Bool = true,
+        speedModel: WalkingSpeedModel = .natural
     ) {
         self.sink = sink
         self.activityManager = activityManager
         self.automaticallySchedulesTicks = automaticallySchedulesTicks
+        self.speedModel = speedModel
     }
 
     var canEditRoute: Bool {
         switch state {
-        case .starting, .playing, .paused, .stopping:
+        case .starting, .playing, .paused, .connectionInterrupted, .clearing:
             return false
-        case .idle, .ready, .completed, .error:
+        case .idle, .ready, .stopped, .completed, .error:
             return true
         }
     }
 
-    var canStop: Bool {
+    var canStopRoute: Bool {
         switch state {
-        case .starting, .playing, .paused, .completed:
+        case .starting, .playing, .paused, .connectionInterrupted, .completed:
             return true
-        case .idle, .ready, .stopping, .error:
-            return isSimulationActive
+        case .idle, .ready, .stopped, .clearing, .error:
+            return false
+        }
+    }
+
+    var canReturnToRealLocation: Bool {
+        if isSimulationActive { return true }
+        switch state {
+        case .starting, .playing, .paused, .stopped, .connectionInterrupted, .completed:
+            return true
+        case .idle, .ready, .clearing, .error:
+            return false
         }
     }
 
@@ -104,7 +142,11 @@ final class RoutePlaybackController: ObservableObject {
     func prepare(_ newRoute: LocationRoute) -> Bool {
         guard canEditRoute else { return false }
         do {
-            let newEngine = try RoutePlaybackEngine(route: newRoute)
+            let newEngine = try RoutePlaybackEngine(
+                route: newRoute,
+                speedModel: speedModel,
+                speedMultiplier: speedMultiplier
+            )
             route = newRoute
             engine = newEngine
             metrics = newEngine.metrics
@@ -125,13 +167,26 @@ final class RoutePlaybackController: ObservableObject {
         if !isSimulationActive { invalidateTimer() }
     }
 
+    func setSpeedMultiplier(_ requestedMultiplier: Double) {
+        let multiplier = WalkingSpeedModel.clampedMultiplier(requestedMultiplier)
+        speedMultiplier = multiplier
+        engine?.setSpeedMultiplier(multiplier)
+        if let engine { metrics = engine.metrics }
+    }
+
     func play(_ newRoute: LocationRoute) async {
-        guard state != .starting, state != .playing, state != .paused, state != .stopping else { return }
+        switch state {
+        case .starting, .playing, .paused, .connectionInterrupted, .clearing:
+            return
+        case .idle, .ready, .stopped, .completed, .error:
+            break
+        }
         guard prepare(newRoute), let initialCoordinate = engine?.metrics.currentCoordinate else { return }
 
         generation &+= 1
         let run = generation
         state = .starting
+        recoveryState = nil
         updateInFlight = true
         lastAdvanceTime = nil
 
@@ -140,58 +195,101 @@ final class RoutePlaybackController: ObservableObject {
             guard run == generation, state == .starting else { return }
             updateInFlight = false
             heldCoordinate = initialCoordinate
-            let wasAlreadyActive = isSimulationActive
-            isSimulationActive = true
+            activateSimulationIfNeeded()
             lastDeviceUpdateTime = ProcessInfo.processInfo.systemUptime
-            if !wasAlreadyActive {
-                activityManager.simulationDidStart()
-            }
             state = .playing
             lastAdvanceTime = ProcessInfo.processInfo.systemUptime
             ensureTimerIfNeeded()
         } catch {
             guard run == generation else { return }
             updateInFlight = false
-            failPlayback(with: error)
+            failInitialPlayback(with: error)
         }
     }
 
     func pause() {
         guard state == .playing else { return }
+        engine?.hold()
+        if let engine { metrics = engine.metrics }
         state = .paused
         lastAdvanceTime = nil
     }
 
     func resume() {
-        guard state == .paused else { return }
+        guard state == .paused || state == .stopped else { return }
         state = .playing
+        recoveryState = nil
         lastAdvanceTime = ProcessInfo.processInfo.systemUptime
     }
 
+    /// Ends movement while explicitly retaining the fake location. The final
+    /// set is queued after any older in-flight tick, so the device settles at
+    /// the exact coordinate represented by the last committed metrics.
     @discardableResult
-    func stop() async -> Bool {
-        let isErrorState: Bool
-        if case .error = state {
-            isErrorState = true
-        } else {
-            isErrorState = false
-        }
-        guard canStop || isErrorState else { return true }
+    func stopRoute() async -> Bool {
+        guard canStopRoute else { return state == .stopped }
+
         generation &+= 1
         let stopGeneration = generation
-        state = .stopping
-        updateInFlight = false
+        engine?.hold()
+        if let engine { metrics = engine.metrics }
+        guard let coordinate = heldCoordinate ?? metrics?.currentCoordinate else {
+            state = .error(RoutePlaybackError(
+                reason: .interrupted,
+                message: "The route had no coordinate to hold."
+            ))
+            return false
+        }
+
+        state = .stopped
+        recoveryState = .stopped
+        updateInFlight = true
+        lastAdvanceTime = nil
+        heldCoordinate = coordinate
+        ensureTimerIfNeeded()
+
+        do {
+            try await sink.setCoordinate(coordinate)
+            guard stopGeneration == generation, state == .stopped else { return false }
+            updateInFlight = false
+            activateSimulationIfNeeded()
+            lastDeviceUpdateTime = ProcessInfo.processInfo.systemUptime
+            return true
+        } catch {
+            guard stopGeneration == generation else { return false }
+            updateInFlight = false
+            enterConnectionInterrupted(with: error, recovery: .stopped)
+            return false
+        }
+    }
+
+    /// The only route operation that invokes `clear()` and releases simulation
+    /// ownership. Generation invalidation happens before the clear is enqueued;
+    /// the serial sink then guarantees no older update can run after it.
+    @discardableResult
+    func returnToRealLocation() async -> Bool {
+        guard canReturnToRealLocation else { return true }
+
+        generation &+= 1
+        let clearGeneration = generation
+        state = .clearing
+        recoveryState = nil
+        updateInFlight = true
         lastAdvanceTime = nil
 
         do {
             try await sink.clear()
-            guard stopGeneration == generation else { return false }
-            finishStop(connectionUnavailable: false)
+            guard clearGeneration == generation else { return false }
+            updateInFlight = false
+            finishClear(connectionUnavailable: false)
             return true
         } catch {
-            guard stopGeneration == generation else { return false }
+            guard clearGeneration == generation else { return false }
+            updateInFlight = false
             let failure = normalizedFailure(error, fallback: "The simulated location could not be cleared.")
-            finishStop(connectionUnavailable: failure.marksConnectionUnavailable)
+            // A failed explicit clear must never start resending and accidentally
+            // resurrect a simulation the user asked to end.
+            finishClear(connectionUnavailable: failure.marksConnectionUnavailable)
             state = .error(RoutePlaybackError(reason: failure.reason, message: failure.message))
             return false
         }
@@ -205,11 +303,13 @@ final class RoutePlaybackController: ObservableObject {
         updateInFlight = false
         lastAdvanceTime = nil
         heldCoordinate = nil
+        recoveryState = nil
         if isSimulationActive {
             isSimulationActive = false
             activityManager.simulationDidEnd(connectionUnavailable: false)
         }
         resetToPreparedState()
+        invalidateTimer()
     }
 
     /// Advances one controller tick. Kept internal so the no-device test target
@@ -239,8 +339,17 @@ final class RoutePlaybackController: ObservableObject {
         } catch {
             guard run == generation else { return }
             updateInFlight = false
-            failPlayback(with: error)
+            enterConnectionInterrupted(with: error, recovery: .paused)
         }
+    }
+
+    /// Deterministic test seam and the operation used by the production timer
+    /// for paused/stopped/completed/interrupted keep-alives.
+    func maintainHeldCoordinate() async {
+        guard isSimulationActive,
+              !updateInFlight,
+              let heldCoordinate else { return }
+        await maintain(coordinate: heldCoordinate, run: generation)
     }
 
     private func ensureTimerIfNeeded() {
@@ -266,13 +375,12 @@ final class RoutePlaybackController: ObservableObject {
             let previous = lastAdvanceTime ?? now
             lastAdvanceTime = now
             await advance(by: now - previous)
-        case .paused, .completed, .ready, .idle:
+        case .paused, .stopped, .connectionInterrupted, .completed, .ready, .idle:
             guard isSimulationActive,
                   !updateInFlight,
-                  let heldCoordinate,
                   now - (lastDeviceUpdateTime ?? 0) >= Self.maintenanceInterval else { return }
-            await maintain(coordinate: heldCoordinate, run: generation)
-        case .starting, .stopping, .error:
+            await maintainHeldCoordinate()
+        case .starting, .clearing, .error:
             break
         }
     }
@@ -284,24 +392,57 @@ final class RoutePlaybackController: ObservableObject {
             guard run == generation, isSimulationActive else { return }
             updateInFlight = false
             lastDeviceUpdateTime = ProcessInfo.processInfo.systemUptime
+            if case .connectionInterrupted = state {
+                restoreAfterConnectionRecovery()
+            }
         } catch {
             guard run == generation else { return }
             updateInFlight = false
-            failPlayback(with: error)
+            let recovery = recoveryState ?? recoveryStateForCurrentState()
+            enterConnectionInterrupted(with: error, recovery: recovery)
         }
     }
 
-    private func failPlayback(with error: Error) {
-        let failure = normalizedFailure(error, fallback: "Route playback was interrupted.")
+    private func enterConnectionInterrupted(with error: Error, recovery: RecoveryState) {
+        let failure = normalizedFailure(error, fallback: "Route playback lost its device connection.")
+        engine?.hold()
+        if let engine { metrics = engine.metrics }
+        recoveryState = recovery
+        lastAdvanceTime = nil
+        state = .connectionInterrupted(RoutePlaybackError(reason: failure.reason, message: failure.message))
+        ensureTimerIfNeeded()
+    }
+
+    private func recoveryStateForCurrentState() -> RecoveryState {
+        switch state {
+        case .stopped: return .stopped
+        case .completed: return .completed
+        default: return .paused
+        }
+    }
+
+    private func restoreAfterConnectionRecovery() {
+        switch recoveryState ?? .paused {
+        case .paused: state = .paused
+        case .stopped: state = .stopped
+        case .completed: state = .completed
+        }
+        recoveryState = nil
+        lastAdvanceTime = nil
+    }
+
+    private func failInitialPlayback(with error: Error) {
+        let failure = normalizedFailure(error, fallback: "Route playback could not start.")
         generation &+= 1
         lastAdvanceTime = nil
         heldCoordinate = nil
+        recoveryState = nil
         if isSimulationActive {
             isSimulationActive = false
+            activityManager.simulationDidEnd(connectionUnavailable: failure.marksConnectionUnavailable)
         }
-        activityManager.simulationDidEnd(connectionUnavailable: failure.marksConnectionUnavailable)
         state = .error(RoutePlaybackError(reason: failure.reason, message: failure.message))
-        if !isSimulationActive { invalidateTimer() }
+        invalidateTimer()
     }
 
     private func transitionToError(_ error: Error, fallback: String) {
@@ -314,17 +455,31 @@ final class RoutePlaybackController: ObservableObject {
         return RoutePlaybackFailure(reason: .interrupted, message: fallback)
     }
 
-    private func finishStop(connectionUnavailable: Bool) {
+    private func activateSimulationIfNeeded() {
+        guard !isSimulationActive else { return }
+        isSimulationActive = true
+        activityManager.simulationDidStart()
+    }
+
+    private func finishClear(connectionUnavailable: Bool) {
         heldCoordinate = nil
         lastDeviceUpdateTime = nil
-        isSimulationActive = false
-        activityManager.simulationDidEnd(connectionUnavailable: connectionUnavailable)
+        recoveryState = nil
+        if isSimulationActive {
+            isSimulationActive = false
+            activityManager.simulationDidEnd(connectionUnavailable: connectionUnavailable)
+        }
         resetToPreparedState()
         invalidateTimer()
     }
 
     private func resetToPreparedState() {
-        if let route, let resetEngine = try? RoutePlaybackEngine(route: route) {
+        if let route,
+           let resetEngine = try? RoutePlaybackEngine(
+               route: route,
+               speedModel: speedModel,
+               speedMultiplier: speedMultiplier
+           ) {
             engine = resetEngine
             metrics = resetEngine.metrics
             state = .ready

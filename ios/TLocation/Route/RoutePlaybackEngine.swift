@@ -24,40 +24,73 @@ struct RoutePlaybackEngine: Equatable, Sendable {
 
     private(set) var distanceTraveled = 0.0
     private(set) var elapsedTime: TimeInterval = 0
+    private(set) var speedMultiplier: Double
+    private(set) var currentSpeed = 0.0
 
-    init(route: LocationRoute, speedModel: WalkingSpeedModel = .natural) throws {
+    init(
+        route: LocationRoute,
+        speedModel: WalkingSpeedModel = .natural,
+        speedMultiplier: Double = 1
+    ) throws {
         self.route = route
         self.geometry = try RouteGeometry(route: route)
         self.speedModel = speedModel
+        self.speedMultiplier = WalkingSpeedModel.clampedMultiplier(speedMultiplier)
     }
 
     var isComplete: Bool { distanceTraveled >= geometry.totalDistance }
 
-    var metrics: RouteMetrics {
-        makeMetrics(currentSpeed: isComplete ? 0 : speedModel.speed(
-            elapsedTime: elapsedTime,
-            distanceRemaining: geometry.totalDistance - distanceTraveled
-        ))
+    var metrics: RouteMetrics { makeMetrics(currentSpeed: currentSpeed) }
+
+    mutating func setSpeedMultiplier(_ value: Double) {
+        speedMultiplier = WalkingSpeedModel.clampedMultiplier(value)
+    }
+
+    /// Playback time and distance stay frozen while velocity drops to zero.
+    /// The next advance ramps up through the same acceleration limiter.
+    mutating func hold() {
+        currentSpeed = 0
     }
 
     @discardableResult
     mutating func advance(by requestedInterval: TimeInterval) -> RouteMetrics {
-        guard !isComplete else { return makeMetrics(currentSpeed: 0) }
+        guard !isComplete else {
+            currentSpeed = 0
+            return makeMetrics(currentSpeed: 0)
+        }
         let interval = requestedInterval.isFinite ? max(requestedInterval, 0) : 0
+        guard interval > 0 else { return makeMetrics(currentSpeed: currentSpeed) }
         elapsedTime += interval
 
         let remaining = max(geometry.totalDistance - distanceTraveled, 0)
-        let speed = speedModel.speed(elapsedTime: elapsedTime, distanceRemaining: remaining)
-        let step = max(speed * interval, 0)
+        let desiredSpeed = speedModel.desiredSpeed(
+            elapsedTime: elapsedTime,
+            distanceRemaining: remaining,
+            multiplier: speedMultiplier
+        )
+        currentSpeed = rateLimitedSpeed(toward: desiredSpeed, interval: interval)
+        let step = max(currentSpeed * interval, 0)
+
         // Finish exactly once the next update would reach/cross the destination,
         // or once only sub-GPS centimetres remain at the deceleration crawl.
         if step >= remaining || remaining <= max(0.05, step * 1.05) {
             distanceTraveled = geometry.totalDistance
+            currentSpeed = 0
             return makeMetrics(currentSpeed: 0)
         }
 
         distanceTraveled = min(distanceTraveled + step, geometry.totalDistance)
-        return makeMetrics(currentSpeed: speed)
+        return makeMetrics(currentSpeed: currentSpeed)
+    }
+
+    private func rateLimitedSpeed(toward desiredSpeed: Double, interval: TimeInterval) -> Double {
+        let desired = desiredSpeed.isFinite ? max(desiredSpeed, 0) : 0
+        let delta = desired - currentSpeed
+        let maximumDelta = (delta >= 0 ? speedModel.maximumAcceleration : speedModel.maximumDeceleration)
+            * interval
+        let limitedDelta = min(max(delta, -maximumDelta), maximumDelta)
+        let result = currentSpeed + limitedDelta
+        return result.isFinite ? max(result, 0) : 0
     }
 
     private func makeMetrics(currentSpeed: Double) -> RouteMetrics {
@@ -66,8 +99,12 @@ struct RoutePlaybackEngine: Equatable, Sendable {
         let remaining = max(total - traveled, 0)
         let progress = total > 0 ? min(max(traveled / total, 0), 1) : 1
         let position = geometry.position(atDistance: traveled)
-        let fallbackSpeed = max(speedModel.cruisingSpeed * 0.4, 0.1)
-        let eta = remaining > 0 ? remaining / max(currentSpeed, fallbackSpeed) : 0
+
+        // ETA deliberately follows the selected long-term pace, not the current
+        // event envelope or acceleration ramp, so a natural slowdown does not
+        // make the label jump every third of a second.
+        let etaReferenceSpeed = max(speedModel.targetSpeed(multiplier: speedMultiplier), 0.1)
+        let eta = remaining > 0 ? remaining / etaReferenceSpeed : 0
 
         return RouteMetrics(
             totalDistance: total,

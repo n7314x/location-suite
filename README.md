@@ -49,3 +49,7 @@ build details, permissions, installation steps, and real-device test checklist.
 Manual waypoint walking routes, their shared v1 JSON contract, playback
 lifecycle, and background-execution boundary are documented in
 [Route engine milestone 1](docs/ios/route-engine-milestone-1.md).
+
+The endpoint-first cellular-runtime investigation, current upstream evidence,
+and physical-device diagnostic matrix are documented in
+[Mobile polish and cellular runtime](docs/ios/mobile-polish-cellular-runtime.md).

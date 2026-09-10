@@ -4,19 +4,65 @@
 //
 
 import Foundation
+import Network
 
 final class TunnelManager: ObservableObject {
     static let shared = TunnelManager()
 
     @Published private(set) var isConnected = false
+    @Published private(set) var underlyingNetwork: UnderlyingNetworkKind = .unknown
+    @Published private(set) var endpointReachability: EndpointReachability = .unknown
+    @Published private(set) var lastConnectionFailureCategory: PhoneLocalConnectionFailureCategory?
+    @Published private(set) var lastConnectionFailure: String?
 
     private var isStarting = false
+    private let pathMonitor = NWPathMonitor()
+    private let pathMonitorQueue = DispatchQueue(label: "vn.truongkma.tlocation.network-path")
+    private var networkRetryWorkItem: DispatchWorkItem?
 
-    private init() {}
+    private init() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let kind = Self.networkKind(for: path)
+            DispatchQueue.main.async {
+                self?.networkPathChanged(to: kind)
+            }
+        }
+        pathMonitor.start(queue: pathMonitorQueue)
+    }
 
     func markDisconnected() {
         runOnMain {
             self.isConnected = false
+            self.endpointReachability = .unknown
+        }
+    }
+
+    /// Records the endpoint actually used by a point/route simulation. These
+    /// calls are more authoritative than interface type and keep diagnostics in
+    /// step when the bootstrap tunnel itself is not the active session.
+    func recordSimulationEndpointSuccess() {
+        runOnMain {
+            self.isConnected = true
+            self.endpointReachability = .reachable
+            self.lastConnectionFailureCategory = nil
+            self.lastConnectionFailure = nil
+        }
+    }
+
+    func recordSimulationEndpointFailure(code: Int32, detail: String) {
+        runOnMain {
+            switch code {
+            case 9, 10, 11:
+                // The RemotePairing handshake succeeded; a service above it
+                // rejected the request.
+                self.endpointReachability = .reachable
+                self.isConnected = true
+            default:
+                self.endpointReachability = .unreachable
+                self.isConnected = false
+            }
+            self.lastConnectionFailureCategory = Self.failureCategory(forSimulationCode: code)
+            self.lastConnectionFailure = detail
         }
     }
 
@@ -29,7 +75,11 @@ final class TunnelManager: ObservableObject {
         }
 
         let pairingFileURL = PairingFileStore.prepareURL()
-        guard FileManager.default.fileExists(atPath: pairingFileURL.path) else {
+        let pairingFilePresent = FileManager.default.fileExists(atPath: pairingFileURL.path)
+        guard PhoneLocalConnectionPolicy.shouldAttemptConnection(
+            pairingFilePresent: pairingFilePresent,
+            underlyingNetwork: underlyingNetwork
+        ) else {
             isConnected = false
             LogManager.shared.addWarningLog(
                 "Tunnel start skipped: no pairing file at \(pairingFileURL.path)"
@@ -42,6 +92,7 @@ final class TunnelManager: ObservableObject {
         }
 
         isStarting = true
+        endpointReachability = .checking
 
         DispatchQueue.global(qos: .userInteractive).async { [showErrorUI] in
             let result: Result<Void, NSError>
@@ -64,12 +115,18 @@ final class TunnelManager: ObservableObject {
         switch result {
         case .success:
             isConnected = true
+            endpointReachability = .reachable
+            lastConnectionFailureCategory = nil
+            lastConnectionFailure = nil
             LogManager.shared.addInfoLog(
                 "Tunnel connected successfully to \(DeviceConnectionContext.targetIPAddress):49152"
             )
             mountDeveloperDiskImageIfNeeded()
         case .failure(let error):
             isConnected = false
+            endpointReachability = .unreachable
+            lastConnectionFailureCategory = Self.failureCategory(for: error)
+            lastConnectionFailure = error.localizedDescription
             handleStartFailure(error, showErrorUI: showErrorUI)
         }
     }
@@ -126,6 +183,53 @@ final class TunnelManager: ObservableObject {
             work()
         } else {
             DispatchQueue.main.async(execute: work)
+        }
+    }
+
+    private func networkPathChanged(to kind: UnderlyingNetworkKind) {
+        let didChange = underlyingNetwork != kind
+        underlyingNetwork = kind
+        guard didChange,
+              !isConnected,
+              !isStarting,
+              !LocationSimulationSession.isMaintained else { return }
+
+        networkRetryWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  !self.isConnected,
+                  !self.isStarting,
+                  !LocationSimulationSession.isMaintained else { return }
+            self.start(showErrorUI: false)
+        }
+        networkRetryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: workItem)
+    }
+
+    private static func networkKind(for path: NWPath) -> UnderlyingNetworkKind {
+        guard path.status == .satisfied else { return .unavailable }
+        if path.usesInterfaceType(.wifi) { return .wifi }
+        if path.usesInterfaceType(.cellular) { return .cellular }
+        return .other
+    }
+
+    private static func failureCategory(for error: NSError) -> PhoneLocalConnectionFailureCategory {
+        let message = error.localizedDescription.lowercased()
+        if error.code == -18 || message.contains("parse target ip") { return .invalidAddress }
+        if message.contains("no route") || message.contains("network is unreachable") { return .noRoute }
+        if error.code == 61 || message.contains("refused") { return .refused }
+        if message.contains("timed out") || message.contains("timeout") { return .timedOut }
+        if error.code == -9 || message.contains("pair") || message.contains("verify") { return .pairing }
+        return .unknown
+    }
+
+    private static func failureCategory(forSimulationCode code: Int32) -> PhoneLocalConnectionFailureCategory {
+        switch code {
+        case 1: return .invalidAddress
+        case 2: return .pairing
+        case 3: return .noRoute
+        case 9, 10, 11, 12: return .service
+        default: return .unknown
         }
     }
 }
@@ -199,7 +303,7 @@ private func tunnelConnectionAlertMessage(for error: NSError) -> String {
         recoverySteps = [
             String(localized: "Open LocalDevVPN and confirm the VPN is connected."),
             String(localized: "Make sure LocalDevVPN is using the default \(defaultIP) address."),
-            String(localized: "Reconnect Wi-Fi and LocalDevVPN, then try again."),
+            String(localized: "Reconnect LocalDevVPN, then try again."),
             String(localized: "If this keeps happening, select a fresh pairing file.")
         ]
     } else if error.code == -18 || lowercasedMessage.contains("parse target ip") {
@@ -211,21 +315,22 @@ private func tunnelConnectionAlertMessage(for error: NSError) -> String {
     } else if lowercasedMessage.contains("timed out") || lowercasedMessage.contains("timeout") {
         likelyCause = String(localized: "The app could not reach the device before the connection timed out.")
         recoverySteps = [
-            String(localized: "Confirm Wi-Fi and LocalDevVPN are both connected."),
+            String(localized: "Confirm LocalDevVPN is connected."),
             String(localized: "Wake and unlock the target device."),
-            String(localized: "Confirm LocalDevVPN is exposing the device at \(targetIP).")
+            String(localized: "Confirm LocalDevVPN is exposing the device at \(targetIP)."),
+            String(localized: "If cellular is active, iOS may not be publishing RemotePairing; the endpoint result is authoritative.")
         ]
     } else if lowercasedMessage.contains("network is unreachable") || lowercasedMessage.contains("no route") {
         likelyCause = String(localized: "The VPN route to the device is not available.")
         recoverySteps = [
             String(localized: "Disconnect and reconnect LocalDevVPN."),
             String(localized: "Confirm iOS shows the VPN indicator."),
-            String(localized: "Try switching Wi-Fi off and on.")
+            String(localized: "Retry after the network path finishes changing.")
         ]
     } else {
         likelyCause = String(localized: "The connection to this device could not be created.")
         recoverySteps = [
-            String(localized: "Confirm Wi-Fi and LocalDevVPN are connected."),
+            String(localized: "Confirm LocalDevVPN is connected."),
             String(localized: "Wake and unlock the target device."),
             String(localized: "Reconnect LocalDevVPN, then try again.")
         ]
@@ -239,7 +344,7 @@ private func tunnelConnectionAlertMessage(for error: NSError) -> String {
 
     // The raw FFI message is deliberately left untranslated — it is diagnostic
     // detail for a bug report, not prose for the user.
-    return String(
+    let message = String(
         localized: """
         \(likelyCause)
 
@@ -253,4 +358,7 @@ private func tunnelConnectionAlertMessage(for error: NSError) -> String {
         Code \(error.code): \(rawMessage)
         """
     )
+    let network = TunnelManager.shared.underlyingNetwork.rawValue
+    let reachable = TunnelManager.shared.endpointReachability.rawValue
+    return message + "\nUnderlying network: \(network)\nEndpoint reachable: \(reachable)"
 }

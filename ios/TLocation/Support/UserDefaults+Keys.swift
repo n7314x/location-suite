@@ -34,5 +34,9 @@ extension UserDefaults {
         /// Absent (or "system") means follow the device language. See
         /// `LanguageSettings`.
         static let appLanguage = "appLanguage"
+
+        /// Selected route pace multiplier. Validated again when read so an old
+        /// or externally edited preference cannot exceed walking safety bounds.
+        static let routeSpeedMultiplier = "routeSpeedMultiplier"
     }
 }

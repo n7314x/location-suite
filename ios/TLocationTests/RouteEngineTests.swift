@@ -125,25 +125,111 @@ struct RouteGeometryTests {
     }
 }
 
-struct WalkingPlaybackEngineTests {
-    @Test func naturalWalkingRampsUpAndDeceleratesNearDestination() {
-        let model = WalkingSpeedModel.natural
-        let early = model.speed(elapsedTime: 0.5, distanceRemaining: 100)
-        let cruise = model.speed(elapsedTime: 5, distanceRemaining: 100)
-        let nearFinish = model.speed(elapsedTime: 5, distanceRemaining: 1)
+struct WalkingSpeedModelTests {
+    @Test func defaultMultiplierAndClampingAreSafe() throws {
+        let value = try route([point(0, 0), point(0, 0.01)])
+        var engine = try RoutePlaybackEngine(route: value)
 
-        #expect(early > 0)
-        #expect(early < cruise)
-        #expect(cruise > 1.2 && cruise < 1.6)
-        #expect(nearFinish < cruise)
-        #expect(nearFinish > 0)
+        #expect(engine.speedMultiplier == 1)
+        engine.setSpeedMultiplier(0.1)
+        #expect(engine.speedMultiplier == 0.5)
+        engine.setSpeedMultiplier(8)
+        #expect(engine.speedMultiplier == 3)
+        engine.setSpeedMultiplier(.nan)
+        #expect(engine.speedMultiplier == 1)
+    }
+
+    @Test func seededVariationIsDeterministicAndBounded() {
+        let first = WalkingSpeedModel(seed: 42)
+        let second = WalkingSpeedModel(seed: 42)
+
+        for step in 0...2_400 {
+            let time = Double(step) * 0.1
+            let a = first.variationFactor(at: time)
+            let b = second.variationFactor(at: time)
+            #expect(a == b)
+            #expect(a >= first.minimumVariationFactor)
+            #expect(a <= first.maximumVariationFactor)
+            #expect(a.isFinite)
+            #expect(a > 0)
+        }
+    }
+
+    @Test func variationContainsSmoothSlowAndFastEvents() {
+        let model = WalkingSpeedModel(seed: 0)
+        var minimum = Double.greatestFiniteMagnitude
+        var maximum = -Double.greatestFiniteMagnitude
+        var largestTickChange = 0.0
+        var previous = model.variationFactor(at: 0)
+
+        for step in 1...1_200 {
+            let factor = model.variationFactor(at: Double(step) * 0.1)
+            minimum = min(minimum, factor)
+            maximum = max(maximum, factor)
+            largestTickChange = max(largestTickChange, abs(factor - previous))
+            previous = factor
+        }
+
+        #expect(minimum < 0.9)
+        #expect(maximum > 1.1)
+        #expect(largestTickChange < 0.02)
+    }
+
+    @Test func eventEnvelopeReturnsTowardTheTarget() {
+        let model = WalkingSpeedModel(
+            normalVariationFraction: 0,
+            eventAmplitudeRange: 0.18...0.18,
+            eventCycleDuration: 22,
+            eventDurationRange: 8...8,
+            seed: 0
+        )
+        let samples = stride(from: 0.0, through: 22.0, by: 0.05)
+            .map { model.variationFactor(at: $0) }
+        let lowestIndex = samples.indices.min(by: { samples[$0] < samples[$1] }) ?? 0
+
+        #expect(samples[lowestIndex] < 0.83)
+        #expect(abs(samples.last! - 1) < 0.000_001)
+    }
+
+    @Test func multiplierChangeUsesReasonableAccelerationAndChangesEta() throws {
+        let value = try route([point(0, 0), point(0, 0.02)])
+        let model = WalkingSpeedModel(normalVariationFraction: 0, eventAmplitudeRange: 0...0, seed: 5)
+        var engine = try RoutePlaybackEngine(route: value, speedModel: model)
+
+        for _ in 0..<30 { engine.advance(by: 0.1) }
+        let before = engine.metrics
+        engine.setSpeedMultiplier(3)
+        let etaAfterSetting = engine.metrics.estimatedRemainingTime
+        let firstFasterTick = engine.advance(by: 0.1)
+
+        #expect(etaAfterSetting < before.estimatedRemainingTime / 2)
+        #expect(firstFasterTick.currentSpeed > before.currentSpeed)
+        #expect(firstFasterTick.currentSpeed - before.currentSpeed <= model.maximumAcceleration * 0.1 + 0.000_001)
+    }
+
+    @Test func naturalVariationNeverCreatesCoordinateJumps() throws {
+        let value = try route([point(0, 0), point(0, 0.02)])
+        let model = WalkingSpeedModel(seed: 92)
+        var engine = try RoutePlaybackEngine(route: value, speedModel: model, speedMultiplier: 3)
+        var previous = engine.metrics
+
+        for _ in 0..<1_200 where !engine.isComplete {
+            let current = engine.advance(by: 0.1)
+            let distanceStep = current.distanceTraveled - previous.distanceTraveled
+            #expect(distanceStep >= 0)
+            #expect(distanceStep <= model.targetSpeed(multiplier: 3) * model.maximumVariationFactor * 0.1 + 0.000_001)
+            #expect(current.currentSpeed.isFinite)
+            #expect(current.currentSpeed >= 0)
+            previous = current
+        }
     }
 
     @Test func completionIsExactAndEtaNeverInvalid() throws {
         let shortRoute = try route([point(0, 0), point(0, 0.00001)])
         var engine = try RoutePlaybackEngine(route: shortRoute)
         let initial = engine.metrics
-        let completed = engine.advance(by: 100)
+        for _ in 0..<200 where !engine.isComplete { engine.advance(by: 0.25) }
+        let completed = engine.metrics
 
         #expect(initial.estimatedRemainingTime.isFinite)
         #expect(initial.estimatedRemainingTime >= 0)
@@ -152,6 +238,43 @@ struct WalkingPlaybackEngineTests {
         #expect(completed.estimatedRemainingTime == 0)
         #expect(completed.currentCoordinate == shortRoute.points.last)
         #expect(completed.currentSpeed == 0)
+    }
+}
+
+struct PhoneLocalConnectionPolicyTests {
+    @Test func cellularIsNeverRejectedAsAnInterfacePolicy() {
+        #expect(PhoneLocalConnectionPolicy.shouldAttemptConnection(
+            pairingFilePresent: true,
+            underlyingNetwork: .cellular
+        ))
+        #expect(PhoneLocalConnectionPolicy.shouldAttemptConnection(
+            pairingFilePresent: true,
+            underlyingNetwork: .unavailable
+        ))
+    }
+
+    @Test func reachableEndpointIsAcceptedRegardlessOfNetworkType() {
+        for network in [UnderlyingNetworkKind.wifi, .cellular, .other, .unavailable, .unknown] {
+            #expect(PhoneLocalConnectionPolicy.shouldAttemptConnection(
+                pairingFilePresent: true,
+                underlyingNetwork: network
+            ))
+            #expect(PhoneLocalConnectionPolicy.isReady(
+                endpointReachability: .reachable,
+                remotePairingConnected: true
+            ))
+        }
+    }
+
+    @Test func unreachableEndpointIsNotReportedReady() {
+        #expect(!PhoneLocalConnectionPolicy.isReady(
+            endpointReachability: .unreachable,
+            remotePairingConnected: false
+        ))
+        #expect(!PhoneLocalConnectionPolicy.shouldAttemptConnection(
+            pairingFilePresent: false,
+            underlyingNetwork: .wifi
+        ))
     }
 }
 
@@ -221,7 +344,8 @@ struct RoutePlaybackControllerTests {
             RoutePlaybackController(
                 sink: sink,
                 activityManager: activity,
-                automaticallySchedulesTicks: false
+                automaticallySchedulesTicks: false,
+                speedModel: WalkingSpeedModel(seed: 7)
             ),
             sink,
             activity
@@ -234,133 +358,239 @@ struct RoutePlaybackControllerTests {
 
     @Test func pauseFreezesAndResumeContinuesExactProgress() async throws {
         let (controller, _, _) = makeController()
-        let value = try standardRoute()
-        await controller.play(value)
+        await controller.play(try standardRoute())
         await controller.advance(by: 1)
-        let beforePause = try #require(controller.metrics)
-
         controller.pause()
+        let paused = try #require(controller.metrics)
+
         await controller.advance(by: 1)
         #expect(controller.state == .paused)
-        #expect(controller.metrics == beforePause)
+        #expect(controller.metrics == paused)
+        #expect(paused.currentSpeed == 0)
 
         controller.resume()
         await controller.advance(by: 1)
         #expect(controller.state == .playing)
-        #expect((controller.metrics?.distanceTraveled ?? 0) > beforePause.distanceTraveled)
+        #expect((controller.metrics?.distanceTraveled ?? 0) > paused.distanceTraveled)
     }
 
-    @Test func stopClearsAndResetsToReady() async throws {
+    @Test func stopRouteHoldsExactCoordinateWithoutClearing() async throws {
         let (controller, sink, activity) = makeController()
         await controller.play(try standardRoute())
-        let stopped = await controller.stop()
+        await controller.advance(by: 1)
+        let beforeStop = try #require(controller.metrics)
+        let stopped = await controller.stopRoute()
 
         #expect(stopped)
-        #expect(controller.state == .ready)
-        #expect(!controller.isSimulationActive)
-        let clearCount = await sink.clearCount
-        #expect(clearCount == 1)
-        #expect(activity.starts == 1)
-        #expect(activity.ends == 1)
-    }
-
-    @Test func completionHoldsDestinationUntilExplicitStop() async throws {
-        let (controller, sink, _) = makeController()
-        let value = try route([point(0, 0), point(0, 0.00001)], id: "route_complete")
-        await controller.play(value)
-        for _ in 0..<20 where controller.state == .playing {
-            await controller.advance(by: 1)
-        }
-
-        #expect(controller.state == .completed)
-        #expect(controller.metrics?.progress == 1)
-        #expect(controller.metrics?.currentCoordinate == value.points.last)
+        #expect(controller.state == .stopped)
         #expect(controller.isSimulationActive)
-        let clearCountBeforeStop = await sink.clearCount
-        #expect(clearCountBeforeStop == 0)
-
-        let stopped = await controller.stop()
-        let clearCountAfterStop = await sink.clearCount
-        #expect(stopped)
-        #expect(clearCountAfterStop == 1)
+        #expect(controller.metrics?.currentCoordinate == beforeStop.currentCoordinate)
+        #expect(controller.metrics?.distanceTraveled == beforeStop.distanceTraveled)
+        #expect(controller.metrics?.elapsedTime == beforeStop.elapsedTime)
+        #expect(controller.metrics?.currentSpeed == 0)
+        let clearCount = await sink.clearCount
+        let lastCoordinate = await sink.coordinates.last
+        #expect(clearCount == 0)
+        #expect(lastCoordinate == beforeStop.currentCoordinate)
+        #expect(activity.starts == 1)
+        #expect(activity.ends == 0)
     }
 
-    @Test func updateFailureStopsAdvancementAndEntersReadableError() async throws {
-        let (controller, sink, activity) = makeController()
+    @Test func stoppedKeepAliveResendsOnlyHeldCoordinateAndNeverAdvances() async throws {
+        let (controller, sink, _) = makeController()
         await controller.play(try standardRoute())
-        await sink.failNextUpdate(
-            RoutePlaybackFailure(
-                reason: .tunnelUnavailable,
-                message: "Reconnect LocalDevVPN before playing again."
-            )
-        )
+        await controller.advance(by: 1)
+        _ = await controller.stopRoute()
+        let stopped = try #require(controller.metrics)
+        let countBeforeMaintenance = await sink.coordinates.count
+
+        await controller.maintainHeldCoordinate()
+
+        let coordinateCount = await sink.coordinates.count
+        let lastCoordinate = await sink.coordinates.last
+        #expect(controller.state == .stopped)
+        #expect(controller.metrics == stopped)
+        #expect(coordinateCount == countBeforeMaintenance + 1)
+        #expect(lastCoordinate == stopped.currentCoordinate)
+    }
+
+    @Test func resumeFromStoppedContinuesFromExactProgress() async throws {
+        let (controller, _, _) = makeController()
+        await controller.play(try standardRoute())
+        await controller.advance(by: 1)
+        _ = await controller.stopRoute()
+        let stopped = try #require(controller.metrics)
+
+        controller.resume()
         await controller.advance(by: 1)
 
-        guard case .error(let error) = controller.state else {
-            Issue.record("Expected route playback error")
-            return
-        }
-        #expect(error.reason == .tunnelUnavailable)
-        #expect(error.message.contains("LocalDevVPN"))
-        #expect(!controller.isSimulationActive)
-        #expect(activity.connectionMarkedUnavailable)
+        #expect(controller.state == .playing)
+        #expect((controller.metrics?.distanceTraveled ?? 0) > stopped.distanceTraveled)
+        #expect((controller.metrics?.elapsedTime ?? 0) > stopped.elapsedTime)
     }
 
-    @Test func stopWinsAgainstAnOlderInFlightUpdate() async throws {
+    @Test func replayAfterStoppedStartsAtRouteBeginningWithoutClear() async throws {
+        let (controller, sink, activity) = makeController()
+        let value = try standardRoute()
+        await controller.play(value)
+        await controller.advance(by: 1)
+        _ = await controller.stopRoute()
+
+        await controller.play(value)
+
+        let clearCount = await sink.clearCount
+        #expect(controller.state == .playing)
+        #expect(controller.metrics?.distanceTraveled == 0)
+        #expect(controller.metrics?.currentCoordinate == value.points.first)
+        #expect(clearCount == 0)
+        #expect(activity.starts == 1)
+    }
+
+    @Test func returnToRealLocationClearsFromPlayingPausedStoppedAndCompleted() async throws {
+        for sourceState in 0..<4 {
+            let (controller, sink, activity) = makeController()
+            let value = sourceState == 3
+                ? try route([point(0, 0), point(0, 0.00001)], id: "route_clear_complete")
+                : try standardRoute(id: "route_clear_\(sourceState)")
+            await controller.play(value)
+
+            if sourceState == 1 {
+                controller.pause()
+            } else if sourceState == 2 {
+                _ = await controller.stopRoute()
+            } else if sourceState == 3 {
+                for _ in 0..<200 where controller.state == .playing {
+                    await controller.advance(by: 0.25)
+                }
+                #expect(controller.state == .completed)
+            }
+
+            let returned = await controller.returnToRealLocation()
+            let clearCount = await sink.clearCount
+
+            #expect(returned)
+            #expect(controller.state == .ready)
+            #expect(!controller.isSimulationActive)
+            #expect(clearCount == 1)
+            #expect(activity.ends == 1)
+        }
+    }
+
+    @Test func stopWinsAgainstAnOlderInFlightTickAndRestoresExactHold() async throws {
+        let (controller, sink, _) = makeController()
+        await controller.play(try standardRoute())
+        let committed = try #require(controller.metrics)
+        await sink.armBlockedUpdate()
+
+        let oldTick = Task { await controller.advance(by: 1) }
+        while !(await sink.isBlocked()) { await Task.yield() }
+        let stop = Task { await controller.stopRoute() }
+        await Task.yield()
+        await sink.releaseBlockedUpdate()
+        await oldTick.value
+
+        let stopped = await stop.value
+        let lastCoordinate = await sink.coordinates.last
+        let clearCount = await sink.clearCount
+        #expect(stopped)
+        #expect(controller.state == .stopped)
+        #expect(controller.metrics?.currentCoordinate == committed.currentCoordinate)
+        #expect(controller.metrics?.distanceTraveled == committed.distanceTraveled)
+        #expect(lastCoordinate == committed.currentCoordinate)
+        #expect(clearCount == 0)
+    }
+
+    @Test func staleTickCannotResurrectAfterReturnToRealLocation() async throws {
         let (controller, sink, _) = makeController()
         await controller.play(try standardRoute())
         await sink.armBlockedUpdate()
 
-        let oldUpdate = Task { await controller.advance(by: 1) }
+        let oldTick = Task { await controller.advance(by: 1) }
         while !(await sink.isBlocked()) { await Task.yield() }
-        let stop = Task { await controller.stop() }
+        let clear = Task { await controller.returnToRealLocation() }
         await Task.yield()
         await sink.releaseBlockedUpdate()
-        await oldUpdate.value
+        await oldTick.value
+        let returned = await clear.value
+        #expect(returned)
+        let coordinateCountAfterClear = await sink.coordinates.count
 
-        let stopped = await stop.value
+        await controller.advance(by: 1)
+        await controller.maintainHeldCoordinate()
+
         let clearCount = await sink.clearCount
-        #expect(stopped)
-        #expect(controller.state == .ready)
-        #expect(!controller.isSimulationActive)
+        let finalCoordinateCount = await sink.coordinates.count
         #expect(clearCount == 1)
+        #expect(finalCoordinateCount == coordinateCountAfterClear)
+        #expect(!controller.isSimulationActive)
+        #expect(controller.state == .ready)
     }
 
-    @Test func repeatedPlayStopCyclesHaveOneAuthoritativeLifecycle() async throws {
+    @Test func connectionFailureFreezesProgressRetriesHoldAndRecoversPaused() async throws {
         let (controller, sink, activity) = makeController()
-        let value = try standardRoute()
+        await controller.play(try standardRoute())
+        let committed = try #require(controller.metrics)
+        await sink.failNextUpdate(RoutePlaybackFailure(
+            reason: .tunnelUnavailable,
+            message: "Reconnect LocalDevVPN before resuming."
+        ))
 
-        for _ in 0..<3 {
-            await controller.play(value)
-            #expect(controller.state == .playing)
-            let stopped = await controller.stop()
-            #expect(stopped)
-            #expect(controller.state == .ready)
+        await controller.advance(by: 1)
+
+        guard case .connectionInterrupted(let error) = controller.state else {
+            Issue.record("Expected a connection-interrupted hold")
+            return
         }
+        #expect(error.reason == .tunnelUnavailable)
+        #expect(controller.metrics?.distanceTraveled == committed.distanceTraveled)
+        #expect(controller.metrics?.elapsedTime == committed.elapsedTime)
+        #expect(controller.isSimulationActive)
+        #expect(activity.ends == 0)
+        let clearCountAfterFailure = await sink.clearCount
+        #expect(clearCountAfterFailure == 0)
 
-        let clearCount = await sink.clearCount
-        #expect(clearCount == 3)
-        #expect(activity.starts == 3)
-        #expect(activity.ends == 3)
+        await controller.maintainHeldCoordinate()
+        let lastCoordinate = await sink.coordinates.last
+        #expect(controller.state == .paused)
+        #expect(controller.metrics?.currentCoordinate == committed.currentCoordinate)
+        #expect(lastCoordinate == committed.currentCoordinate)
     }
 
-    @Test func aNewRouteCanReplaceACompletedRouteWithoutClearingFirst() async throws {
-        let (controller, sink, activity) = makeController()
-        let first = try route([point(0, 0), point(0, 0.00001)], id: "route_first")
-        let second = try route([point(1, 1), point(1, 1.001)], id: "route_second")
+    @Test func reconnectDoesNotCreateDuplicateMaintenanceUpdates() async throws {
+        let (controller, sink, _) = makeController()
+        await controller.play(try standardRoute())
+        _ = await controller.stopRoute()
+        let before = await sink.coordinates.count
+        await sink.armBlockedUpdate()
 
-        await controller.play(first)
-        for _ in 0..<20 where controller.state == .playing {
-            await controller.advance(by: 1)
+        let first = Task { await controller.maintainHeldCoordinate() }
+        while !(await sink.isBlocked()) { await Task.yield() }
+        let duplicate = Task { await controller.maintainHeldCoordinate() }
+        await duplicate.value
+        await sink.releaseBlockedUpdate()
+        await first.value
+
+        let coordinateCount = await sink.coordinates.count
+        #expect(coordinateCount == before + 1)
+        #expect(controller.state == .stopped)
+    }
+
+    @Test func completedRouteKeepsDestinationUntilExplicitReturn() async throws {
+        let (controller, sink, _) = makeController()
+        let value = try route([point(0, 0), point(0, 0.00001)], id: "route_complete")
+        await controller.play(value)
+        for _ in 0..<200 where controller.state == .playing {
+            await controller.advance(by: 0.25)
         }
+
         #expect(controller.state == .completed)
-
-        await controller.play(second)
-        #expect(controller.state == .playing)
-        #expect(controller.route?.id == second.id)
-        #expect(controller.metrics?.currentCoordinate == second.points.first)
+        #expect(controller.metrics?.currentCoordinate == value.points.last)
+        #expect(controller.isSimulationActive)
         let clearCount = await sink.clearCount
         #expect(clearCount == 0)
-        #expect(activity.starts == 1)
+
+        await controller.maintainHeldCoordinate()
+        let lastCoordinate = await sink.coordinates.last
+        #expect(lastCoordinate == value.points.last)
     }
 }

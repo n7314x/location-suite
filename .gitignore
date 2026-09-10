@@ -33,13 +33,18 @@ Payload/
 *.mobileprovision
 *.p12
 *.pfx
+*.p8
 *.cer
 *.key
 *.pem
+*.pkey
+*.ppk
+*.jks
 *.mobiledevicepairing
 *.mobiledevicepair
 pairingFile.plist
 rp_pairing_file.plist
+adi.pb
 
 # Local databases outside the default data directory
 *.db
