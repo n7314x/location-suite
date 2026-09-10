@@ -370,9 +370,7 @@ enum LocationSimulationSession {
     private static var maintained = false
 
     static var isOpen: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return open
+        LocationSimulationOwnership.shared.isSessionOpen
     }
 
     static var isMaintained: Bool {
@@ -394,10 +392,13 @@ enum LocationSimulationSession {
 
     fileprivate static func set(open newValue: Bool) {
         lock.lock()
+        let didChange = open != newValue
         let didClose = open && !newValue
         open = newValue
         lock.unlock()
 
+        LocationSimulationOwnership.shared.setSessionOpen(newValue)
+        if didChange { postSessionChanged() }
         if didClose { postSessionEnded() }
     }
 
@@ -406,6 +407,12 @@ enum LocationSimulationSession {
     private static func postSessionEnded() {
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: .locationSimulationSessionEnded, object: nil)
+        }
+    }
+
+    private static func postSessionChanged() {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .locationSimulationSessionChanged, object: nil)
         }
     }
 }

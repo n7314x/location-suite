@@ -9,17 +9,39 @@ import Foundation
 import UIKit
 
 struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
-    func setCoordinate(_ coordinate: RoutePoint) async throws {
+    private enum CoordinateOutcome: Sendable {
+        case superseded
+        case completed(code: Int32, reusedOpenSession: Bool)
+    }
+
+    func setCoordinate(
+        _ coordinate: RoutePoint,
+        lease: LocationSimulationProducerLease
+    ) async throws {
         let pairingFilePath = PairingFileStore.prepareURL().path
-        guard FileManager.default.fileExists(atPath: pairingFilePath) else {
-            throw RoutePlaybackFailure(
-                reason: .noPairingFile,
-                message: "Import a pairing file before starting route playback."
-            )
-        }
         let deviceIP = DeviceConnectionContext.targetIPAddress
-        let code = await runOnLocationCommandQueue {
-            simulate_location(deviceIP, coordinate.latitude, coordinate.longitude, pairingFilePath)
+        let outcome = await runOnLocationCommandQueue {
+            guard LocationSimulationOwnership.shared.isCurrent(lease) else {
+                return .superseded
+            }
+            let reusedOpenSession = LocationSimulationSession.isOpen
+            let code = simulate_location(
+                deviceIP,
+                coordinate.latitude,
+                coordinate.longitude,
+                pairingFilePath
+            )
+            guard LocationSimulationOwnership.shared.isCurrent(lease) else {
+                return .superseded
+            }
+            return .completed(code: code, reusedOpenSession: reusedOpenSession)
+        }
+
+        guard case .completed(let code, let reusedOpenSession) = outcome else {
+            throw RoutePlaybackFailure(
+                reason: .superseded,
+                message: "A newer location mode took ownership of the simulation."
+            )
         }
         guard code == 0 else {
             TunnelManager.shared.recordSimulationEndpointFailure(
@@ -28,7 +50,9 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
             )
             throw Self.failure(for: code, clearing: false)
         }
-        TunnelManager.shared.recordSimulationEndpointSuccess()
+        TunnelManager.shared.recordSimulationCoordinateSuccess(
+            reusedOpenSession: reusedOpenSession
+        )
     }
 
     func clear() async throws {
@@ -36,7 +60,9 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
         guard code == 0 else { throw Self.failure(for: code, clearing: true) }
     }
 
-    private func runOnLocationCommandQueue(_ operation: @escaping () -> Int32) async -> Int32 {
+    private func runOnLocationCommandQueue<T: Sendable>(
+        _ operation: @escaping @Sendable () -> T
+    ) async -> T {
         await withCheckedContinuation { continuation in
             LocationSimulationCommandQueue.shared.async {
                 continuation.resume(returning: operation())
@@ -84,23 +110,32 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
 
 @MainActor
 final class DeviceRoutePlaybackActivityManager: RoutePlaybackActivityManaging {
-    private var isActive = false
+    static let shared = DeviceRoutePlaybackActivityManager()
+
+    private var activeLease: LocationSimulationProducerLease?
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
-    func simulationDidStart() {
-        guard !isActive else { return }
-        isActive = true
-        LocationSimulationSession.setMaintained(true)
-        BackgroundLocationManager.shared.requestStart()
+    func simulationDidTakeOwnership(_ lease: LocationSimulationProducerLease) {
+        guard LocationSimulationOwnership.shared.isCurrent(lease) else { return }
+        let wasActive = activeLease != nil
+        activeLease = lease
+        if !wasActive {
+            LocationSimulationSession.setMaintained(true)
+            BackgroundLocationManager.shared.requestStart()
+        }
         beginBackgroundTask()
     }
 
-    func simulationDidEnd(connectionUnavailable: Bool) {
-        if isActive {
-            isActive = false
-            LocationSimulationSession.setMaintained(false)
-            BackgroundLocationManager.shared.requestStop()
-        }
+    func simulationDidEnd(
+        _ lease: LocationSimulationProducerLease,
+        connectionUnavailable: Bool
+    ) {
+        // A prior producer may finish after point/route handoff. Its stale end
+        // must not stop the successor's maintenance or disconnect its tunnel.
+        guard activeLease == lease else { return }
+        activeLease = nil
+        LocationSimulationSession.setMaintained(false)
+        BackgroundLocationManager.shared.requestStop()
         endBackgroundTask()
         if connectionUnavailable {
             markTunnelDisconnected()
@@ -125,7 +160,7 @@ extension RoutePlaybackController {
     static func deviceController() -> RoutePlaybackController {
         RoutePlaybackController(
             sink: DeviceRouteLocationSimulationSink(),
-            activityManager: DeviceRoutePlaybackActivityManager(),
+            activityManager: DeviceRoutePlaybackActivityManager.shared,
             speedModel: .randomNatural
         )
     }

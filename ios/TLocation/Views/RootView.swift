@@ -97,6 +97,7 @@ struct RootView: View {
     )
     @State private var isShowingExpiryWarning = false
     @State private var suppressExpiryWarning = false
+    @State private var simulationSessionOpen = LocationSimulationSession.isOpen
     /// The expiry warning is decided once per launch — but only once there is
     /// something to decide *with*. Without this, dismissing with "Later" would
     /// only last until the app next came back to the foreground.
@@ -107,13 +108,16 @@ struct RootView: View {
     private var isReady: Bool {
         pairingExists
             && (
-                LocationSimulationSession.isMaintained
-                    || PhoneLocalConnectionPolicy.isReady(
-                        endpointReachability: tunnel.endpointReachability,
-                        remotePairingConnected: tunnel.isConnected
+                simulationSessionOpen
+                    || LocationSimulationSession.isMaintained
+                    || (
+                        PhoneLocalConnectionPolicy.isReady(
+                            endpointReachability: tunnel.endpointReachability,
+                            remotePairingConnected: tunnel.isConnected
+                        )
+                        && mounting.coolisMounted
                     )
             )
-            && mounting.coolisMounted
     }
 
     var body: some View {
@@ -186,6 +190,9 @@ struct RootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .showPairingFilePicker)) { _ in
             isShowingPairingFilePicker = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .locationSimulationSessionChanged)) { _ in
+            simulationSessionOpen = LocationSimulationSession.isOpen
         }
         .onOpenURL { url in
             handleURL(url)

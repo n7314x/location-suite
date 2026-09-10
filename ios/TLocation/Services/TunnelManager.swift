@@ -37,13 +37,17 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// Records the endpoint actually used by a point/route simulation. These
-    /// calls are more authoritative than interface type and keep diagnostics in
-    /// step when the bootstrap tunnel itself is not the active session.
-    func recordSimulationEndpointSuccess() {
+    /// Records a coordinate accepted by the simulation service. An update on an
+    /// already-open session proves that warm session is healthy, but says
+    /// nothing about whether a *fresh* TCP connection can currently be made.
+    /// Only a coordinate that had to build a session updates fresh endpoint and
+    /// RemotePairing diagnostics.
+    func recordSimulationCoordinateSuccess(reusedOpenSession: Bool) {
         runOnMain {
-            self.isConnected = true
-            self.endpointReachability = .reachable
+            if !reusedOpenSession {
+                self.isConnected = true
+                self.endpointReachability = .reachable
+            }
             self.lastConnectionFailureCategory = nil
             self.lastConnectionFailure = nil
         }
@@ -71,6 +75,13 @@ final class TunnelManager: ObservableObject {
             DispatchQueue.main.async {
                 self.start(showErrorUI: showErrorUI)
             }
+            return
+        }
+
+        guard !LocationSimulationSession.isOpen else {
+            LogManager.shared.addInfoLog(
+                "Fresh tunnel start skipped: the warm location-simulation session is still open."
+            )
             return
         }
 
@@ -192,6 +203,7 @@ final class TunnelManager: ObservableObject {
         guard didChange,
               !isConnected,
               !isStarting,
+              !LocationSimulationSession.isOpen,
               !LocationSimulationSession.isMaintained else { return }
 
         networkRetryWorkItem?.cancel()
@@ -199,6 +211,7 @@ final class TunnelManager: ObservableObject {
             guard let self,
                   !self.isConnected,
                   !self.isStarting,
+                  !LocationSimulationSession.isOpen,
                   !LocationSimulationSession.isMaintained else { return }
             self.start(showErrorUI: false)
         }

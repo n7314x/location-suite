@@ -29,6 +29,20 @@ private enum MapInteractionMode {
     case route
 }
 
+private enum PointCoordinateResult: Sendable {
+    case succeeded
+    case failed(Int32)
+    case stale
+
+    var code: Int32? {
+        switch self {
+        case .succeeded: return 0
+        case .failed(let code): return code
+        case .stale: return nil
+        }
+    }
+}
+
 /// Parses coordinates typed or pasted directly into the search field (e.g.
 /// "21.012452, 105.847002"). File-based import (GPX/KML/GeoJSON/CSV) has been
 /// removed; this inline text path is all that remains and must keep working.
@@ -439,8 +453,8 @@ struct LocationSimulationView: View {
     /// `nil` until the map has reported a region at least once.
     @State private var cameraSpan: MKCoordinateSpan?
 
-    @State private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     @State private var resendTimer: Timer?
+    @State private var pointProducerLease: LocationSimulationProducerLease?
     @State private var isBusy = false
     /// Drives the single consolidated `.alert` below — see `PendingAlert`.
     /// Nothing else in this view decides whether an alert is on screen.
@@ -728,7 +742,11 @@ struct LocationSimulationView: View {
             mapControlButton(
                 systemImage: "figure.walk",
                 accessibilityLabel: "Waypoint Route Mode",
-                isDisabled: hasActiveSimulation || isBusy || !routePlayback.canEditRoute,
+                isDisabled: isBusy || (
+                    interactionMode == .point
+                        ? !routePlayback.canEditRoute
+                        : !routePlayback.canRelinquishWithoutClearing
+                ),
                 isSelected: interactionMode == .route,
                 action: toggleRouteMode
             )
@@ -1279,7 +1297,6 @@ struct LocationSimulationView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulateLocationRequested)) { notification in
             guard let requested = LocationSimulationRequest.coordinate(from: notification) else { return }
-            routePlayback.relinquishWithoutClearing()
             interactionMode = .point
             if LocationSimulationRequest.isAlreadyApplied(notification) {
                 adoptExternalSimulation(at: requested)
@@ -1326,11 +1343,7 @@ struct LocationSimulationView: View {
             // Balances the `startTracking()` above: no GPS runs while the map
             // is off screen.
             currentLocationProvider.stopTracking()
-            stopResendLoop()
-            if backgroundTaskID != .invalid {
-                BackgroundLocationManager.shared.requestStop()
-            }
-            endBackgroundTask()
+            stopPointProducer()
         }
     }
 
@@ -1382,10 +1395,10 @@ struct LocationSimulationView: View {
 
         if coordinate != nil {
             HStack(spacing: 12) {
-                Button("Stop") { clear() }
+                Button("Return", role: .destructive) { returnToRealLocation() }
                     .buttonStyle(.bordered)
-                    .tint(.red)
                     .disabled(!pairingExists || isBusy || !hasActiveSimulation)
+                    .accessibilityLabel("Return to Real Location")
 
                 Button("Simulate Location", action: simulate)
                     .buttonStyle(.borderedProminent)
@@ -1474,10 +1487,11 @@ struct LocationSimulationView: View {
                 routeSpeedMenu
 
                 if routePlayback.isSimulationActive {
-                    Button("Return to Real", role: .destructive) {
+                    Button("Return", role: .destructive) {
                         returnToRealLocation()
                     }
                     .buttonStyle(.bordered)
+                    .accessibilityLabel("Return to Real Location")
                 }
 
                 Button {
@@ -1682,8 +1696,17 @@ struct LocationSimulationView: View {
     }
 
     private func toggleRouteMode() {
-        guard !hasActiveSimulation, !isBusy, routePlayback.canEditRoute else { return }
-        interactionMode = interactionMode == .route ? .point : .route
+        guard !isBusy else { return }
+        if interactionMode == .point {
+            guard routePlayback.canEditRoute else { return }
+            // The point producer keeps holding/resending while the route is
+            // drafted. Ownership moves only when Play is tapped.
+            interactionMode = .route
+        } else {
+            guard routePlayback.canRelinquishWithoutClearing else { return }
+            routePlayback.relinquishWithoutClearing()
+            interactionMode = .point
+        }
         dismissSearch()
         Haptics.light()
     }
@@ -1725,7 +1748,14 @@ struct LocationSimulationView: View {
 
     private func playRoute() {
         guard pairingExists, let route = preparedRoute, routePlayback.canEditRoute else { return }
-        Task { await routePlayback.play(route) }
+        Task {
+            await routePlayback.play(route) {
+                // The route lease is already current and its shared maintenance
+                // activity is already active. Retiring point mode here prevents
+                // any queued/timer resend from following the first route fix.
+                stopPointProducer()
+            }
+        }
     }
 
     private func stopRoute() {
@@ -1760,17 +1790,10 @@ struct LocationSimulationView: View {
     /// loop would resend the map's older position and silently undo the
     /// shortcut.
     private func adoptExternalSimulation(at requested: CLLocationCoordinate2D) {
-        // Exactly one keep-alive activation should be outstanding while a
-        // simulation is running. The intent took one of its own before posting;
-        // if this view was already holding one, release it so the two do not
-        // stack and leave background location running after the next stop.
-        if hasActiveSimulation {
-            BackgroundLocationManager.shared.requestStop()
-        }
+        let lease = takePointOwnership()
         coordinate = requested
         recenterCamera(on: requested)
-        beginBackgroundTask()
-        startResendLoop(with: requested)
+        startResendLoop(with: requested, lease: lease)
     }
 
     /// Counterpart of `adoptExternalSimulation`: the intent has already cleared
@@ -1783,23 +1806,36 @@ struct LocationSimulationView: View {
     /// resend loop stopped, background task ended, and the pin still on screen
     /// ready to be re-simulated.
     private func adoptExternalClear() {
-        stopResendLoop()
-        endBackgroundTask()
+        stopPointProducer()
     }
 
     private func simulate(at target: CLLocationCoordinate2D?) {
         guard pairingExists, let coord = target, !isBusy else { return }
         coordinate = coord
-        runLocationCommand(
-            errorTitle: String(localized: "Simulation Failed"),
-            errorMessage: { code in
-                String(localized: "Could not simulate location (error \(code)). Make sure the device is connected and the Developer Disk Image (DDI) is mounted.")
-            },
-            operation: { locationUpdateCode(for: coord) }
-        ) {
-            beginBackgroundTask()
-            startResendLoop(with: coord)
-            BackgroundLocationManager.shared.requestStart()
+        let lease = takePointOwnership()
+        isBusy = true
+        LocationSimulationCommandQueue.shared.async {
+            guard LocationSimulationOwnership.shared.isCurrent(lease) else {
+                DispatchQueue.main.async { isBusy = false }
+                return
+            }
+            let result = pointLocationUpdate(for: coord, lease: lease)
+            DispatchQueue.main.async {
+                isBusy = false
+                guard LocationSimulationOwnership.shared.isCurrent(lease) else { return }
+                switch result {
+                case .failed(let code):
+                    stopPointProducer()
+                    pendingAlert = .message(
+                        title: String(localized: "Simulation Failed"),
+                        body: String(localized: "Could not simulate location (error \(code)). Make sure the device is connected and the Developer Disk Image (DDI) is mounted.")
+                    )
+                case .succeeded:
+                    startResendLoop(with: coord, lease: lease)
+                case .stale:
+                    break
+                }
+            }
         }
     }
 
@@ -1827,7 +1863,9 @@ struct LocationSimulationView: View {
 
     private func clear(onFailure: (() -> Void)? = nil, onCleared: (() -> Void)? = nil) {
         guard pairingExists, !isBusy else { return }
-        stopResendLoop()
+        LocationSimulationOwnership.shared.invalidateAll()
+        stopPointProducer()
+        routePlayback.relinquishWithoutClearing()
         runLocationCommand(
             errorTitle: String(localized: "Clear Failed"),
             errorMessage: { code in
@@ -1836,8 +1874,6 @@ struct LocationSimulationView: View {
             operation: clear_simulated_location,
             onFailure: onFailure
         ) {
-            endBackgroundTask()
-            BackgroundLocationManager.shared.requestStop()
             // The simulated fix is gone; bounce the tracking session so the
             // real dot arrives as soon as CoreLocation can manage rather than
             // waiting out `distanceFilter`'s cache. Covers both the Stop
@@ -1849,19 +1885,13 @@ struct LocationSimulationView: View {
         }
     }
 
-    private func beginBackgroundTask() {
-        guard backgroundTaskID == .invalid else { return }
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask { endBackgroundTask() }
-    }
-
-    private func endBackgroundTask() {
-        guard backgroundTaskID != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(backgroundTaskID)
-        backgroundTaskID = .invalid
-    }
-
-    private func startResendLoop(with coordinate: CLLocationCoordinate2D) {
+    private func startResendLoop(
+        with coordinate: CLLocationCoordinate2D,
+        lease: LocationSimulationProducerLease
+    ) {
+        guard LocationSimulationOwnership.shared.isCurrent(lease) else { return }
         simulatedCoordinate = coordinate
+        pointProducerLease = lease
         consecutiveResendFailures = 0
         resendTimer?.invalidate()
         // Starts a new run, and in doing so retires any tick still queued from
@@ -1870,7 +1900,6 @@ struct LocationSimulationView: View {
         // so a tick carrying the *old* anchor could otherwise land after the
         // new one. See `ResendGeneration`.
         let generation = ResendGeneration.invalidate()
-        LocationSimulationSession.setMaintained(true)
         resendTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { _ in
             guard let simulatedCoordinate else { return }
             // `simulatedCoordinate` is the fixed anchor set above (or in
@@ -1890,8 +1919,14 @@ struct LocationSimulationView: View {
                 // or the app concluding the simulation is dead — it must not
                 // simulate anything, least of all resurrect a simulation the
                 // user has already been told is over.
-                guard ResendGeneration.isCurrent(generation) else { return }
-                let code = locationUpdateCode(for: sendCoordinate)
+                guard ResendGeneration.isCurrent(generation),
+                      LocationSimulationOwnership.shared.isCurrent(lease) else { return }
+                guard let code = pointLocationUpdate(
+                    for: sendCoordinate,
+                    lease: lease
+                ).code else {
+                    return
+                }
                 // The verdict is reached here, on the queue that runs the ticks,
                 // not on the main thread: if this is the failure that ends the
                 // run, `record` retires the run before returning, which is
@@ -1998,9 +2033,7 @@ struct LocationSimulationView: View {
         // main-thread half: killing the timer, dropping the anchor, and
         // retracting `LocationSimulationSession.isMaintained`, which is what
         // releases the deferred tunnel rebuild below.
-        stopResendLoop()
-        endBackgroundTask()
-        BackgroundLocationManager.shared.requestStop()
+        stopPointProducer()
         // Same reasoning as `clear()`'s success path: whatever the device is
         // reporting now, this app should stop sitting on a cached simulated fix.
         currentLocationProvider.refreshTracking()
@@ -2093,7 +2126,33 @@ struct LocationSimulationView: View {
         )
     }
 
-    private func stopResendLoop() {
+    /// Claims point production and transfers the one shared maintenance
+    /// activity before retiring any route/older-point work. Stale owners can no
+    /// longer stop the new activity because the activity manager is lease-aware.
+    private func takePointOwnership() -> LocationSimulationProducerLease {
+        let previousPointLease = pointProducerLease
+        let lease = LocationSimulationOwnership.shared.claim(.point)
+        DeviceRoutePlaybackActivityManager.shared.simulationDidTakeOwnership(lease)
+
+        // Invalidates route generations/timers without touching the underlying
+        // simulation handle. Its activity-end callback carries the stale route
+        // lease and therefore cannot stop the point activity just installed.
+        routePlayback.relinquishWithoutClearing()
+
+        if let previousPointLease {
+            retirePointLoop(lease: previousPointLease)
+        }
+        pointProducerLease = lease
+        return lease
+    }
+
+    private func stopPointProducer() {
+        let lease = pointProducerLease
+        pointProducerLease = nil
+        retirePointLoop(lease: lease)
+    }
+
+    private func retirePointLoop(lease: LocationSimulationProducerLease?) {
         resendTimer?.invalidate()
         resendTimer = nil
         simulatedCoordinate = nil
@@ -2111,7 +2170,12 @@ struct LocationSimulationView: View {
         // the run on the queue before it ever gets here; this bump is then just
         // the next one along.
         ResendGeneration.invalidate()
-        LocationSimulationSession.setMaintained(false)
+        guard let lease else { return }
+        LocationSimulationOwnership.shared.relinquish(lease)
+        DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
+            lease,
+            connectionUnavailable: false
+        )
     }
 
     /// - Parameter recenter: `true` for programmatic selections (search result,
@@ -2230,17 +2294,28 @@ struct LocationSimulationView: View {
         }
     }
 
-    private func locationUpdateCode(for coordinate: CLLocationCoordinate2D) -> Int32 {
+    private func pointLocationUpdate(
+        for coordinate: CLLocationCoordinate2D,
+        lease: LocationSimulationProducerLease
+    ) -> PointCoordinateResult {
+        guard LocationSimulationOwnership.shared.isCurrent(lease) else { return .stale }
+        let reusedOpenSession = LocationSimulationSession.isOpen
         let code = simulate_location(deviceIP, coordinate.latitude, coordinate.longitude, pairingFilePath)
+        // Ownership can change while the synchronous FFI call is in progress.
+        // The successor's command is serialized behind this one and will be the
+        // final coordinate; this stale result must not alter its diagnostics.
+        guard LocationSimulationOwnership.shared.isCurrent(lease) else { return .stale }
         if code == 0 {
-            TunnelManager.shared.recordSimulationEndpointSuccess()
+            TunnelManager.shared.recordSimulationCoordinateSuccess(
+                reusedOpenSession: reusedOpenSession
+            )
         } else {
             TunnelManager.shared.recordSimulationEndpointFailure(
                 code: code,
                 detail: "Point coordinate delivery failed with device code \(code)."
             )
         }
-        return code
+        return code == 0 ? .succeeded : .failed(code)
     }
 }
 

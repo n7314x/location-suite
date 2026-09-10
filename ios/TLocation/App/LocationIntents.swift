@@ -285,25 +285,34 @@ enum LocationIntentRunner {
         }
 
         let pairingFilePath = try requirePairingFile()
-        try await ensureDeviceReady()
+        // A live simulation session is stronger evidence than a fresh endpoint
+        // probe. On LTE the existing DVT session can keep accepting coordinates
+        // even when opening another TCP connection would be refused.
+        if !LocationSimulationSession.isOpen {
+            try await ensureDeviceReady()
+        }
 
         let deviceIP = DeviceConnectionContext.targetIPAddress
-        let code = try await run(
+        let result = try await run(
             on: LocationSimulationCommandQueue.shared,
             timeout: commandTimeout,
             step: String(localized: "Simulating the location")
         ) {
-            simulate_location(deviceIP, latitude, longitude, pairingFilePath)
+            let code = simulate_location(deviceIP, latitude, longitude, pairingFilePath)
+            let lease = code == 0
+                ? LocationSimulationOwnership.shared.claim(.point)
+                : nil
+            return IntentSimulationResult(code: code, lease: lease)
         }
 
-        guard code == 0 else {
-            LogManager.shared.addErrorLog("Shortcut simulate failed with code \(code)")
-            throw LocationIntentError.simulationFailed(code: Int(code))
+        guard result.code == 0, let lease = result.lease else {
+            LogManager.shared.addErrorLog("Shortcut simulate failed with code \(result.code)")
+            throw LocationIntentError.simulationFailed(code: Int(result.code))
         }
 
         // No coordinate in the log — see `simulate_location`.
         LogManager.shared.addInfoLog("Shortcut simulated a location successfully")
-        await publishSimulation(latitude: latitude, longitude: longitude)
+        await publishSimulation(latitude: latitude, longitude: longitude, lease: lease)
     }
 
     // MARK: Stop
@@ -313,17 +322,20 @@ enum LocationIntentRunner {
         // session to clear, and saying so is more useful than error 12.
         _ = try requirePairingFile()
 
-        let code = try await run(
+        let result = try await run(
             on: LocationSimulationCommandQueue.shared,
             timeout: commandTimeout,
             step: String(localized: "Clearing the simulated location")
         ) {
-            clear_simulated_location()
+            let lease = LocationSimulationOwnership.shared.invalidateAll()
+            return IntentClearResult(code: clear_simulated_location(), lease: lease)
         }
 
-        guard code == 0 else {
-            LogManager.shared.addErrorLog("Shortcut clear failed with code \(code)")
-            throw LocationIntentError.clearFailed(code: Int(code))
+        await endSimulationActivity(for: result.lease)
+
+        guard result.code == 0 else {
+            LogManager.shared.addErrorLog("Shortcut clear failed with code \(result.code)")
+            throw LocationIntentError.clearFailed(code: Int(result.code))
         }
 
         LogManager.shared.addInfoLog("Shortcut cleared the simulated location")
@@ -383,18 +395,43 @@ enum LocationIntentRunner {
     /// from there, and so does this. The notification is posted from the same
     /// hop because `MapSelectionView` observes it with `onReceive`, which
     /// delivers on whatever thread posted.
-    private static func publishSimulation(latitude: Double, longitude: Double) async {
+    private static func publishSimulation(
+        latitude: Double,
+        longitude: Double,
+        lease: LocationSimulationProducerLease
+    ) async {
         await MainActor.run {
-            BackgroundLocationManager.shared.requestStart()
+            DeviceRoutePlaybackActivityManager.shared.simulationDidTakeOwnership(lease)
             LocationSimulationRequest.postSimulateApplied(latitude: latitude, longitude: longitude)
         }
     }
 
     private static func publishClear() async {
         await MainActor.run {
-            BackgroundLocationManager.shared.requestStop()
             LocationSimulationRequest.postClearApplied()
         }
+    }
+
+    private static func endSimulationActivity(
+        for lease: LocationSimulationProducerLease?
+    ) async {
+        guard let lease else { return }
+        await MainActor.run {
+            DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
+                lease,
+                connectionUnavailable: false
+            )
+        }
+    }
+
+    private struct IntentSimulationResult: Sendable {
+        let code: Int32
+        let lease: LocationSimulationProducerLease?
+    }
+
+    private struct IntentClearResult: Sendable {
+        let code: Int32
+        let lease: LocationSimulationProducerLease?
     }
 
     // MARK: Blocking-work bridge

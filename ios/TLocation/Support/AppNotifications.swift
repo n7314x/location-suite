@@ -30,6 +30,11 @@ extension Notification.Name {
     /// must re-check `LocationSimulationSession` rather than trust the edge: one
     /// half can retract while the other is still set.
     static let locationSimulationSessionEnded = Notification.Name("vn.truongkma.tlocation.locationSimulationSessionEnded")
+
+    /// The real FFI session handle opened or closed. Diagnostics and readiness
+    /// use this edge to distinguish a warm live session from the ability to
+    /// create a fresh TCP/RemotePairing connection.
+    static let locationSimulationSessionChanged = Notification.Name("vn.truongkma.tlocation.locationSimulationSessionChanged")
 }
 
 enum LocationSimulationRequest {

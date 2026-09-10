@@ -276,22 +276,65 @@ struct PhoneLocalConnectionPolicyTests {
             underlyingNetwork: .wifi
         ))
     }
+
+    @Test func warmSessionOutranksFreshEndpointFailureOnCellular() {
+        #expect(PhoneLocalConnectionPolicy.isReady(
+            endpointReachability: .unreachable,
+            remotePairingConnected: false,
+            simulationSessionOpen: true
+        ))
+        #expect(PhoneLocalConnectionPolicy.shouldAttemptConnection(
+            pairingFilePresent: true,
+            underlyingNetwork: .wifi
+        ))
+        #expect(PhoneLocalConnectionPolicy.shouldAttemptConnection(
+            pairingFilePresent: true,
+            underlyingNetwork: .cellular
+        ))
+    }
+
+    @Test func trueWarmSessionLossRestoresHonestNotReadyState() {
+        #expect(!PhoneLocalConnectionPolicy.isReady(
+            endpointReachability: .unreachable,
+            remotePairingConnected: false,
+            simulationSessionOpen: false
+        ))
+    }
 }
 
 private actor FakeRouteSink: RouteLocationSimulationSink {
+    private let ownership: LocationSimulationOwnership
     private(set) var coordinates: [RoutePoint] = []
     private(set) var clearCount = 0
+    private(set) var sessionWasOpenForCoordinate: [Bool] = []
     private var nextFailure: RoutePlaybackFailure?
     private var blockNextUpdate = false
     private var blockedContinuation: CheckedContinuation<Void, Never>?
 
-    func setCoordinate(_ coordinate: RoutePoint) async throws {
+    init(ownership: LocationSimulationOwnership) {
+        self.ownership = ownership
+    }
+
+    func setCoordinate(
+        _ coordinate: RoutePoint,
+        lease: LocationSimulationProducerLease
+    ) async throws {
+        guard ownership.isCurrent(lease) else {
+            throw RoutePlaybackFailure(reason: .superseded, message: "superseded")
+        }
+        // Once an FFI call has begun it may land before a takeover. The new
+        // producer is serialized after it and therefore supplies the final
+        // coordinate; a command that had not begun is rejected by the guard.
         coordinates.append(coordinate)
+        sessionWasOpenForCoordinate.append(ownership.isSessionOpen)
         if blockNextUpdate {
             blockNextUpdate = false
             await withCheckedContinuation { continuation in
                 blockedContinuation = continuation
             }
+        }
+        guard ownership.isCurrent(lease) else {
+            throw RoutePlaybackFailure(reason: .superseded, message: "superseded")
         }
         if let failure = nextFailure {
             nextFailure = nil
@@ -301,6 +344,7 @@ private actor FakeRouteSink: RouteLocationSimulationSink {
 
     func clear() async throws {
         clearCount += 1
+        ownership.setSessionOpen(false)
     }
 
     func failNextUpdate(_ failure: RoutePlaybackFailure) {
@@ -324,12 +368,19 @@ private final class FakeRouteActivityManager: RoutePlaybackActivityManaging {
     private(set) var starts = 0
     private(set) var ends = 0
     private(set) var connectionMarkedUnavailable = false
+    private var activeLease: LocationSimulationProducerLease?
 
-    func simulationDidStart() {
-        starts += 1
+    func simulationDidTakeOwnership(_ lease: LocationSimulationProducerLease) {
+        if activeLease == nil { starts += 1 }
+        activeLease = lease
     }
 
-    func simulationDidEnd(connectionUnavailable: Bool) {
+    func simulationDidEnd(
+        _ lease: LocationSimulationProducerLease,
+        connectionUnavailable: Bool
+    ) {
+        guard activeLease == lease else { return }
+        activeLease = nil
         ends += 1
         connectionMarkedUnavailable = connectionMarkedUnavailable || connectionUnavailable
     }
@@ -337,18 +388,27 @@ private final class FakeRouteActivityManager: RoutePlaybackActivityManaging {
 
 @MainActor
 struct RoutePlaybackControllerTests {
-    private func makeController() -> (RoutePlaybackController, FakeRouteSink, FakeRouteActivityManager) {
-        let sink = FakeRouteSink()
+    private func makeController(
+        ownership: LocationSimulationOwnership = LocationSimulationOwnership()
+    ) -> (
+        RoutePlaybackController,
+        FakeRouteSink,
+        FakeRouteActivityManager,
+        LocationSimulationOwnership
+    ) {
+        let sink = FakeRouteSink(ownership: ownership)
         let activity = FakeRouteActivityManager()
         return (
             RoutePlaybackController(
                 sink: sink,
                 activityManager: activity,
                 automaticallySchedulesTicks: false,
-                speedModel: WalkingSpeedModel(seed: 7)
+                speedModel: WalkingSpeedModel(seed: 7),
+                ownership: ownership
             ),
             sink,
-            activity
+            activity,
+            ownership
         )
     }
 
@@ -357,7 +417,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func pauseFreezesAndResumeContinuesExactProgress() async throws {
-        let (controller, _, _) = makeController()
+        let (controller, _, _, _) = makeController()
         await controller.play(try standardRoute())
         await controller.advance(by: 1)
         controller.pause()
@@ -375,7 +435,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func stopRouteHoldsExactCoordinateWithoutClearing() async throws {
-        let (controller, sink, activity) = makeController()
+        let (controller, sink, activity, _) = makeController()
         await controller.play(try standardRoute())
         await controller.advance(by: 1)
         let beforeStop = try #require(controller.metrics)
@@ -397,7 +457,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func stoppedKeepAliveResendsOnlyHeldCoordinateAndNeverAdvances() async throws {
-        let (controller, sink, _) = makeController()
+        let (controller, sink, _, _) = makeController()
         await controller.play(try standardRoute())
         await controller.advance(by: 1)
         _ = await controller.stopRoute()
@@ -415,7 +475,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func resumeFromStoppedContinuesFromExactProgress() async throws {
-        let (controller, _, _) = makeController()
+        let (controller, _, _, _) = makeController()
         await controller.play(try standardRoute())
         await controller.advance(by: 1)
         _ = await controller.stopRoute()
@@ -430,7 +490,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func replayAfterStoppedStartsAtRouteBeginningWithoutClear() async throws {
-        let (controller, sink, activity) = makeController()
+        let (controller, sink, activity, _) = makeController()
         let value = try standardRoute()
         await controller.play(value)
         await controller.advance(by: 1)
@@ -448,7 +508,7 @@ struct RoutePlaybackControllerTests {
 
     @Test func returnToRealLocationClearsFromPlayingPausedStoppedAndCompleted() async throws {
         for sourceState in 0..<4 {
-            let (controller, sink, activity) = makeController()
+            let (controller, sink, activity, _) = makeController()
             let value = sourceState == 3
                 ? try route([point(0, 0), point(0, 0.00001)], id: "route_clear_complete")
                 : try standardRoute(id: "route_clear_\(sourceState)")
@@ -477,7 +537,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func stopWinsAgainstAnOlderInFlightTickAndRestoresExactHold() async throws {
-        let (controller, sink, _) = makeController()
+        let (controller, sink, _, _) = makeController()
         await controller.play(try standardRoute())
         let committed = try #require(controller.metrics)
         await sink.armBlockedUpdate()
@@ -501,7 +561,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func staleTickCannotResurrectAfterReturnToRealLocation() async throws {
-        let (controller, sink, _) = makeController()
+        let (controller, sink, _, _) = makeController()
         await controller.play(try standardRoute())
         await sink.armBlockedUpdate()
 
@@ -527,7 +587,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func connectionFailureFreezesProgressRetriesHoldAndRecoversPaused() async throws {
-        let (controller, sink, activity) = makeController()
+        let (controller, sink, activity, _) = makeController()
         await controller.play(try standardRoute())
         let committed = try #require(controller.metrics)
         await sink.failNextUpdate(RoutePlaybackFailure(
@@ -557,7 +617,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func reconnectDoesNotCreateDuplicateMaintenanceUpdates() async throws {
-        let (controller, sink, _) = makeController()
+        let (controller, sink, _, _) = makeController()
         await controller.play(try standardRoute())
         _ = await controller.stopRoute()
         let before = await sink.coordinates.count
@@ -576,7 +636,7 @@ struct RoutePlaybackControllerTests {
     }
 
     @Test func completedRouteKeepsDestinationUntilExplicitReturn() async throws {
-        let (controller, sink, _) = makeController()
+        let (controller, sink, _, _) = makeController()
         let value = try route([point(0, 0), point(0, 0.00001)], id: "route_complete")
         await controller.play(value)
         for _ in 0..<200 where controller.state == .playing {
@@ -592,5 +652,142 @@ struct RoutePlaybackControllerTests {
         await controller.maintainHeldCoordinate()
         let lastCoordinate = await sink.coordinates.last
         #expect(lastCoordinate == value.points.last)
+    }
+
+    @Test func pointToRouteReusesOpenSessionWithoutClear() async throws {
+        let ownership = LocationSimulationOwnership()
+        ownership.setSessionOpen(true)
+        let pointLease = ownership.claim(.point)
+        let (controller, sink, _, _) = makeController(ownership: ownership)
+
+        await controller.play(try standardRoute()) {
+            _ = ownership.relinquish(pointLease)
+        }
+
+        #expect(controller.state == .playing)
+        #expect(ownership.currentProducer == .route)
+        #expect(ownership.isSessionOpen)
+        let clearCount = await sink.clearCount
+        let openObservations = await sink.sessionWasOpenForCoordinate
+        #expect(clearCount == 0)
+        #expect(openObservations == [true])
+    }
+
+    @Test func routeToPointRelinquishesWithoutClearOrClosingSession() async throws {
+        let ownership = LocationSimulationOwnership()
+        ownership.setSessionOpen(true)
+        let (controller, sink, _, _) = makeController(ownership: ownership)
+        await controller.play(try standardRoute())
+
+        let pointLease = ownership.claim(.point)
+        controller.relinquishWithoutClearing()
+
+        #expect(ownership.isCurrent(pointLease))
+        #expect(ownership.currentProducer == .point)
+        #expect(ownership.isSessionOpen)
+        let clearCount = await sink.clearCount
+        #expect(clearCount == 0)
+    }
+
+    @Test func completedRouteStartsDifferentRouteWithoutClear() async throws {
+        let (controller, sink, _, ownership) = makeController()
+        ownership.setSessionOpen(true)
+        let first = try route([point(0, 0), point(0, 0.00001)], id: "route_a")
+        let second = try route([point(1, 1), point(1, 1.001)], id: "route_b")
+        await controller.play(first)
+        for _ in 0..<200 where controller.state == .playing {
+            await controller.advance(by: 0.25)
+        }
+        #expect(controller.state == .completed)
+
+        await controller.play(second)
+
+        #expect(controller.state == .playing)
+        #expect(controller.metrics?.currentCoordinate == second.points.first)
+        #expect(ownership.isSessionOpen)
+        let clearCount = await sink.clearCount
+        #expect(clearCount == 0)
+    }
+
+    @Test func stoppedRouteStartsDifferentRouteWithoutClear() async throws {
+        let (controller, sink, _, ownership) = makeController()
+        ownership.setSessionOpen(true)
+        await controller.play(try standardRoute(id: "route_a"))
+        _ = await controller.stopRoute()
+
+        let second = try route([point(2, 2), point(2, 2.001)], id: "route_b")
+        await controller.play(second)
+
+        #expect(controller.state == .playing)
+        #expect(controller.metrics?.currentCoordinate == second.points.first)
+        #expect(ownership.isSessionOpen)
+        let clearCount = await sink.clearCount
+        #expect(clearCount == 0)
+    }
+
+    @Test func queuedPointTickCannotOverwriteRouteAfterTakeover() async throws {
+        let ownership = LocationSimulationOwnership()
+        ownership.setSessionOpen(true)
+        let pointLease = ownership.claim(.point)
+        let (controller, sink, _, _) = makeController(ownership: ownership)
+        let oldPoint = try point(10, 10)
+        await sink.armBlockedUpdate()
+        let pointTick = Task {
+            try? await sink.setCoordinate(oldPoint, lease: pointLease)
+        }
+        while !(await sink.isBlocked()) { await Task.yield() }
+
+        await controller.play(try standardRoute())
+        await sink.releaseBlockedUpdate()
+        await pointTick.value
+
+        let lastCoordinate = await sink.coordinates.last
+        let clearCount = await sink.clearCount
+        #expect(lastCoordinate == controller.metrics?.currentCoordinate)
+        #expect(lastCoordinate != oldPoint)
+        #expect(clearCount == 0)
+    }
+
+    @Test func queuedRouteTickCannotOverwritePointAfterTakeover() async throws {
+        let ownership = LocationSimulationOwnership()
+        ownership.setSessionOpen(true)
+        let (controller, sink, activity, _) = makeController(ownership: ownership)
+        await controller.play(try standardRoute())
+        await sink.failNextUpdate(RoutePlaybackFailure(
+            reason: .tunnelUnavailable,
+            message: "stale route failure"
+        ))
+        await sink.armBlockedUpdate()
+        let routeTick = Task { await controller.advance(by: 1) }
+        while !(await sink.isBlocked()) { await Task.yield() }
+
+        let pointLease = ownership.claim(.point)
+        controller.relinquishWithoutClearing()
+        let newPoint = try point(20, 20)
+        try await sink.setCoordinate(newPoint, lease: pointLease)
+        await sink.releaseBlockedUpdate()
+        await routeTick.value
+
+        let lastCoordinate = await sink.coordinates.last
+        let clearCount = await sink.clearCount
+        #expect(lastCoordinate == newPoint)
+        #expect(!activity.connectionMarkedUnavailable)
+        #expect(clearCount == 0)
+    }
+
+    @Test func explicitReturnIsTheOnlyOperationThatClosesWarmSession() async throws {
+        let ownership = LocationSimulationOwnership()
+        ownership.setSessionOpen(true)
+        let (controller, sink, _, _) = makeController(ownership: ownership)
+        await controller.play(try standardRoute())
+        controller.pause()
+
+        let countBeforeReturn = await sink.clearCount
+        let returned = await controller.returnToRealLocation()
+        let countAfterReturn = await sink.clearCount
+        #expect(countBeforeReturn == 0)
+        #expect(returned)
+        #expect(!ownership.isSessionOpen)
+        #expect(countAfterReturn == 1)
     }
 }

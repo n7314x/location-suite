@@ -43,8 +43,9 @@ enum PhoneLocalConnectionPolicy {
 
     static func isReady(
         endpointReachability: EndpointReachability,
-        remotePairingConnected: Bool
+        remotePairingConnected: Bool,
+        simulationSessionOpen: Bool = false
     ) -> Bool {
-        endpointReachability == .reachable && remotePairingConnected
+        simulationSessionOpen || (endpointReachability == .reachable && remotePairingConnected)
     }
 }

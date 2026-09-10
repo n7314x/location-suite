@@ -13,6 +13,9 @@ enum RoutePlaybackFailureReason: Equatable, Sendable {
     case sessionFailed
     case interrupted
     case clearFailed
+    /// The command belonged to a producer that has already handed ownership to
+    /// point mode or to a newer route generation.
+    case superseded
 }
 
 struct RoutePlaybackFailure: Error, Equatable, LocalizedError, Sendable {
@@ -57,14 +60,20 @@ protocol RouteLocationSimulationSink: Sendable {
     /// Implementations must serialize set and clear operations in call order.
     /// That ordering is what lets a final hold update outrank an older route
     /// tick and lets an explicit clear outrank every older update.
-    func setCoordinate(_ coordinate: RoutePoint) async throws
+    func setCoordinate(
+        _ coordinate: RoutePoint,
+        lease: LocationSimulationProducerLease
+    ) async throws
     func clear() async throws
 }
 
 @MainActor
 protocol RoutePlaybackActivityManaging: AnyObject {
-    func simulationDidStart()
-    func simulationDidEnd(connectionUnavailable: Bool)
+    func simulationDidTakeOwnership(_ lease: LocationSimulationProducerLease)
+    func simulationDidEnd(
+        _ lease: LocationSimulationProducerLease,
+        connectionUnavailable: Bool
+    )
 }
 
 @MainActor
@@ -90,6 +99,7 @@ final class RoutePlaybackController: ObservableObject {
     private let activityManager: RoutePlaybackActivityManaging
     private let automaticallySchedulesTicks: Bool
     private let speedModel: WalkingSpeedModel
+    private let ownership: LocationSimulationOwnership
     private var timer: Timer?
     private var generation: UInt64 = 0
     private var updateInFlight = false
@@ -97,17 +107,20 @@ final class RoutePlaybackController: ObservableObject {
     private var lastDeviceUpdateTime: TimeInterval?
     private var heldCoordinate: RoutePoint?
     private var recoveryState: RecoveryState?
+    private var producerLease: LocationSimulationProducerLease?
 
     init(
         sink: RouteLocationSimulationSink,
         activityManager: RoutePlaybackActivityManaging,
         automaticallySchedulesTicks: Bool = true,
-        speedModel: WalkingSpeedModel = .natural
+        speedModel: WalkingSpeedModel = .natural,
+        ownership: LocationSimulationOwnership = .shared
     ) {
         self.sink = sink
         self.activityManager = activityManager
         self.automaticallySchedulesTicks = automaticallySchedulesTicks
         self.speedModel = speedModel
+        self.ownership = ownership
     }
 
     var canEditRoute: Bool {
@@ -135,6 +148,15 @@ final class RoutePlaybackController: ObservableObject {
             return true
         case .idle, .ready, .clearing, .error:
             return false
+        }
+    }
+
+    var canRelinquishWithoutClearing: Bool {
+        switch state {
+        case .starting, .clearing:
+            return false
+        case .idle, .ready, .playing, .paused, .stopped, .connectionInterrupted, .completed, .error:
+            return true
         }
     }
 
@@ -174,7 +196,10 @@ final class RoutePlaybackController: ObservableObject {
         if let engine { metrics = engine.metrics }
     }
 
-    func play(_ newRoute: LocationRoute) async {
+    func play(
+        _ newRoute: LocationRoute,
+        ownershipDidChange: (() -> Void)? = nil
+    ) async {
         switch state {
         case .starting, .playing, .paused, .connectionInterrupted, .clearing:
             return
@@ -185,17 +210,24 @@ final class RoutePlaybackController: ObservableObject {
 
         generation &+= 1
         let run = generation
+        let lease = ownership.claim(.route)
+        producerLease = lease
+        isSimulationActive = true
+        activityManager.simulationDidTakeOwnership(lease)
+        // Point mode retires its timer here, after the route lease and shared
+        // maintenance ownership are already in place but before the first route
+        // coordinate is enqueued. There is no unmaintained handoff window.
+        ownershipDidChange?()
         state = .starting
         recoveryState = nil
         updateInFlight = true
         lastAdvanceTime = nil
 
         do {
-            try await sink.setCoordinate(initialCoordinate)
+            try await sink.setCoordinate(initialCoordinate, lease: lease)
             guard run == generation, state == .starting else { return }
             updateInFlight = false
             heldCoordinate = initialCoordinate
-            activateSimulationIfNeeded()
             lastDeviceUpdateTime = ProcessInfo.processInfo.systemUptime
             state = .playing
             lastAdvanceTime = ProcessInfo.processInfo.systemUptime
@@ -249,10 +281,10 @@ final class RoutePlaybackController: ObservableObject {
         ensureTimerIfNeeded()
 
         do {
-            try await sink.setCoordinate(coordinate)
+            guard let lease = producerLease else { return false }
+            try await sink.setCoordinate(coordinate, lease: lease)
             guard stopGeneration == generation, state == .stopped else { return false }
             updateInFlight = false
-            activateSimulationIfNeeded()
             lastDeviceUpdateTime = ProcessInfo.processInfo.systemUptime
             return true
         } catch {
@@ -272,6 +304,9 @@ final class RoutePlaybackController: ObservableObject {
 
         generation &+= 1
         let clearGeneration = generation
+        let lease = producerLease
+        ownership.invalidateAll()
+        producerLease = nil
         state = .clearing
         recoveryState = nil
         updateInFlight = true
@@ -281,7 +316,7 @@ final class RoutePlaybackController: ObservableObject {
             try await sink.clear()
             guard clearGeneration == generation else { return false }
             updateInFlight = false
-            finishClear(connectionUnavailable: false)
+            finishClear(lease: lease, connectionUnavailable: false)
             return true
         } catch {
             guard clearGeneration == generation else { return false }
@@ -289,7 +324,7 @@ final class RoutePlaybackController: ObservableObject {
             let failure = normalizedFailure(error, fallback: "The simulated location could not be cleared.")
             // A failed explicit clear must never start resending and accidentally
             // resurrect a simulation the user asked to end.
-            finishClear(connectionUnavailable: failure.marksConnectionUnavailable)
+            finishClear(lease: lease, connectionUnavailable: failure.marksConnectionUnavailable)
             state = .error(RoutePlaybackError(reason: failure.reason, message: failure.message))
             return false
         }
@@ -300,13 +335,18 @@ final class RoutePlaybackController: ObservableObject {
     /// call is made here; the external operation remains authoritative.
     func relinquishWithoutClearing() {
         generation &+= 1
+        let lease = producerLease
+        producerLease = nil
+        if let lease { ownership.relinquish(lease) }
         updateInFlight = false
         lastAdvanceTime = nil
         heldCoordinate = nil
         recoveryState = nil
-        if isSimulationActive {
+        if isSimulationActive, let lease {
             isSimulationActive = false
-            activityManager.simulationDidEnd(connectionUnavailable: false)
+            activityManager.simulationDidEnd(lease, connectionUnavailable: false)
+        } else {
+            isSimulationActive = false
         }
         resetToPreparedState()
         invalidateTimer()
@@ -324,7 +364,8 @@ final class RoutePlaybackController: ObservableObject {
         updateInFlight = true
 
         do {
-            try await sink.setCoordinate(nextMetrics.currentCoordinate)
+            guard let lease = producerLease else { return }
+            try await sink.setCoordinate(nextMetrics.currentCoordinate, lease: lease)
             guard run == generation else { return }
             updateInFlight = false
             guard state == .playing || state == .paused else { return }
@@ -386,9 +427,10 @@ final class RoutePlaybackController: ObservableObject {
     }
 
     private func maintain(coordinate: RoutePoint, run: UInt64) async {
+        guard let lease = producerLease else { return }
         updateInFlight = true
         do {
-            try await sink.setCoordinate(coordinate)
+            try await sink.setCoordinate(coordinate, lease: lease)
             guard run == generation, isSimulationActive else { return }
             updateInFlight = false
             lastDeviceUpdateTime = ProcessInfo.processInfo.systemUptime
@@ -437,9 +479,17 @@ final class RoutePlaybackController: ObservableObject {
         lastAdvanceTime = nil
         heldCoordinate = nil
         recoveryState = nil
-        if isSimulationActive {
+        let lease = producerLease
+        producerLease = nil
+        if let lease { ownership.relinquish(lease) }
+        if isSimulationActive, let lease {
             isSimulationActive = false
-            activityManager.simulationDidEnd(connectionUnavailable: failure.marksConnectionUnavailable)
+            activityManager.simulationDidEnd(
+                lease,
+                connectionUnavailable: failure.marksConnectionUnavailable
+            )
+        } else {
+            isSimulationActive = false
         }
         state = .error(RoutePlaybackError(reason: failure.reason, message: failure.message))
         invalidateTimer()
@@ -455,19 +505,21 @@ final class RoutePlaybackController: ObservableObject {
         return RoutePlaybackFailure(reason: .interrupted, message: fallback)
     }
 
-    private func activateSimulationIfNeeded() {
-        guard !isSimulationActive else { return }
-        isSimulationActive = true
-        activityManager.simulationDidStart()
-    }
-
-    private func finishClear(connectionUnavailable: Bool) {
+    private func finishClear(
+        lease: LocationSimulationProducerLease?,
+        connectionUnavailable: Bool
+    ) {
         heldCoordinate = nil
         lastDeviceUpdateTime = nil
         recoveryState = nil
-        if isSimulationActive {
+        if isSimulationActive, let lease {
             isSimulationActive = false
-            activityManager.simulationDidEnd(connectionUnavailable: connectionUnavailable)
+            activityManager.simulationDidEnd(
+                lease,
+                connectionUnavailable: connectionUnavailable
+            )
+        } else {
+            isSimulationActive = false
         }
         resetToPreparedState()
         invalidateTimer()

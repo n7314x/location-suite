@@ -5,6 +5,26 @@ already-installed Location Suite build on iOS 27 using a pairing file, cached
 personalized DDI, and LocalDevVPN. SideStore installation and refresh are out of
 scope.
 
+## Physical iOS 27 follow-up: warm sessions
+
+Testing on an iPhone 15 Pro Max running iOS 27.0 established a narrower and more
+useful boundary than the initial investigation:
+
+- A cold LTE-only launch cannot currently create a new phone-local
+  RemotePairing session. `10.7.0.1:49152` refuses the connection.
+- A session bootstrapped on Wi-Fi survives the switch to LTE. Existing point
+  updates and an already-playing route continue to work.
+- The prior point-to-route UI required clearing point simulation before route
+  mode could be entered. That destroyed the warm session and made route Play
+  depend on the cold LTE bootstrap that is known to fail.
+
+The follow-up patch separates the process-wide simulation session from its
+coordinate producer. Point and route mode exchange generation-checked producer
+leases while the FFI handle remains open. Stop Route and route completion keep
+holding the coordinate. Only the visible **Return** action clears and releases
+the session. Diagnostics now show `Simulation Session Open` separately from
+fresh endpoint reachability.
+
 ## Executive result
 
 Route Stop and GPS clearing are now separate operations. Stop Route freezes
@@ -19,16 +39,10 @@ cellular, other, and apparently-offline paths. `NWPathMonitor` supplies only a
 diagnostic label and a network-change retry trigger. The actual RemotePairing
 handshake is the authority.
 
-That removes the app-level restriction, but it does not make true LTE/5G-active
-runtime a proven platform capability. The current upstream evidence consistently
-places the remaining restriction below Location Suite and LocalDevVPN: the iOS
-RemotePairing endpoint is described as Wi-Fi-only, while the currently documented
-no-Wi-Fi workaround deliberately enables Airplane Mode after starting
-LocalDevVPN.[^pmd3-tunnels] [^stikjit-integration] Current TLocation reports the
-same observation more directly: recent cellular-only tricks do not expose the
-service.[^tlocation-readme] Because Apple does not publish a supported contract
-for this private on-device service, the final iOS 27 verdict must be established
-by the physical A/B test below rather than inferred from `NWPath` alone.
+That removes the app-level restriction. Physical testing now proves LTE/5G can
+carry an already-warm RemotePairing/DVT/location-simulation session, including
+ongoing route coordinates. It does not prove cold LTE bootstrap: that still
+receives connection refused and remains below Location Suite's mode lifecycle.
 
 ## Layer-by-layer findings
 
@@ -161,12 +175,17 @@ Interpretation:
 
 ## Limitations
 
-CI can prove state semantics, deterministic speed behavior, the endpoint-first
+CI can prove state semantics, deterministic speed behavior, the warm-session
 policy, compilation, and IPA hygiene. It cannot toggle an iPhone's radios,
 observe the private iOS listener, verify system-wide Core Location output, or
-guarantee background scheduling. No claim of LTE/5G-active success should be
-made until the requested-target row passes on the iPhone 15 Pro Max running
-iOS 27.0.
+guarantee background scheduling.
+
+After an app force-close, device reboot, LocalDevVPN/session destruction, or a
+genuine RemotePairing teardown, the in-process FFI handle is gone. A fresh
+LTE-only bootstrap may still fail with connection refused on
+`10.7.0.1:49152`; Wi-Fi may be required once to establish a new warm session.
+This patch intentionally does not add alternate ports, entitlements, or
+unsupported iOS workarounds for that lower-level limitation.
 
 ## Sources
 

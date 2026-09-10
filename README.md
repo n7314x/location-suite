@@ -53,3 +53,6 @@ lifecycle, and background-execution boundary are documented in
 The endpoint-first cellular-runtime investigation, current upstream evidence,
 and physical-device diagnostic matrix are documented in
 [Mobile polish and cellular runtime](docs/ios/mobile-polish-cellular-runtime.md).
+That document also records the iOS 27 warm-session result: a Wi-Fi-bootstrapped
+simulation can continue and switch between point and route producers on LTE,
+while a true cold LTE bootstrap may still require Wi-Fi.

@@ -137,6 +137,7 @@ struct SettingsView: View {
     /// `CLLocationManagerDelegate`, which is the only reliable notice of a
     /// change the user makes over in system Settings.
     @ObservedObject private var backgroundLocation = BackgroundLocationManager.shared
+    @State private var simulationSessionOpen = LocationSimulationSession.isOpen
 
     /// Watched, not owned. Holds the last signing expiry read from the device;
     /// this view shows it and asks for a refresh, and never reads the app bundle.
@@ -296,6 +297,10 @@ struct SettingsView: View {
                         "Developer Disk Image Ready",
                         value: mounting.coolisMounted ? String(localized: "Yes") : String(localized: "No")
                     )
+                    diagnosticRow(
+                        "Simulation Session Open",
+                        value: simulationSessionOpen ? String(localized: "Yes") : String(localized: "No")
+                    )
                     diagnosticRow("Target", value: "\(DeviceConnectionContext.targetIPAddress):49152")
 
                     if let category = tunnel.lastConnectionFailureCategory {
@@ -313,7 +318,7 @@ struct SettingsView: View {
                         }
                     }
 
-                    Text("Network type is diagnostic only. Readiness is decided by the actual phone-local RemotePairing connection.")
+                    Text("Endpoint reachability describes a fresh connection attempt. An open simulation session can remain usable after that fresh endpoint becomes unavailable.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -356,6 +361,9 @@ struct SettingsView: View {
             // the scene ever leaving `.active`.
             .onChange(of: scenePhase) { _, newPhase in
                 if newPhase == .active { backgroundLocation.refreshAuthorizationStatus() }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .locationSimulationSessionChanged)) { _ in
+                simulationSessionOpen = LocationSimulationSession.isOpen
             }
         }
         // The exporter lives on its own invisible subview (rather than chained
