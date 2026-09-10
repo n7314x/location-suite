@@ -32,24 +32,19 @@ struct LocationRouteLibraryFile: Codable, Equatable, Sendable {
 
 actor RouteDocumentStore {
     let fileURL: URL
-    private let fileManager: FileManager
 
-    init(fileURL: URL, fileManager: FileManager = .default) {
+    init(fileURL: URL) {
         self.fileURL = fileURL
-        self.fileManager = fileManager
     }
 
-    static func applicationStore(fileManager: FileManager = .default) -> RouteDocumentStore {
-        let root = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    static func applicationStore() -> RouteDocumentStore {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("LocationSuite", isDirectory: true)
-        return RouteDocumentStore(
-            fileURL: root.appendingPathComponent("saved-routes-v1.json"),
-            fileManager: fileManager
-        )
+        return RouteDocumentStore(fileURL: root.appendingPathComponent("saved-routes-v1.json"))
     }
 
     func load() throws -> [LocationRouteDocument] {
-        guard fileManager.fileExists(atPath: fileURL.path) else { return [] }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
         let data = try Data(contentsOf: fileURL)
 
         do {
@@ -144,7 +139,7 @@ actor RouteDocumentStore {
         let envelope = try LocationRouteLibraryFile(routes: routes)
         let data = try RouteDocumentCodec.makeEncoder().encode(envelope)
         let directory = fileURL.deletingLastPathComponent()
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try data.write(to: fileURL, options: [.atomic])
     }
 }
