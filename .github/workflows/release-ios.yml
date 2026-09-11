@@ -108,21 +108,22 @@ jobs:
           release_notes="$(git log -1 --pretty=%s "$GITHUB_SHA")"
           xcode_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["xcodeVersion"])' "$metadata")"
           sdk_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["iOSSDKVersion"])' "$metadata")"
-          previous_args=()
+          generate_args=(
+            scripts/release_feed.py generate
+            --ipa "$RUNNER_TEMP/unsigned-output/LocationSuite.ipa"
+            --output-root "$RUNNER_TEMP/public-release"
+            --base-url "$RELEASE_BASE_URL"
+            --release-date "$release_date"
+            --commit-sha "$GITHUB_SHA"
+            --xcode-version "$xcode_version"
+            --ios-sdk-version "$sdk_version"
+            --notes "$release_notes"
+            --expected-version "$RELEASE_VERSION"
+          )
           if [[ -n "$PREVIOUS_SOURCE" ]]; then
-            previous_args+=(--existing-source "$PREVIOUS_SOURCE")
+            generate_args+=(--existing-source "$PREVIOUS_SOURCE")
           fi
-          python3 scripts/release_feed.py generate \
-            --ipa "$RUNNER_TEMP/unsigned-output/LocationSuite.ipa" \
-            --output-root "$RUNNER_TEMP/public-release" \
-            --base-url "$RELEASE_BASE_URL" \
-            --release-date "$release_date" \
-            --commit-sha "$GITHUB_SHA" \
-            --xcode-version "$xcode_version" \
-            --ios-sdk-version "$sdk_version" \
-            --notes "$release_notes" \
-            --expected-version "$RELEASE_VERSION" \
-            "${previous_args[@]}"
+          python3 "${generate_args[@]}"
 
       - name: Verify staging release
         env:
@@ -130,15 +131,16 @@ jobs:
           PREVIOUS_SOURCE: ${{ steps.previous.outputs.path }}
         run: |
           set -euo pipefail
-          previous_args=()
+          verify_args=(
+            scripts/verify_release.py
+            --ipa "$RUNNER_TEMP/public-release/v$RELEASE_VERSION/LocationSuite.ipa"
+            --metadata "$RUNNER_TEMP/public-release/v$RELEASE_VERSION/release-metadata.json"
+            --source "$RUNNER_TEMP/public-release/source-staging.json"
+          )
           if [[ -n "$PREVIOUS_SOURCE" ]]; then
-            previous_args+=(--previous-source "$PREVIOUS_SOURCE")
+            verify_args+=(--previous-source "$PREVIOUS_SOURCE")
           fi
-          python3 scripts/verify_release.py \
-            --ipa "$RUNNER_TEMP/public-release/v$RELEASE_VERSION/LocationSuite.ipa" \
-            --metadata "$RUNNER_TEMP/public-release/v$RELEASE_VERSION/release-metadata.json" \
-            --source "$RUNNER_TEMP/public-release/source-staging.json" \
-            "${previous_args[@]}"
+          python3 "${verify_args[@]}"
 
       - name: Upload validated publication bundle
         uses: actions/upload-artifact@v7
@@ -190,7 +192,7 @@ jobs:
       - name: Verify the public host serves the published bytes
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 12); do
+          for _ in $(seq 1 12); do
             if python3 scripts/verify_release.py \
               --remote-source-url "$RELEASE_BASE_URL/source.json" \
               --timeout 20; then
