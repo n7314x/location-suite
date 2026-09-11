@@ -1,0 +1,22 @@
+name: Verify iOS Release Feed
+
+on:
+  schedule:
+    - cron: "23 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-feed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_BASE_URL: ${{ vars.LOCATION_SUITE_RELEASE_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require configured production source
+        run: test -n "$RELEASE_BASE_URL"
+      - name: Verify latest source, metadata, IPA size, and SHA-256
+        run: python3 scripts/verify_release.py --remote-source-url "$RELEASE_BASE_URL/source.json"
