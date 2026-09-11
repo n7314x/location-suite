@@ -87,11 +87,10 @@ struct TLocationApp: App {
     ///
     /// Both the "in the way" checks matter, and neither is redundant:
     /// `isOpen` covers a live session (including one a Shortcut opened while no
-    /// map was on screen), `isMaintained` covers a resend loop whose last
-    /// rebuild failed — session already gone, another rebuild due within
-    /// seconds. Reconnecting into either is the second concurrent RemotePairing
-    /// handshake against single-occupancy `<targetIP>:49152` that this deferral
-    /// exists to avoid.
+    /// map was on screen), `isMaintained` covers the process-wide lifecycle
+    /// while a producer is building that session. Reconnecting into either is
+    /// the second concurrent RemotePairing handshake against single-occupancy
+    /// `<targetIP>:49152` that this deferral exists to avoid.
     ///
     /// The hop through `LocationSimulationCommandQueue` is what makes the checks
     /// mean anything when the trigger is a session *closing*: that close is

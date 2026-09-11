@@ -73,8 +73,10 @@ protocol RoutePlaybackActivityManaging: AnyObject {
     func simulationDidTakeOwnership(_ lease: LocationSimulationProducerLease)
     func simulationDidEnd(
         _ lease: LocationSimulationProducerLease,
-        connectionUnavailable: Bool
+        reason: LocationSimulationProducerEndReason
     )
+    func simulationSessionWillDisconnect() -> LocationSimulationDisconnectLease
+    func simulationSessionDidDisconnect(_ lease: LocationSimulationDisconnectLease)
 }
 
 @MainActor
@@ -331,7 +333,7 @@ final class RoutePlaybackController: ObservableObject {
             try await sink.clear()
             guard clearGeneration == generation else { return false }
             updateInFlight = false
-            finishClear(lease: lease, connectionUnavailable: false)
+            finishClear(lease: lease, reason: .returnedToRealGPS)
             return true
         } catch {
             guard clearGeneration == generation else { return false }
@@ -339,7 +341,10 @@ final class RoutePlaybackController: ObservableObject {
             let failure = normalizedFailure(error, fallback: "The simulated location could not be cleared.")
             // A failed explicit clear must never start resending and accidentally
             // resurrect a simulation the user asked to end.
-            finishClear(lease: lease, connectionUnavailable: failure.marksConnectionUnavailable)
+            finishClear(
+                lease: lease,
+                reason: .failure(connectionUnavailable: failure.marksConnectionUnavailable)
+            )
             state = .error(RoutePlaybackError(reason: failure.reason, message: failure.message))
             return false
         }
@@ -351,7 +356,7 @@ final class RoutePlaybackController: ObservableObject {
     func disconnectSession() async -> Bool {
         generation &+= 1
         let disconnectGeneration = generation
-        let lease = producerLease
+        let disconnectLease = activityManager.simulationSessionWillDisconnect()
         ownership.invalidateAll()
         producerLease = nil
         state = .clearing
@@ -363,7 +368,8 @@ final class RoutePlaybackController: ObservableObject {
             try await sink.disconnect()
             guard disconnectGeneration == generation else { return false }
             updateInFlight = false
-            finishClear(lease: lease, connectionUnavailable: false)
+            finishClear(lease: nil, reason: nil)
+            activityManager.simulationSessionDidDisconnect(disconnectLease)
             return true
         } catch {
             guard disconnectGeneration == generation else { return false }
@@ -372,7 +378,8 @@ final class RoutePlaybackController: ObservableObject {
                 error,
                 fallback: "The session was disconnected, but real GPS could not be confirmed."
             )
-            finishClear(lease: lease, connectionUnavailable: true)
+            finishClear(lease: nil, reason: nil)
+            activityManager.simulationSessionDidDisconnect(disconnectLease)
             state = .error(RoutePlaybackError(reason: failure.reason, message: failure.message))
             return false
         }
@@ -392,7 +399,7 @@ final class RoutePlaybackController: ObservableObject {
         recoveryState = nil
         if isSimulationActive, let lease {
             isSimulationActive = false
-            activityManager.simulationDidEnd(lease, connectionUnavailable: false)
+            activityManager.simulationDidEnd(lease, reason: .relinquished)
         } else {
             isSimulationActive = false
         }
@@ -534,7 +541,7 @@ final class RoutePlaybackController: ObservableObject {
             isSimulationActive = false
             activityManager.simulationDidEnd(
                 lease,
-                connectionUnavailable: failure.marksConnectionUnavailable
+                reason: .failure(connectionUnavailable: failure.marksConnectionUnavailable)
             )
         } else {
             isSimulationActive = false
@@ -555,16 +562,16 @@ final class RoutePlaybackController: ObservableObject {
 
     private func finishClear(
         lease: LocationSimulationProducerLease?,
-        connectionUnavailable: Bool
+        reason: LocationSimulationProducerEndReason?
     ) {
         heldCoordinate = nil
         lastDeviceUpdateTime = nil
         recoveryState = nil
-        if isSimulationActive, let lease {
+        if isSimulationActive, let lease, let reason {
             isSimulationActive = false
             activityManager.simulationDidEnd(
                 lease,
-                connectionUnavailable: connectionUnavailable
+                reason: reason
             )
         } else {
             isSimulationActive = false

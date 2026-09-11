@@ -137,6 +137,7 @@ struct SettingsView: View {
     /// `CLLocationManagerDelegate`, which is the only reliable notice of a
     /// change the user makes over in system Settings.
     @ObservedObject private var backgroundLocation = BackgroundLocationManager.shared
+    @ObservedObject private var warmSessionKeeper = DeviceRoutePlaybackActivityManager.shared.sessionKeeper
     @State private var simulationSessionOpen = LocationSimulationSession.isOpen
     @State private var simulationActive = LocationSimulationSession.isActive
     @State private var isDisconnectingSession = false
@@ -206,12 +207,12 @@ struct SettingsView: View {
                     Toggle(isOn: $keepAliveLocation) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Background Location")
-                            Text("Uses low-accuracy location to stay alive while simulating.")
+                            Text("Uses low-accuracy location to stay alive while simulating or keeping a warm session.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    .onChange(of: keepAliveLocation) { _, enabled in
-                        if !enabled { BackgroundLocationManager.shared.stop() }
+                    .onChange(of: keepAliveLocation) { _, _ in
+                        BackgroundLocationManager.shared.keepAlivePreferenceDidChange()
                     }
 
                     alwaysAuthorizationWarning
@@ -325,6 +326,25 @@ struct SettingsView: View {
                     diagnosticRow(
                         "Coordinate Producer",
                         value: String(describing: LocationSimulationOwnership.shared.currentProducer).capitalized
+                    )
+                    diagnosticRow(
+                        "Warm Session Keeper",
+                        value: warmSessionKeeper.isIdleKeeperActive
+                            ? String(localized: "Active")
+                            : String(localized: "Inactive")
+                    )
+                    diagnosticRow(
+                        "Last Warm Heartbeat",
+                        value: warmSessionKeeper.lastHeartbeat.map { syncTimestampFormatter.string(from: $0) }
+                            ?? String(localized: "Never")
+                    )
+                    diagnosticRow(
+                        "Warm Heartbeat Failures",
+                        value: String(warmSessionKeeper.heartbeatFailureCount)
+                    )
+                    diagnosticRow(
+                        "Warm Session State",
+                        value: warmSessionKeeper.state.rawValue
                     )
                     diagnosticRow("Target", value: "\(DeviceConnectionContext.targetIPAddress):49152")
 

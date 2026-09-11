@@ -72,6 +72,18 @@ final class BackgroundLocationManager: NSObject, ObservableObject, CLLocationMan
         }
     }
 
+    /// Applies the user-facing toggle without changing the balanced lifecycle
+    /// count. Re-enabling while a Point, Route, or idle warm keeper already owns
+    /// activity must restart Core Location even though there is no new 0 -> 1
+    /// request edge to do it.
+    func keepAlivePreferenceDidChange() {
+        if activityCount > 0, UserDefaults.standard.bool(forKey: "keepAliveLocation") {
+            start()
+        } else {
+            stop()
+        }
+    }
+
     /// Re-reads the current authorization. Only a safety net for the case where
     /// the delegate callback below is somehow missed; it is not the mechanism
     /// the UI relies on.

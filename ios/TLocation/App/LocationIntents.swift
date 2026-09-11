@@ -331,7 +331,12 @@ enum LocationIntentRunner {
             return IntentClearResult(code: clear_simulated_location(), lease: lease)
         }
 
-        await endSimulationActivity(for: result.lease)
+        await endSimulationActivity(
+            for: result.lease,
+            reason: result.code == 0
+                ? .returnedToRealGPS
+                : .failure(connectionUnavailable: false)
+        )
 
         guard result.code == 0 else {
             LogManager.shared.addErrorLog("Shortcut clear failed with code \(result.code)")
@@ -413,13 +418,14 @@ enum LocationIntentRunner {
     }
 
     private static func endSimulationActivity(
-        for lease: LocationSimulationProducerLease?
+        for lease: LocationSimulationProducerLease?,
+        reason: LocationSimulationProducerEndReason
     ) async {
         guard let lease else { return }
         await MainActor.run {
             DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
                 lease,
-                connectionUnavailable: false
+                reason: reason
             )
         }
     }
