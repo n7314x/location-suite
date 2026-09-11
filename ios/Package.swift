@@ -6,19 +6,33 @@ let package = Package(
     name: "LocationSuiteRouteEngine",
     platforms: [.macOS(.v13)],
     products: [
-        .library(name: "RouteEngine", targets: ["RouteEngine"])
+        .library(name: "RouteEngine", targets: ["RouteEngine"]),
+        .library(name: "LocationSuiteCore", targets: ["LocationSuiteCore"])
     ],
     targets: [
+        .target(
+            name: "LocationSuiteCore",
+            path: "TLocation/Core",
+            sources: [
+                "ReleaseUpdateModels.swift",
+                "SigningExpiryPolicy.swift",
+                "ColdBootstrapModels.swift"
+            ]
+        ),
         .target(
             name: "RouteEngine",
             path: "TLocation/Route"
         ),
         .testTarget(
             name: "RouteEngineTests",
-            dependencies: ["RouteEngine"],
+            dependencies: ["RouteEngine", "LocationSuiteCore"],
             path: "TLocationTests",
             exclude: ["TLocationTests.swift"],
-            sources: ["RouteEngineTests.swift"]
+            sources: [
+                "RouteEngineTests.swift",
+                "ReleaseUpdateTests.swift",
+                "ColdBootstrapTests.swift"
+            ]
         )
     ]
 )
