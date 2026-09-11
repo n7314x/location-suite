@@ -1,20 +1,11 @@
 diff --git a/TunnelProv/PacketTunnelProvider.swift b/TunnelProv/PacketTunnelProvider.swift
-index aaf79c1..f4c1a11 100644
+index 8a36937..b681043 100644
 --- a/TunnelProv/PacketTunnelProvider.swift
 +++ b/TunnelProv/PacketTunnelProvider.swift
-@@ -5,6 +5,8 @@
- //  Created by Stossy11 on 28/03/2025.
- //
-
+@@ -7,0 +8,2 @@
 +import Foundation
 +import Network
- import NetworkExtension
- #if DEBUG
- import os.log
-@@ -16,12 +18,110 @@ private func tunnelLog(_ message: @autoclosure () -> String) {
- #endif
- }
-
+@@ -19,0 +22,53 @@ private func tunnelLog(_ message: @autoclosure () -> String) {
 +private struct TCPHeaderTrace {
 +    let sourceAddress: String
 +    let destinationAddress: String
@@ -68,10 +59,7 @@ index aaf79c1..f4c1a11 100644
 +    }
 +}
 +
-
- class PacketTunnelProvider: NEPacketTunnelProvider {
-     var tunnelIfaceIP: String = TunnelConstants.defaultIfaceIP
-     var tunnelPeerIP: String = TunnelConstants.defaultPeerIP
+@@ -23,0 +79,43 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 +
 +    private let diagnosticLock = NSLock()
 +    private var underlyingPath = "unknown"
@@ -115,43 +103,19 @@ index aaf79c1..f4c1a11 100644
 +            + "flags=\(trace.flags) path={\(currentPathSummary())}"
 +        )
 +    }
-
-     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+@@ -25,0 +124,2 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 +        tunnelLog("lifecycle=start-requested")
 +        startPathDiagnostics()
-         if let options = options {
-             for (key, val) in options {
-                 tunnelLog("startTunnel option \(key) = \(String(describing: val))")
-@@ -61,6 +161,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
-                 return completionHandler(error)
-             }
-             tunnelLog("Tunnel network settings set successfully. Starting packet loops.")
+@@ -75,0 +176 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 +            tunnelLog("lifecycle=running")
-             self.setPackets()
-             completionHandler(nil)
-         }
-@@ -68,7 +169,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
-
-     func setPackets() {
-         packetFlow.readPackets { [self] packets, protocols in
+@@ -82,0 +184 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 +            for packet in packets { logRemotePairingHeader(packet, direction: "captured") }
-             var modified = packets
-
-             for i in modified.indices where protocols[i].int32Value == AF_INET && modified[i].count >= 20 {
-                 modified[i].withUnsafeMutableBytes { bytes in
-@@ -82,8 +184,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
-                 }
-             }
-
+@@ -94,0 +197 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 +            for packet in modified { logRemotePairingHeader(packet, direction: "reinjected") }
-             self.packetFlow.writePackets(modified, withProtocols: protocols)
-             setPackets()
-         }
-     }
+@@ -98,0 +202,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 +
 +    override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
 +        tunnelLog("lifecycle=stopping reason=\(reason.rawValue)")
 +        stopPathDiagnostics()
 +        completionHandler()
 +    }
- }
