@@ -85,6 +85,7 @@ struct SettingsView: View {
     /// of an already-active simulation, never the initial "Simulate Location"
     /// call, the pin, or anything else shown on screen.
     @AppStorage("naturalGPSDrift") private var naturalGPSDrift = false
+    @AppStorage(UserDefaults.Keys.autoRefreshSigning) private var autoRefreshSigning = true
 
     /// Mirrors `LanguageSettings.selected`; the `onChange` below is what writes
     /// the matching `AppleLanguages` override.
@@ -146,6 +147,7 @@ struct SettingsView: View {
     /// Watched, not owned. Holds the last signing expiry read from the device;
     /// this view shows it and asks for a refresh, and never reads the app bundle.
     @ObservedObject private var signing = SigningExpiryMonitor.shared
+    @ObservedObject private var maintenance = SelfMaintenanceService.shared
     @ObservedObject private var updates = UpdateService.shared
     @ObservedObject private var tunnel = TunnelManager.shared
     @ObservedObject private var mounting = MountingProgress.shared
@@ -273,9 +275,9 @@ struct SettingsView: View {
 
                 bookmarkSyncSection
 
-                Section("Advanced") {
-                    signingExpiryRows
+                selfMaintenanceSection
 
+                Section("Advanced") {
                     HStack {
                         Text("Target Device IP")
                         Spacer()
@@ -535,14 +537,77 @@ struct SettingsView: View {
 
     // MARK: - Signing Expiry
 
+    @ViewBuilder
+    private var selfMaintenanceSection: some View {
+        Section("Self Maintenance") {
+            HStack {
+                Text("Apple Account")
+                Spacer()
+                Text(maintenance.isSignedIn ? "Signed In" : "Not Signed In")
+                    .foregroundStyle(.secondary)
+            }
+
+            signingExpiryRows
+
+            Toggle("Auto Refresh Signing", isOn: $autoRefreshSigning)
+                .onChange(of: autoRefreshSigning) { _, enabled in
+                    guard enabled else { return }
+                    Task {
+                        await SigningExpiryNotificationScheduler.shared.requestAuthorizationAndSchedule(
+                            expirationDate: signing.reading?.expirationDate
+                        )
+                    }
+                }
+
+            if let lastSuccess = maintenance.history.lastSuccess {
+                HStack {
+                    Text("Last Refresh")
+                    Spacer()
+                    Text(syncTimestampFormatter.string(from: lastSuccess))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Button {
+                Task { await maintenance.refreshSigningNow() }
+            } label: {
+                if maintenance.isWorking {
+                    Label("Refreshing…", systemImage: "arrow.triangle.2.circlepath")
+                } else {
+                    Label("Refresh Signing Now", systemImage: "arrow.triangle.2.circlepath")
+                }
+            }
+            .disabled(maintenance.isWorking || LocationSimulationSession.isActive)
+
+            if maintenance.lastError?.category == .localDevVPNUnavailable
+                || maintenance.lastError?.category == .deviceTransportUnavailable {
+                Link(destination: SettingsLinks.localDevVPN) {
+                    Label("Open LocalDevVPN", systemImage: "network")
+                }
+            }
+
+            NavigationLink {
+                SelfMaintenanceAccountView()
+            } label: {
+                Label("Account Settings", systemImage: "person.crop.circle")
+            }
+
+            if let message = maintenance.statusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(maintenance.lastError == nil ? .secondary : .orange)
+            }
+        }
+    }
+
     /// What the device last said about when this install's signature expires,
     /// and when it said it.
     ///
     /// Three honest states, and no fourth:
     ///
     /// * never read — says so. It does **not** fall back to the date baked into
-    ///   the app bundle at install time, which stops moving the moment SideStore
-    ///   first refreshes the app and from then on reads as long expired.
+    ///   the app bundle at install time, which stops moving after the first
+    ///   profile-only refresh and from then on eventually reads as expired.
     /// * read, no profile for this app — says that too. An App Store or
     ///   TrollStore install has no expiry to report, which is not "expired".
     /// * read — the date, how long is left, and when it was checked.
@@ -563,14 +628,9 @@ struct SettingsView: View {
                 Text(syncTimestampFormatter.string(from: reading.checkedAt))
                     .foregroundStyle(.secondary)
             }
-            Text("Read from the provisioning profile on this device, so it follows a SideStore refresh.")
+            Text("Read from the active provisioning profile on this device. A refresh succeeds only when this value moves later.")
                 .font(.caption).foregroundStyle(.secondary)
             if signingSeverity != .normal, signingSeverity != .unknown {
-                Button("Open SideStore to Refresh") {
-                    UIApplication.shared.open(SettingsLinks.sideStore)
-                }
-                Text("Location Suite only reports the profile expiration. SideStore performs the refresh; return here afterward to verify that the expiration moved later.")
-                    .font(.caption).foregroundStyle(.secondary)
                 Text("If Apple's authentication service is temporarily unavailable, the current profile remains valid until the expiration shown above. Retry later; Location Suite never revokes or recreates certificates.")
                     .font(.caption).foregroundStyle(.secondary)
             }
