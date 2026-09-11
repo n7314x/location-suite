@@ -6,12 +6,20 @@ on:
     paths:
       - "ios/**"
       - "contracts/**"
+      - "scripts/build_unsigned_ipa.sh"
+      - "scripts/release_feed.py"
+      - "scripts/verify_release.py"
+      - "scripts/tests/**"
       - ".github/workflows/build-ios-ipa.yml"
   pull_request:
     branches: [main]
     paths:
       - "ios/**"
       - "contracts/**"
+      - "scripts/build_unsigned_ipa.sh"
+      - "scripts/release_feed.py"
+      - "scripts/verify_release.py"
+      - "scripts/tests/**"
       - ".github/workflows/build-ios-ipa.yml"
   workflow_dispatch:
 
@@ -24,16 +32,9 @@ concurrency:
 
 jobs:
   build-ipa:
-    name: Build unsigned LocationSuite.ipa
+    name: Test and build unsigned LocationSuite.ipa
     runs-on: xcode-27
     timeout-minutes: 45
-
-    env:
-      PROJECT_PATH: ios/TLocation.xcodeproj
-      SCHEME: TLocation
-      CONFIGURATION: Release
-      ARCHIVE_NAME: LocationSuite.xcarchive
-      IPA_NAME: LocationSuite.ipa
 
     steps:
       - name: Check out repository
@@ -50,160 +51,51 @@ jobs:
       - name: Validate project inputs
         run: |
           set -euo pipefail
-          test -f "$PROJECT_PATH/project.pbxproj"
+          test -f ios/TLocation.xcodeproj/project.pbxproj
           test -f ios/TLocation/Info.plist
           test -f ios/TLocation/TLocation.entitlements
           test -f ios/TLocation/idevice/libidevice_ffi.a
+          xcodebuild -project ios/TLocation.xcodeproj -list
 
-          plutil -lint ios/TLocation/Info.plist
-          plutil -lint ios/TLocation/TLocation.entitlements
-          python3 -m json.tool ios/TLocation/TLocation.icon/icon.json >/dev/null
-          python3 -m json.tool ios/TLocation/InfoPlist.xcstrings >/dev/null
-          python3 -m json.tool contracts/route-v1.schema.json >/dev/null
-          python3 -m json.tool contracts/location-route-document-v1.schema.json >/dev/null
-
-          library_architectures="$(lipo -archs ios/TLocation/idevice/libidevice_ffi.a)"
-          echo "libidevice_ffi.a architectures: $library_architectures"
-          case " $library_architectures " in
-            *" arm64 "*) ;;
-            *) echo "libidevice_ffi.a does not contain the required arm64 device slice." >&2; exit 1 ;;
-          esac
-
-          xcodebuild -project "$PROJECT_PATH" -list
-
-      - name: Test route engine
+      - name: Run deterministic Swift tests
         run: swift test --package-path ios
 
-      - name: Archive unsigned device app
-        run: |
-          set -euo pipefail
-          archive_path="$RUNNER_TEMP/$ARCHIVE_NAME"
-          log_path="$RUNNER_TEMP/LocationSuite-xcodebuild.log"
-          rm -rf "$archive_path"
+      - name: Run release tooling tests
+        run: python3 -m unittest discover -s scripts/tests -v
 
-          set -o pipefail
-          xcodebuild archive \
-            -project "$PROJECT_PATH" \
-            -scheme "$SCHEME" \
-            -configuration "$CONFIGURATION" \
-            -archivePath "$archive_path" \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            ONLY_ACTIVE_ARCH=NO \
-            SKIP_INSTALL=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY= \
-            DEVELOPMENT_TEAM= \
-            | tee "$log_path"
-
-      - name: Verify unsigned app bundle
-        id: app
-        run: |
-          set -euo pipefail
-          archive_path="$RUNNER_TEMP/$ARCHIVE_NAME"
-          app_path="$archive_path/Products/Applications/TLocation.app"
-          metadata_path="$RUNNER_TEMP/LocationSuite-build-metadata.txt"
-
-          test -d "$app_path"
-          test -f "$app_path/Info.plist"
-          plutil -lint "$app_path/Info.plist"
-
-          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Info.plist")"
-          executable_path="$app_path/$executable_name"
-          bundle_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Info.plist")"
-          display_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$app_path/Info.plist")"
-          minimum_os="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app_path/Info.plist")"
-
-          test -x "$executable_path"
-          test "$bundle_identifier" = "vn.truongkma.tlocation"
-          test "$display_name" = "Location Suite"
-          test "$minimum_os" = "17.4"
-
-          if codesign -d "$app_path" >/dev/null 2>&1; then
-            echo "The app unexpectedly contains a code signature." >&2
-            exit 1
-          fi
-          if find "$app_path" -name embedded.mobileprovision -print -quit | grep -q .; then
-            echo "The unsigned app unexpectedly contains a provisioning profile." >&2
-            exit 1
-          fi
-
-          {
-            echo "App: $app_path"
-            echo "Display name: $display_name"
-            echo "Bundle identifier: $bundle_identifier"
-            echo "Minimum iOS: $minimum_os"
-            file "$executable_path"
-            echo "Executable architectures: $(lipo -archs "$executable_path")"
-            echo "Linked libraries:"
-            otool -L "$executable_path"
-            echo "Bundled frameworks and dynamic libraries:"
-            find "$app_path" \( -name '*.framework' -o -name '*.dylib' \) -print | sort
-          } | tee "$metadata_path"
-
-          case " $(lipo -archs "$executable_path") " in
-            *" arm64 "*) ;;
-            *) echo "The app executable does not contain the required arm64 slice." >&2; exit 1 ;;
-          esac
-
-          echo "app_path=$app_path" >> "$GITHUB_OUTPUT"
-
-      - name: Package and inspect IPA
+      - name: Build canonical unsigned IPA
         id: package
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/location-suite-output
+        run: scripts/build_unsigned_ipa.sh "$OUTPUT_DIR"
+
+      - name: Add build summary
+        env:
+          IPA_SIZE: ${{ steps.package.outputs.ipa_size }}
+          IPA_SHA256: ${{ steps.package.outputs.ipa_sha256 }}
+          VERSION: ${{ steps.package.outputs.version }}
+          BUILD_VERSION: ${{ steps.package.outputs.build_version }}
         run: |
-          set -euo pipefail
-          ipa_path="$GITHUB_WORKSPACE/$IPA_NAME"
-          staging_path="$RUNNER_TEMP/LocationSuite-ipa-staging"
-          verification_path="$RUNNER_TEMP/LocationSuite-ipa-verification"
-          app_path="${{ steps.app.outputs.app_path }}"
-
-          rm -rf "$staging_path" "$verification_path" "$ipa_path"
-          mkdir -p "$staging_path/Payload" "$verification_path"
-          ditto "$app_path" "$staging_path/Payload/TLocation.app"
-
-          (
-            cd "$staging_path"
-            zip -qry "$ipa_path" Payload
-          )
-
-          unzip -tq "$ipa_path"
-          unzip -q "$ipa_path" -d "$verification_path"
-
-          app_count="$(find "$verification_path/Payload" -mindepth 1 -maxdepth 1 -type d -name '*.app' | wc -l | tr -d ' ')"
-          test "$app_count" = "1"
-          test -d "$verification_path/Payload/TLocation.app"
-          test -f "$verification_path/Payload/TLocation.app/Info.plist"
-          plutil -lint "$verification_path/Payload/TLocation.app/Info.plist"
-
-          ipa_size="$(stat -f '%z' "$ipa_path")"
-          ipa_sha256="$(shasum -a 256 "$ipa_path" | awk '{print $1}')"
-          echo "IPA size: $ipa_size bytes"
-          echo "IPA SHA-256: $ipa_sha256"
-          echo "Top-level Payload contents:"
-          find "$verification_path/Payload" -mindepth 1 -maxdepth 2 -print | sort
-
           {
             echo "### iOS IPA build"
             echo
             echo "- Runner: \`xcode-27\` (\`$(uname -m)\`)"
             echo "- Xcode: \`$(xcodebuild -version | tr '\n' ' ')\`"
             echo "- iOS SDK: \`$(xcrun --sdk iphoneos --show-sdk-version)\`"
-            echo "- Configuration: \`$CONFIGURATION\`"
-            echo "- Signing: disabled; SideStore signs at install time"
-            echo "- IPA: \`$IPA_NAME\` ($ipa_size bytes)"
-            echo "- SHA-256: \`$ipa_sha256\`"
+            echo "- Version/build: \`$VERSION ($BUILD_VERSION)\`"
+            echo "- Signing: disabled; SideStore signs locally at install time"
+            echo "- IPA: \`LocationSuite.ipa\` ($IPA_SIZE bytes)"
+            echo "- SHA-256: \`$IPA_SHA256\`"
             echo "- Payload app: \`Payload/TLocation.app\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "ipa_path=$ipa_path" >> "$GITHUB_OUTPUT"
-          echo "ipa_sha256=$ipa_sha256" >> "$GITHUB_OUTPUT"
-
-      - name: Upload LocationSuite.ipa
+      - name: Upload LocationSuite.ipa and metadata
         uses: actions/upload-artifact@v7
         with:
           name: LocationSuite-IPA
-          path: ${{ steps.package.outputs.ipa_path }}
+          path: |
+            ${{ steps.package.outputs.ipa_path }}
+            ${{ steps.package.outputs.metadata_path }}
           if-no-files-found: error
           retention-days: 90
           compression-level: 0
@@ -213,8 +105,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: LocationSuite-build-diagnostics-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/LocationSuite-xcodebuild.log
-            ${{ runner.temp }}/LocationSuite-build-metadata.txt
+          path: ${{ runner.temp }}/location-suite-output/LocationSuite-xcodebuild.log
           if-no-files-found: ignore
           retention-days: 30

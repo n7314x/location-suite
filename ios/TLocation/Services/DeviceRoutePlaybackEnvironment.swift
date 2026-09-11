@@ -11,7 +11,7 @@ import UIKit
 struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
     private enum CoordinateOutcome: Sendable {
         case superseded
-        case completed(code: Int32, reusedOpenSession: Bool)
+        case completed(result: LocationSimulationAttemptResult, reusedOpenSession: Bool)
     }
 
     func setCoordinate(
@@ -25,34 +25,38 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
                 return .superseded
             }
             let reusedOpenSession = LocationSimulationSession.isOpen
-            let code = simulate_location(
+            let result = simulate_location_detailed(
                 deviceIP,
                 coordinate.latitude,
                 coordinate.longitude,
-                pairingFilePath
+                pairingFilePath,
+                underlyingNetwork: TunnelManager.shared.underlyingNetwork.rawValue
             )
             guard LocationSimulationOwnership.shared.isCurrent(lease) else {
                 return .superseded
             }
-            return .completed(code: code, reusedOpenSession: reusedOpenSession)
+            return .completed(result: result, reusedOpenSession: reusedOpenSession)
         }
 
-        guard case .completed(let code, let reusedOpenSession) = outcome else {
+        guard case .completed(let result, let reusedOpenSession) = outcome else {
             throw RoutePlaybackFailure(
                 reason: .superseded,
                 message: "A newer location mode took ownership of the simulation."
             )
         }
-        guard code == 0 else {
-            TunnelManager.shared.recordSimulationEndpointFailure(
-                code: code,
-                detail: "Route coordinate delivery failed with device code \(code)."
-            )
-            throw Self.failure(for: code, clearing: false)
-        }
-        TunnelManager.shared.recordSimulationCoordinateSuccess(
+        TunnelManager.shared.recordSimulationResult(
+            result,
             reusedOpenSession: reusedOpenSession
         )
+        guard result.statusCode == 0 else {
+            if let bootstrapError = result.coldBootstrapTrace?.failure {
+                throw RoutePlaybackFailure(
+                    reason: Self.failureReason(for: bootstrapError.category),
+                    message: bootstrapError.userMessage
+                )
+            }
+            throw Self.failure(for: result.statusCode, clearing: false)
+        }
     }
 
     func clear() async throws {
@@ -109,6 +113,22 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
                 reason: .sessionFailed,
                 message: "The device stopped accepting route locations. Reconnect LocalDevVPN and confirm the Developer Disk Image is mounted."
             )
+        }
+    }
+
+    private static func failureReason(
+        for category: ColdBootstrapFailureCategory
+    ) -> RoutePlaybackFailureReason {
+        switch category {
+        case .pairingRejected, .pairingFileUnreadable:
+            return .noPairingFile
+        case .ddiUnavailable:
+            return .developerDiskImageUnavailable
+        case .localVPNUnavailable, .noRoute, .connectionRefused, .timeout,
+             .connectionReset, .remotePairingFailed, .rsdFailed, .invalidTarget:
+            return .tunnelUnavailable
+        case .dvtFailed, .coordinateSetFailed, .unknown:
+            return .sessionFailed
         }
     }
 }

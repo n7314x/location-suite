@@ -19,6 +19,10 @@ extension UserDefaults {
         /// write it.
         static let signingExpiryCheckedAt = "signingExpiryCheckedAt"
 
+        /// Last successfully parsed stable update and its check timestamp. A
+        /// failed network or decoding attempt never removes this cache.
+        static let updateCheckCache = "updateCheckCache"
+
         /// Security-scoped URL bookmark for the JSON file the user linked as a
         /// bookmark sync file. See `BookmarkSyncFile`.
         static let bookmarkSyncFileBookmark = "bookmarkSyncFileBookmark"

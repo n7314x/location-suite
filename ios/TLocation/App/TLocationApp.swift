@@ -22,6 +22,9 @@ struct TLocationApp: App {
                 .task {
                     await downloadMissingDeveloperDiskImageFiles()
                 }
+                .task {
+                    await UpdateService.shared.checkIfNeeded()
+                }
                 .onChange(of: scenePhase) { _, newPhase in
                     handleScenePhaseChange(newPhase)
                 }
@@ -74,6 +77,7 @@ struct TLocationApp: App {
         case .background:
             shouldAttemptTunnelReconnect = true
         case .active:
+            Task { await UpdateService.shared.checkIfNeeded() }
             // `scenePhase` itself is not read here: `onChange` hands us the new
             // phase, and the environment value it mirrors may not have been
             // republished yet at this point in the update.

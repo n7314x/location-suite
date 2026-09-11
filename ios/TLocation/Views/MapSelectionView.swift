@@ -31,13 +31,13 @@ private enum MapInteractionMode {
 
 private enum PointCoordinateResult: Sendable {
     case succeeded
-    case failed(Int32)
+    case failed(Int32, LocationBootstrapError?)
     case stale
 
     var code: Int32? {
         switch self {
         case .succeeded: return 0
-        case .failed(let code): return code
+        case .failed(let code, _): return code
         case .stale: return nil
         }
     }
@@ -2202,11 +2202,13 @@ struct LocationSimulationView: View {
                 isBusy = false
                 guard LocationSimulationOwnership.shared.isCurrent(lease) else { return }
                 switch result {
-                case .failed(let code):
+                case .failed(let code, let bootstrapError):
                     stopPointProducer(reason: .failure(connectionUnavailable: false))
                     pendingAlert = .message(
-                        title: String(localized: "Simulation Failed"),
-                        body: String(localized: "Could not simulate location (error \(code)). Make sure the device is connected and the Developer Disk Image (DDI) is mounted.")
+                        title: bootstrapError?.userTitle ?? String(localized: "Simulation Failed"),
+                        body: bootstrapError.map {
+                            "\($0.userMessage)\n\nStage: \($0.stage.displayName)\nStatus: \($0.statusCode)\($0.errno.map { "\nerrno: \($0)" } ?? "")\n\($0.detail)"
+                        } ?? String(localized: "Could not simulate location (error \(code)).")
                     )
                 case .succeeded:
                     startResendLoop(with: coord, lease: lease)
@@ -2727,22 +2729,24 @@ struct LocationSimulationView: View {
     ) -> PointCoordinateResult {
         guard LocationSimulationOwnership.shared.isCurrent(lease) else { return .stale }
         let reusedOpenSession = LocationSimulationSession.isOpen
-        let code = simulate_location(deviceIP, coordinate.latitude, coordinate.longitude, pairingFilePath)
+        let result = simulate_location_detailed(
+            deviceIP,
+            coordinate.latitude,
+            coordinate.longitude,
+            pairingFilePath,
+            underlyingNetwork: TunnelManager.shared.underlyingNetwork.rawValue
+        )
         // Ownership can change while the synchronous FFI call is in progress.
         // The successor's command is serialized behind this one and will be the
         // final coordinate; this stale result must not alter its diagnostics.
         guard LocationSimulationOwnership.shared.isCurrent(lease) else { return .stale }
-        if code == 0 {
-            TunnelManager.shared.recordSimulationCoordinateSuccess(
-                reusedOpenSession: reusedOpenSession
-            )
-        } else {
-            TunnelManager.shared.recordSimulationEndpointFailure(
-                code: code,
-                detail: "Point coordinate delivery failed with device code \(code)."
-            )
-        }
-        return code == 0 ? .succeeded : .failed(code)
+        TunnelManager.shared.recordSimulationResult(
+            result,
+            reusedOpenSession: reusedOpenSession
+        )
+        return result.statusCode == 0
+            ? .succeeded
+            : .failed(result.statusCode, result.coldBootstrapTrace?.failure)
     }
 }
 

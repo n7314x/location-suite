@@ -1,0 +1,121 @@
+diff --git a/TunnelProv/PacketTunnelProvider.swift b/TunnelProv/PacketTunnelProvider.swift
+index 8a36937..b681043 100644
+--- a/TunnelProv/PacketTunnelProvider.swift
++++ b/TunnelProv/PacketTunnelProvider.swift
+@@ -7,0 +8,2 @@
++import Foundation
++import Network
+@@ -19,0 +22,53 @@ private func tunnelLog(_ message: @autoclosure () -> String) {
++private struct TCPHeaderTrace {
++    let sourceAddress: String
++    let destinationAddress: String
++    let sourcePort: UInt16
++    let destinationPort: UInt16
++    let flags: String
++
++    static func parse(_ packet: Data) -> TCPHeaderTrace? {
++        packet.withUnsafeBytes { rawBuffer in
++            guard let bytes = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
++                  rawBuffer.count >= 40,
++                  bytes[0] >> 4 == 4 else {
++                return nil
++            }
++            let headerLength = Int(bytes[0] & 0x0F) * 4
++            guard headerLength >= 20,
++                  rawBuffer.count >= headerLength + 20,
++                  bytes[9] == 6 else {
++                return nil
++            }
++
++            let sourcePort = UInt16(bytes[headerLength]) << 8
++                | UInt16(bytes[headerLength + 1])
++            let destinationPort = UInt16(bytes[headerLength + 2]) << 8
++                | UInt16(bytes[headerLength + 3])
++            guard sourcePort == 49152 || destinationPort == 49152 else {
++                return nil
++            }
++
++            return TCPHeaderTrace(
++                sourceAddress: ipv4(bytes, offset: 12),
++                destinationAddress: ipv4(bytes, offset: 16),
++                sourcePort: sourcePort,
++                destinationPort: destinationPort,
++                flags: tcpFlags(bytes[headerLength + 13])
++            )
++        }
++    }
++
++    private static func ipv4(_ bytes: UnsafePointer<UInt8>, offset: Int) -> String {
++        "\(bytes[offset]).\(bytes[offset + 1]).\(bytes[offset + 2]).\(bytes[offset + 3])"
++    }
++
++    private static func tcpFlags(_ value: UInt8) -> String {
++        let names: [(UInt8, String)] = [
++            (0x80, "CWR"), (0x40, "ECE"), (0x20, "URG"), (0x10, "ACK"),
++            (0x08, "PSH"), (0x04, "RST"), (0x02, "SYN"), (0x01, "FIN"),
++        ]
++        let present = names.compactMap { value & $0.0 == 0 ? nil : $0.1 }
++        return present.isEmpty ? "NONE" : present.joined(separator: "|")
++    }
++}
++
+@@ -23,0 +79,43 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
++
++    private let diagnosticLock = NSLock()
++    private var underlyingPath = "unknown"
++    private var pathMonitor: NWPathMonitor?
++
++    private func startPathDiagnostics() {
++        let monitor = NWPathMonitor()
++        monitor.pathUpdateHandler = { [weak self] path in
++            let interfaces = path.availableInterfaces
++                .map { "\($0.type):\($0.name)" }
++                .sorted()
++                .joined(separator: ",")
++            let summary = "status=\(path.status) interfaces=\(interfaces.isEmpty ? "none" : interfaces)"
++            self?.diagnosticLock.lock()
++            self?.underlyingPath = summary
++            self?.diagnosticLock.unlock()
++            tunnelLog("lifecycle=path-change \(summary)")
++        }
++        pathMonitor = monitor
++        monitor.start(queue: DispatchQueue(label: "LocalDevVPN.RemotePairingPath"))
++    }
++
++    private func stopPathDiagnostics() {
++        pathMonitor?.cancel()
++        pathMonitor = nil
++    }
++
++    private func currentPathSummary() -> String {
++        diagnosticLock.lock()
++        defer { diagnosticLock.unlock() }
++        return underlyingPath
++    }
++
++    private func logRemotePairingHeader(_ packet: Data, direction: String) {
++        guard let trace = TCPHeaderTrace.parse(packet) else { return }
++        let timestamp = ISO8601DateFormatter().string(from: Date())
++        tunnelLog(
++            "timestamp=\(timestamp) direction=\(direction) "
++            + "src=\(trace.sourceAddress):\(trace.sourcePort) "
++            + "dst=\(trace.destinationAddress):\(trace.destinationPort) "
++            + "flags=\(trace.flags) path={\(currentPathSummary())}"
++        )
++    }
+@@ -25,0 +124,2 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
++        tunnelLog("lifecycle=start-requested")
++        startPathDiagnostics()
+@@ -75,0 +176 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
++            tunnelLog("lifecycle=running")
+@@ -82,0 +184 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
++            for packet in packets { logRemotePairingHeader(packet, direction: "captured") }
+@@ -94,0 +197 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
++            for packet in modified { logRemotePairingHeader(packet, direction: "reinjected") }
+@@ -98,0 +202,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
++
++    override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
++        tunnelLog("lifecycle=stopping reason=\(reason.rawValue)")
++        stopPathDiagnostics()
++        completionHandler()
++    }

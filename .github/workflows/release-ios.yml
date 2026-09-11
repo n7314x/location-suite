@@ -1,0 +1,221 @@
+name: Release iOS IPA
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: location-suite-stable-release
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build and validate stable release
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      RELEASE_BASE_URL: ${{ vars.LOCATION_SUITE_RELEASE_BASE_URL }}
+      PUBLIC_REPOSITORY: ${{ vars.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY }}
+
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require configured public artifact host
+        env:
+          PUBLIC_REPOSITORY_TOKEN: ${{ secrets.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_BASE_URL" || {
+            echo "Set repository variable LOCATION_SUITE_RELEASE_BASE_URL." >&2
+            exit 1
+          }
+          test -n "$PUBLIC_REPOSITORY" || {
+            echo "Set repository variable LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY." >&2
+            exit 1
+          }
+          test -n "$PUBLIC_REPOSITORY_TOKEN" || {
+            echo "Set secret LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY_TOKEN." >&2
+            exit 1
+          }
+          case "$RELEASE_BASE_URL" in
+            https://*) ;;
+            *) echo "Release base URL must use HTTPS." >&2; exit 1 ;;
+          esac
+
+      - name: Validate release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          python3 - "$version" <<'PY'
+          import re
+          import sys
+          if not re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][0-9A-Za-z.-]+)?", sys.argv[1]):
+              raise SystemExit(f"Tag is not v-prefixed semantic version: v{sys.argv[1]}")
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Run deterministic Swift tests
+        run: swift test --package-path ios
+
+      - name: Run release tooling tests
+        run: python3 -m unittest discover -s scripts/tests -v
+
+      - name: Fetch current production source if it exists
+        id: previous
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-input"
+          status="$(curl --silent --show-error --location \
+            --output "$RUNNER_TEMP/release-input/source.json" \
+            --write-out '%{http_code}' \
+            --connect-timeout 5 --max-time 15 \
+            "$RELEASE_BASE_URL/source.json" || true)"
+          case "$status" in
+            200) echo "path=$RUNNER_TEMP/release-input/source.json" >> "$GITHUB_OUTPUT" ;;
+            404) rm -f "$RUNNER_TEMP/release-input/source.json" ;;
+            *) echo "Production source returned HTTP $status; refusing to guess its history." >&2; exit 1 ;;
+          esac
+
+      - name: Build canonical unsigned IPA
+        id: package
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/unsigned-output
+          LOCATION_SUITE_SOURCE_URL: ${{ env.RELEASE_BASE_URL }}/source.json
+        run: scripts/build_unsigned_ipa.sh "$OUTPUT_DIR"
+
+      - name: Confirm tag matches the built app
+        env:
+          TAG_VERSION: ${{ steps.tag.outputs.version }}
+          BUILT_VERSION: ${{ steps.package.outputs.version }}
+        run: test "$TAG_VERSION" = "$BUILT_VERSION"
+
+      - name: Generate staging source and immutable release files
+        env:
+          RELEASE_VERSION: ${{ steps.tag.outputs.version }}
+          PREVIOUS_SOURCE: ${{ steps.previous.outputs.path }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/unsigned-output/build-metadata.json"
+          release_date="$(git show -s --format=%cI "$GITHUB_SHA")"
+          release_notes="$(git log -1 --pretty=%s "$GITHUB_SHA")"
+          xcode_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["xcodeVersion"])' "$metadata")"
+          sdk_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["iOSSDKVersion"])' "$metadata")"
+          generate_args=(
+            scripts/release_feed.py generate
+            --ipa "$RUNNER_TEMP/unsigned-output/LocationSuite.ipa"
+            --output-root "$RUNNER_TEMP/public-release"
+            --base-url "$RELEASE_BASE_URL"
+            --release-date "$release_date"
+            --commit-sha "$GITHUB_SHA"
+            --xcode-version "$xcode_version"
+            --ios-sdk-version "$sdk_version"
+            --notes "$release_notes"
+            --expected-version "$RELEASE_VERSION"
+          )
+          if [[ -n "$PREVIOUS_SOURCE" ]]; then
+            generate_args+=(--existing-source "$PREVIOUS_SOURCE")
+          fi
+          python3 "${generate_args[@]}"
+
+      - name: Verify staging release
+        env:
+          RELEASE_VERSION: ${{ steps.tag.outputs.version }}
+          PREVIOUS_SOURCE: ${{ steps.previous.outputs.path }}
+        run: |
+          set -euo pipefail
+          verify_args=(
+            scripts/verify_release.py
+            --ipa "$RUNNER_TEMP/public-release/v$RELEASE_VERSION/LocationSuite.ipa"
+            --metadata "$RUNNER_TEMP/public-release/v$RELEASE_VERSION/release-metadata.json"
+            --source "$RUNNER_TEMP/public-release/source-staging.json"
+          )
+          if [[ -n "$PREVIOUS_SOURCE" ]]; then
+            verify_args+=(--previous-source "$PREVIOUS_SOURCE")
+          fi
+          python3 "${verify_args[@]}"
+
+      - name: Upload validated publication bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: LocationSuite-public-release-${{ steps.tag.outputs.version }}
+          path: ${{ runner.temp }}/public-release
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish-release:
+    name: Publish artifact-only feed
+    needs: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RELEASE_BASE_URL: ${{ vars.LOCATION_SUITE_RELEASE_BASE_URL }}
+      PUBLIC_REPOSITORY: ${{ vars.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY }}
+
+    steps:
+      - name: Check out private release tooling
+        uses: actions/checkout@v6
+
+      - name: Check out public artifact repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PUBLIC_REPOSITORY }}
+          token: ${{ secrets.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY_TOKEN }}
+          path: public-feed
+
+      - name: Verify destination repository is public
+        env:
+          GH_TOKEN: ${{ secrets.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY_TOKEN }}
+        run: test "$(gh api "repos/$PUBLIC_REPOSITORY" --jq .visibility)" = "public"
+
+      - name: Download validated publication bundle
+        uses: actions/download-artifact@v8
+        with:
+          pattern: LocationSuite-public-release-*
+          path: public-release
+          merge-multiple: true
+
+      - name: Publish without overwriting history
+        run: |
+          git -C public-feed config user.name "github-actions[bot]"
+          git -C public-feed config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/publish_release_feed.sh public-release public-feed
+
+      - name: Verify the public host serves the published bytes
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 12); do
+            if python3 scripts/verify_release.py \
+              --remote-source-url "$RELEASE_BASE_URL/source.json" \
+              --timeout 20; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Public release did not become verifiable within 60 seconds." >&2
+          exit 1
+
+      - name: Create immutable private-repository release record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          release_dir="public-release/v$version"
+          gh release create "$GITHUB_REF_NAME" \
+            "$release_dir/LocationSuite.ipa" \
+            "$release_dir/release-metadata.json" \
+            "$release_dir/SHA256SUMS" \
+            public-feed/source.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Location Suite $version" \
+            --generate-notes

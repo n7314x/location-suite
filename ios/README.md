@@ -18,11 +18,14 @@ A minimal iOS app that does one thing: **simulate your device's GPS location** �
 - iOS 17.4+ (on-device setup; no Mac/PC needed after you have a pairing file)
 - [LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044) (free) — loopback VPN so the app can talk to the device it runs on
 - A **pairing file** for your device — see the [pairing file guide](https://github.com/StikDebug/StikDebug-Guide/blob/main/pairing_file.md)
-- **Wi-Fi joined to a network when starting a simulation.** iOS only exposes the on-device pairing service while Wi-Fi is associated (the network needs no internet — another phone's hotspot works). On recent iOS builds, cellular-only / hotspot-toggle tricks do NOT work. Once simulation is running, it may survive brief network changes while the VPN stays up.
+- LocalDevVPN connected. A Wi-Fi cold bootstrap is the known-good control. A
+  retained warm session is proven to work on LTE; true cold LTE remains under
+  packet-level investigation and is never reported as working without a trace.
 
 ## Install via SideStore
 
-1. Download the latest `TLocation.ipa` from [Releases](../../releases) (built unsigned by CI).
+1. Download a verified `LocationSuite.ipa` from the configured public release
+   feed once hosting is enabled (built unsigned by CI).
 2. Open SideStore → **+** → pick the `.ipa`. SideStore signs it with your Apple ID and installs it.
 3. Launch TLocation, import your pairing file, connect LocalDevVPN, wait for the status banner to turn green.
 
@@ -30,9 +33,11 @@ AltStore works the same way.
 
 ### SideStore source
 
-Add this source in SideStore to get updates automatically: `https://raw.githubusercontent.com/truongkma/t-location/main/source.json`.
-
-Note: the source lists no installable version until the first release tag is pushed. Until then it will appear empty in SideStore — install the `.ipa` manually as described above.
+The source URL is intentionally not hard-coded until the artifact-only public
+host is configured. See
+[`docs/ios/releases-and-cold-lte.md`](../docs/ios/releases-and-cold-lte.md) for
+the required variables, immutable layout, and SideStore handoff. The private
+source repository and temporary Actions artifact URLs are not valid feed hosts.
 
 ## Build from source
 
@@ -41,7 +46,9 @@ xcodebuild -project TLocation.xcodeproj -scheme TLocation -configuration Debug \
   -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
 ```
 
-Pushing a version tag (e.g. `1.0`) makes CI attach an unsigned IPA to a GitHub release.
+Pushing a matching `v*` semantic-version tag runs the stable release workflow
+only after the public feed boundary is configured. SideStore remains responsible
+for local Apple Account signing and seven-day profile renewal.
 
 ## What was removed from StikDebug
 
