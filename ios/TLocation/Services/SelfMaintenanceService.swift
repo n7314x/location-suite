@@ -341,13 +341,16 @@ final class SelfMaintenanceService: ObservableObject {
         preferredTeam: String?
     ) async throws -> PreparedSignIn {
         let storageDirectory = try Self.protectedStorageDirectory()
+        // Read the main-actor configuration before entering the Sendable queue
+        // closure. This also keeps the boundary valid under Swift 6 isolation.
+        let timeout = Self.anisetteTimeout
         let prepared = try await onAccountQueue {
             let result = try AppleDeveloperBridge.signIn(
                 appleID: appleID,
                 password: password,
                 anisetteEndpoints: endpoints,
                 storageDirectory: storageDirectory,
-                timeout: Self.anisetteTimeout
+                timeout: timeout
             )
             let identifier = TeamSelectionPolicy.selection(
                 from: result.summary.teams,

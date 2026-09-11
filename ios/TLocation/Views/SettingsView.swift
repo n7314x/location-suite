@@ -595,7 +595,7 @@ struct SettingsView: View {
             if let message = maintenance.statusMessage {
                 Text(message)
                     .font(.caption)
-                    .foregroundStyle(maintenance.lastError == nil ? .secondary : .orange)
+                    .foregroundStyle(maintenance.lastError == nil ? Color.secondary : Color.orange)
             }
         }
     }
