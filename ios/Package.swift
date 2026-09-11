@@ -13,6 +13,11 @@ let package = Package(
         .target(
             name: "LocationSuiteCore",
             path: "TLocation/Core",
+            exclude: [
+                "AppLanguage.swift",
+                "Localization.swift",
+                "LogManager.swift"
+            ],
             sources: [
                 "ReleaseUpdateModels.swift",
                 "SigningExpiryPolicy.swift",

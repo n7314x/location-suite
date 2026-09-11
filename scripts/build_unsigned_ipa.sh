@@ -56,27 +56,27 @@ case " $library_architectures " in
   *) echo "libidevice_ffi.a lacks the required arm64 device slice." >&2; exit 1 ;;
 esac
 
-extra_build_settings=()
+xcodebuild_args=(
+  archive
+  -project "$project_path"
+  -scheme "$scheme"
+  -configuration "$configuration"
+  -archivePath "$archive_path"
+  -sdk iphoneos
+  -destination 'generic/platform=iOS'
+  ONLY_ACTIVE_ARCH=NO
+  SKIP_INSTALL=NO
+  CODE_SIGNING_ALLOWED=NO
+  CODE_SIGNING_REQUIRED=NO
+  CODE_SIGN_IDENTITY=
+  DEVELOPMENT_TEAM=
+)
 if [[ -n "${LOCATION_SUITE_SOURCE_URL:-}" ]]; then
-  extra_build_settings+=("LOCATION_SUITE_SOURCE_URL=$LOCATION_SUITE_SOURCE_URL")
+  xcodebuild_args+=("LOCATION_SUITE_SOURCE_URL=$LOCATION_SUITE_SOURCE_URL")
 fi
 
 set -o pipefail
-xcodebuild archive \
-  -project "$project_path" \
-  -scheme "$scheme" \
-  -configuration "$configuration" \
-  -archivePath "$archive_path" \
-  -sdk iphoneos \
-  -destination 'generic/platform=iOS' \
-  ONLY_ACTIVE_ARCH=NO \
-  SKIP_INSTALL=NO \
-  CODE_SIGNING_ALLOWED=NO \
-  CODE_SIGNING_REQUIRED=NO \
-  CODE_SIGN_IDENTITY= \
-  DEVELOPMENT_TEAM= \
-  "${extra_build_settings[@]}" \
-  | tee "$build_log"
+xcodebuild "${xcodebuild_args[@]}" | tee "$build_log"
 
 app_path="$archive_path/Products/Applications/TLocation.app"
 info_plist="$app_path/Info.plist"
