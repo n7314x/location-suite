@@ -100,7 +100,14 @@ final class JITEnableContext {
             return makeError(fallback)
         }
         let message = nsString(from: ffiError.pointee.message, fallback: fallback)
-        let error = makeError(message, code: Int(ffiError.pointee.code))
+        let error = NSError(
+            domain: "TLocation",
+            code: Int(ffiError.pointee.code),
+            userInfo: [
+                NSLocalizedDescriptionKey: message,
+                "IdeviceFFISubcode": Int(ffiError.pointee.sub_code),
+            ]
+        )
         idevice_error_free(ffiError)
         return error
     }

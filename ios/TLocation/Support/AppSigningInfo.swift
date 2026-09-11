@@ -30,6 +30,20 @@ enum AppSigningInfo {
     /// Remaining time at or below which the launch warning is shown.
     static let warningThreshold: TimeInterval = 24 * 60 * 60
 
+    static func severity(
+        expirationDate: Date?,
+        checkedAt: Date?,
+        now: Date = Date(),
+        trustWindow: TimeInterval = SigningExpiryMonitor.trustWindow
+    ) -> SigningExpirySeverity {
+        SigningExpiryPolicy.severity(
+            expirationDate: expirationDate,
+            checkedAt: checkedAt,
+            now: now,
+            trustWindow: trustWindow
+        )
+    }
+
     // MARK: - Choosing this app's profile
 
     /// Latest expiry among the profiles that cover `bundleIdentifier`, or `nil`
@@ -113,6 +127,10 @@ enum AppSigningInfo {
     /// Localised short date, e.g. "12 Aug 2026".
     static func formatted(_ expiry: Date) -> String {
         expiry.formatted(date: .abbreviated, time: .omitted)
+    }
+
+    static func formattedDateTime(_ expiry: Date) -> String {
+        expiry.formatted(date: .abbreviated, time: .shortened)
     }
 
     /// Human phrase for a positive duration: "5 days", "18 hours", "45 minutes".

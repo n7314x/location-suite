@@ -31,7 +31,7 @@ enum LocationIntentError: Swift.Error, CustomLocalizedStringResourceConvertible,
     case invalidLatitude(Double)
     case invalidLongitude(Double)
     case bookmarkUnavailable
-    case simulationFailed(code: Int)
+    case simulationFailed(message: String)
     case clearFailed(code: Int)
 
     var localizedStringResource: LocalizedStringResource {
@@ -50,8 +50,8 @@ enum LocationIntentError: Swift.Error, CustomLocalizedStringResourceConvertible,
             return "Longitude \(value) is out of range. It must be between -180 and 180."
         case .bookmarkUnavailable:
             return "That saved location no longer exists in TLocation."
-        case .simulationFailed(let code):
-            return "TLocation could not simulate the location (error \(code)). Make sure the device is connected and the Developer Disk Image (DDI) is mounted."
+        case .simulationFailed(let message):
+            return "TLocation could not simulate the location. \(message)"
         case .clearFailed(let code):
             return "TLocation could not clear the simulated location (error \(code)). It may already have been cleared."
         }
@@ -298,16 +298,29 @@ enum LocationIntentRunner {
             timeout: commandTimeout,
             step: String(localized: "Simulating the location")
         ) {
-            let code = simulate_location(deviceIP, latitude, longitude, pairingFilePath)
-            let lease = code == 0
+            let attempt = simulate_location_detailed(
+                deviceIP,
+                latitude,
+                longitude,
+                pairingFilePath,
+                underlyingNetwork: TunnelManager.shared.underlyingNetwork.rawValue
+            )
+            let lease = attempt.statusCode == 0
                 ? LocationSimulationOwnership.shared.claim(.point)
                 : nil
-            return IntentSimulationResult(code: code, lease: lease)
+            return IntentSimulationResult(attempt: attempt, lease: lease)
         }
 
-        guard result.code == 0, let lease = result.lease else {
-            LogManager.shared.addErrorLog("Shortcut simulate failed with code \(result.code)")
-            throw LocationIntentError.simulationFailed(code: Int(result.code))
+        TunnelManager.shared.recordSimulationResult(
+            result.attempt,
+            reusedOpenSession: result.attempt.coldBootstrapTrace == nil
+        )
+        guard result.attempt.statusCode == 0, let lease = result.lease else {
+            LogManager.shared.addErrorLog("Shortcut simulate failed with code \(result.attempt.statusCode)")
+            throw LocationIntentError.simulationFailed(
+                message: result.attempt.coldBootstrapTrace?.failure?.userMessage
+                    ?? "Device status \(result.attempt.statusCode)."
+            )
         }
 
         // No coordinate in the log — see `simulate_location`.
@@ -437,7 +450,7 @@ enum LocationIntentRunner {
     }
 
     private struct IntentSimulationResult: Sendable {
-        let code: Int32
+        let attempt: LocationSimulationAttemptResult
         let lease: LocationSimulationProducerLease?
     }
 

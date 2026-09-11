@@ -11,6 +11,7 @@ import UIKit
 private enum SettingsLinks {
     static let pairingFileGuide = URL(string: "https://github.com/StikDebug/StikDebug-Guide/blob/main/pairing_file.md")!
     static let localDevVPN = URL(string: "https://apps.apple.com/us/app/localdevvpn/id6755608044")!
+    static let sideStore = URL(string: "sidestore://")!
 }
 
 /// Wraps the encoded bookmark JSON for `.fileExporter`, which hands the user the
@@ -145,6 +146,7 @@ struct SettingsView: View {
     /// Watched, not owned. Holds the last signing expiry read from the device;
     /// this view shows it and asks for a refresh, and never reads the app bundle.
     @ObservedObject private var signing = SigningExpiryMonitor.shared
+    @ObservedObject private var updates = UpdateService.shared
     @ObservedObject private var tunnel = TunnelManager.shared
     @ObservedObject private var mounting = MountingProgress.shared
 
@@ -301,6 +303,8 @@ struct SettingsView: View {
                     }
                 }
 
+                updateSection
+
                 Section("Connection Diagnostics") {
                     diagnosticRow("Underlying Network", value: tunnel.underlyingNetwork.rawValue)
                     diagnosticRow(
@@ -347,6 +351,43 @@ struct SettingsView: View {
                         value: warmSessionKeeper.state.rawValue
                     )
                     diagnosticRow("Target", value: "\(DeviceConnectionContext.targetIPAddress):49152")
+
+                    if let trace = tunnel.lastColdBootstrap {
+                        diagnosticRow("Cold Bootstrap Stage", value: trace.finalStage.displayName)
+                        diagnosticRow("Cold Bootstrap Result", value: trace.resultDescription)
+                        diagnosticRow(
+                            "Last Cold Bootstrap Attempt",
+                            value: syncTimestampFormatter.string(from: trace.timestamp)
+                        )
+                        diagnosticRow(
+                            "Last Cold Bootstrap Duration",
+                            value: String(format: "%.3f s", trace.totalElapsed)
+                        )
+                        diagnosticRow("Cold Bootstrap Retry Count", value: String(trace.retryCount))
+                        diagnosticRow(
+                            "Cold Bootstrap Stage Timings",
+                            value: trace.measurements.map { measurement in
+                                let elapsed = measurement.elapsed.map { String(format: "%.3fs", $0) } ?? "combined"
+                                return "#\(measurement.attempt) \(measurement.stage.displayName): \(elapsed)"
+                            }.joined(separator: "\n")
+                        )
+                        if let failure = trace.failure {
+                            diagnosticRow(
+                                "Last Socket Error",
+                                value: failure.detail
+                            )
+                            diagnosticRow(
+                                "Last errno",
+                                value: failure.errno.map(String.init) ?? String(localized: "Not available")
+                            )
+                            Text(failure.userMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    } else {
+                        diagnosticRow("Cold Bootstrap Result", value: String(localized: "Not attempted"))
+                    }
 
                     if let category = tunnel.lastConnectionFailureCategory {
                         VStack(alignment: .leading, spacing: 3) {
@@ -396,6 +437,7 @@ struct SettingsView: View {
                 // tunnel is up, nothing is simulating, and the last reading is
                 // old enough to be worth replacing.
                 signing.refreshIfPossible(reason: "opening Settings")
+                Task { await updates.checkIfNeeded() }
             }
             // Belt and braces only. `BackgroundLocationManager` republishes the
             // status from its authorization delegate callback, which already
@@ -523,6 +565,15 @@ struct SettingsView: View {
             }
             Text("Read from the provisioning profile on this device, so it follows a SideStore refresh.")
                 .font(.caption).foregroundStyle(.secondary)
+            if signingSeverity != .normal, signingSeverity != .unknown {
+                Button("Open SideStore to Refresh") {
+                    UIApplication.shared.open(SettingsLinks.sideStore)
+                }
+                Text("Location Suite only reports the profile expiration. SideStore performs the refresh; return here afterward to verify that the expiration moved later.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("If Apple's authentication service is temporarily unavailable, the current profile remains valid until the expiration shown above. Retry later; Location Suite never revokes or recreates certificates.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         } else {
             Text("TLocation reads this from the device, and can only check it while connected.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -536,7 +587,7 @@ struct SettingsView: View {
         guard let expiry = reading.expirationDate else {
             return String(localized: "No profile on this device")
         }
-        return "\(AppSigningInfo.formatted(expiry)) (\(AppSigningInfo.remainingPhrase(until: expiry)))"
+        return "\(AppSigningInfo.formattedDateTime(expiry)) (\(AppSigningInfo.remainingPhrase(until: expiry)))"
     }
 
     /// Red once the signature has lapsed, orange inside the last day, otherwise
@@ -548,11 +599,87 @@ struct SettingsView: View {
     /// moves later, so an old reading can be wrong in exactly the alarming
     /// direction, which is the bug this whole change exists to stop repeating.
     private var signingExpiryColor: Color {
-        guard let expiry = signing.reading?.expirationDate, signing.isTrustworthy else {
-            return .secondary
+        switch signingSeverity {
+        case .expired: return .red
+        case .urgentWarning, .clearWarning: return .orange
+        case .subtleWarning: return .yellow
+        case .normal, .unknown: return .secondary
         }
-        if AppSigningInfo.hasExpired(expiry) { return .red }
-        return AppSigningInfo.isExpiringSoon(expiry) ? .orange : .secondary
+    }
+
+    private var signingSeverity: SigningExpirySeverity {
+        AppSigningInfo.severity(
+            expirationDate: signing.reading?.expirationDate,
+            checkedAt: signing.reading?.checkedAt
+        )
+    }
+
+    // MARK: - Updates
+
+    @ViewBuilder
+    private var updateSection: some View {
+        Section("Updates") {
+            HStack {
+                Text("Status")
+                Spacer()
+                Text(updateStatusText)
+                    .foregroundStyle(updates.snapshot.status == .updateAvailable ? .orange : .secondary)
+            }
+
+            if let release = updates.snapshot.availableRelease {
+                Text("Location Suite \(release.version) (\(release.buildVersion)) is available.")
+                if let date = release.releaseDate {
+                    Text("Released \(syncTimestampFormatter.string(from: date))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let notes = release.localizedDescription, !notes.isEmpty {
+                    Text(notes).font(.caption).foregroundStyle(.secondary).lineLimit(4)
+                }
+                Button("Install Update") {
+                    guard let url = SideStoreURLBuilder.installURL(for: release.downloadURL) else { return }
+                    UIApplication.shared.open(url)
+                }
+            }
+
+            Button {
+                Task { await updates.checkIfNeeded(force: true) }
+            } label: {
+                if updates.isChecking {
+                    Label("Checking…", systemImage: "arrow.clockwise")
+                } else {
+                    Label("Check for Updates", systemImage: "arrow.clockwise")
+                }
+            }
+            .disabled(updates.isChecking)
+
+            if let sourceURL = updates.sourceURL,
+               let addSourceURL = SideStoreURLBuilder.sourceURL(for: sourceURL) {
+                Button("Add Location Suite Source") {
+                    UIApplication.shared.open(addSourceURL)
+                }
+            } else {
+                Text("This build has no public update source configured.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            if let checkedAt = updates.snapshot.lastSuccessfulCheck {
+                Text("Last successful check: \(syncTimestampFormatter.string(from: checkedAt))")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if updates.snapshot.status == .checkFailed, let error = updates.lastError {
+                Text("Update check failed: \(error)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var updateStatusText: String {
+        switch updates.snapshot.status {
+        case .upToDate: return String(localized: "Up to Date")
+        case .updateAvailable: return String(localized: "Update Available")
+        case .checkFailed: return String(localized: "Check Failed")
+        case .unknown: return String(localized: "Unknown")
+        }
     }
 
     // MARK: - Background Keep-Alive Warning

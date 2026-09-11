@@ -479,6 +479,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/TLocation/idevice",
 				);
+				LOCATION_SUITE_SOURCE_URL = "";
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
 				MARKETING_VERSION = 1.4.3;
 				PRODUCT_BUNDLE_IDENTIFIER = vn.truongkma.tlocation;
@@ -542,6 +543,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/TLocation/idevice",
 				);
+				LOCATION_SUITE_SOURCE_URL = "";
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
 				MARKETING_VERSION = 1.4.3;
 				PRODUCT_BUNDLE_IDENTIFIER = vn.truongkma.tlocation;

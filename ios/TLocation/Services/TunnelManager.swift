@@ -7,6 +7,11 @@ import Foundation
 import Network
 
 final class TunnelManager: ObservableObject {
+    private struct StartOutcome {
+        let result: Result<Void, NSError>
+        let trace: ColdBootstrapTrace?
+    }
+
     static let shared = TunnelManager()
 
     @Published private(set) var isConnected = false
@@ -14,11 +19,13 @@ final class TunnelManager: ObservableObject {
     @Published private(set) var endpointReachability: EndpointReachability = .unknown
     @Published private(set) var lastConnectionFailureCategory: PhoneLocalConnectionFailureCategory?
     @Published private(set) var lastConnectionFailure: String?
+    @Published private(set) var lastColdBootstrap: ColdBootstrapTrace?
 
     private var isStarting = false
     private let pathMonitor = NWPathMonitor()
     private let pathMonitorQueue = DispatchQueue(label: "vn.truongkma.tlocation.network-path")
     private var networkRetryWorkItem: DispatchWorkItem?
+    private var coldBootstrapRetryGate = ColdBootstrapRetryGate()
 
     private init() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
@@ -42,31 +49,56 @@ final class TunnelManager: ObservableObject {
     /// nothing about whether a *fresh* TCP connection can currently be made.
     /// Only a coordinate that had to build a session updates fresh endpoint and
     /// RemotePairing diagnostics.
-    func recordSimulationCoordinateSuccess(reusedOpenSession: Bool) {
+    func recordSimulationResult(
+        _ result: LocationSimulationAttemptResult,
+        reusedOpenSession: Bool
+    ) {
         runOnMain {
-            if !reusedOpenSession {
-                self.isConnected = true
-                self.endpointReachability = .reachable
+            if let trace = result.coldBootstrapTrace,
+               ColdBootstrapTraceOrdering.shouldReplace(
+                   currentSequence: self.lastColdBootstrap?.sequence,
+                   with: trace.sequence
+               ) {
+                self.lastColdBootstrap = trace
+                if let failure = trace.failure {
+                    self.coldBootstrapRetryGate.recordFinalFailure(
+                        failure.category,
+                        underlyingNetwork: trace.underlyingNetwork
+                    )
+                }
             }
-            self.lastConnectionFailureCategory = nil
-            self.lastConnectionFailure = nil
-        }
-    }
 
-    func recordSimulationEndpointFailure(code: Int32, detail: String) {
-        runOnMain {
-            switch code {
-            case 9, 10, 11:
-                // The RemotePairing handshake succeeded; a service above it
-                // rejected the request.
-                self.endpointReachability = .reachable
-                self.isConnected = true
-            default:
-                self.endpointReachability = .unreachable
-                self.isConnected = false
+            if result.statusCode == 0 {
+                if !reusedOpenSession {
+                    self.isConnected = true
+                    self.endpointReachability = .reachable
+                }
+                self.lastConnectionFailureCategory = nil
+                self.lastConnectionFailure = nil
+                return
             }
-            self.lastConnectionFailureCategory = Self.failureCategory(forSimulationCode: code)
-            self.lastConnectionFailure = detail
+
+            guard let failure = result.coldBootstrapTrace?.failure else {
+                self.isConnected = false
+                self.endpointReachability = .unreachable
+                self.lastConnectionFailureCategory = .unknown
+                self.lastConnectionFailure = "Location simulation failed with status \(result.statusCode)."
+                return
+            }
+
+            switch failure.stage {
+            case .rsdConnect, .locationSimulationChannel, .coordinateSet, .ready:
+                self.isConnected = true
+                self.endpointReachability = .reachable
+            case .waitingForTunnel, .tcpConnect, .remotePairing:
+                self.isConnected = false
+                self.endpointReachability = failure.category == .pairingRejected
+                    || failure.category == .remotePairingFailed
+                    ? .reachable
+                    : .unreachable
+            }
+            self.lastConnectionFailureCategory = Self.legacyCategory(for: failure.category)
+            self.lastConnectionFailure = "\(failure.userMessage) \(failure.detail)"
         }
     }
 
@@ -116,26 +148,97 @@ final class TunnelManager: ObservableObject {
 
         isStarting = true
         endpointReachability = .checking
+        let network = underlyingNetwork.rawValue
+        let target = DeviceConnectionContext.targetIPAddress
+        let timestamp = Date()
+        let sequence = ColdBootstrapSequenceNumber.next()
 
         DispatchQueue.global(qos: .userInteractive).async { [showErrorUI] in
-            let result: Result<Void, NSError>
-            do {
-                try JITEnableContext.shared.startTunnel()
-                result = .success(())
-            } catch {
-                result = .failure(error as NSError)
-            }
+            let outcome = Self.performBoundedStart(
+                target: target,
+                underlyingNetwork: network,
+                timestamp: timestamp,
+                sequence: sequence
+            )
 
             DispatchQueue.main.async {
-                self.finishStart(result, showErrorUI: showErrorUI)
+                self.finishStart(outcome, showErrorUI: showErrorUI)
             }
         }
     }
 
-    private func finishStart(_ result: Result<Void, NSError>, showErrorUI: Bool) {
+    private static func performBoundedStart(
+        target: String,
+        underlyingNetwork: String,
+        timestamp: Date,
+        sequence: UInt64
+    ) -> StartOutcome {
+        let startedAt = Date()
+        var measurements: [ColdBootstrapStageMeasurement] = []
+        var retryCount = 0
+
+        while true {
+            let attempt = retryCount + 1
+            measurements.append(ColdBootstrapStageMeasurement(
+                attempt: attempt,
+                stage: .waitingForTunnel,
+                elapsed: nil
+            ))
+            let operationStartedAt = Date()
+            do {
+                try JITEnableContext.shared.startTunnel()
+                return StartOutcome(result: .success(()), trace: nil)
+            } catch {
+                let nsError = error as NSError
+                let ffi = LocationBootstrapFFIError(
+                    code: Int32(clamping: nsError.code),
+                    subcode: Int32(clamping: nsError.userInfo["IdeviceFFISubcode"] as? Int ?? 0),
+                    message: nsError.localizedDescription
+                )
+                let socketErrno = ColdBootstrapErrorClassifier.errno(from: ffi)
+                let stage: ColdBootstrapStage = socketErrno == nil ? .remotePairing : .tcpConnect
+                measurements.append(ColdBootstrapStageMeasurement(
+                    attempt: attempt,
+                    stage: stage,
+                    elapsed: Date().timeIntervalSince(operationStartedAt)
+                ))
+                let failure = ColdBootstrapErrorClassifier.classify(
+                    stage: stage,
+                    statusCode: Int32(clamping: nsError.code),
+                    ffi: ffi
+                )
+                let delays = ColdBootstrapRecoveryPolicy.retryDelays(
+                    for: failure.category,
+                    underlyingNetwork: underlyingNetwork
+                )
+                guard retryCount < delays.count else {
+                    let trace = ColdBootstrapTrace(
+                        sequence: sequence,
+                        timestamp: timestamp,
+                        targetHost: target,
+                        targetPort: 49152,
+                        underlyingNetwork: underlyingNetwork,
+                        measurements: measurements,
+                        retryCount: retryCount,
+                        totalElapsed: Date().timeIntervalSince(startedAt),
+                        failure: failure
+                    )
+                    return StartOutcome(result: .failure(nsError), trace: trace)
+                }
+                let delay = delays[retryCount]
+                retryCount += 1
+                LogManager.shared.addInfoLog(
+                    "Initial RemotePairing retry \(retryCount) scheduled after \(Int(delay * 1_000)) ms for \(failure.category.displayName)."
+                )
+                Thread.sleep(forTimeInterval: delay)
+            }
+        }
+    }
+
+    private func finishStart(_ outcome: StartOutcome, showErrorUI: Bool) {
         isStarting = false
 
-        switch result {
+        switch outcome.result {
         case .success:
             isConnected = true
             endpointReachability = .reachable
@@ -146,6 +249,19 @@ final class TunnelManager: ObservableObject {
             )
             mountDeveloperDiskImageIfNeeded()
         case .failure(let error):
+            if let trace = outcome.trace,
+               ColdBootstrapTraceOrdering.shouldReplace(
+                   currentSequence: lastColdBootstrap?.sequence,
+                   with: trace.sequence
+               ) {
+                lastColdBootstrap = trace
+                if let failure = trace.failure {
+                    coldBootstrapRetryGate.recordFinalFailure(
+                        failure.category,
+                        underlyingNetwork: trace.underlyingNetwork
+                    )
+                }
+            }
             isConnected = false
             endpointReachability = .unreachable
             lastConnectionFailureCategory = Self.failureCategory(for: error)
@@ -170,8 +286,26 @@ final class TunnelManager: ObservableObject {
             return
         }
 
-        if error.code == -9 {
+        if error.code == -9
+            || lastColdBootstrap?.failure?.category == .pairingRejected
+            || lastColdBootstrap?.failure?.category == .pairingFileUnreadable {
             handleInvalidPairingFile()
+            return
+        }
+
+        if let failure = lastColdBootstrap?.failure {
+            let errnoLine = failure.errno.map { "\nerrno: \($0)" } ?? ""
+            showAlert(
+                title: failure.userTitle,
+                message: "\(failure.userMessage)\n\nTarget: \(DeviceConnectionContext.targetIPAddress):49152\nStage: \(failure.stage.displayName)\nStatus: \(failure.statusCode)\(errnoLine)\n\nTechnical details:\n\(failure.detail)",
+                showOk: false,
+                showTryAgain: true
+            ) { shouldTryAgain in
+                if shouldTryAgain {
+                    self.coldBootstrapRetryGate.meaningfulEvent(.userRetry)
+                    startTunnelInBackground()
+                }
+            }
             return
         }
 
@@ -212,6 +346,7 @@ final class TunnelManager: ObservableObject {
     private func networkPathChanged(to kind: UnderlyingNetworkKind) {
         let didChange = underlyingNetwork != kind
         underlyingNetwork = kind
+        if didChange { coldBootstrapRetryGate.meaningfulEvent(.pathChanged) }
         guard didChange,
               !isConnected,
               !isStarting,
@@ -248,13 +383,18 @@ final class TunnelManager: ObservableObject {
         return .unknown
     }
 
-    private static func failureCategory(forSimulationCode code: Int32) -> PhoneLocalConnectionFailureCategory {
-        switch code {
-        case 1: return .invalidAddress
-        case 2: return .pairing
-        case 3: return .noRoute
-        case 9, 10, 11, 12: return .service
-        default: return .unknown
+    private static func legacyCategory(
+        for category: ColdBootstrapFailureCategory
+    ) -> PhoneLocalConnectionFailureCategory {
+        switch category {
+        case .invalidTarget: return .invalidAddress
+        case .localVPNUnavailable, .noRoute: return .noRoute
+        case .connectionRefused: return .refused
+        case .timeout: return .timedOut
+        case .pairingRejected, .pairingFileUnreadable: return .pairing
+        case .connectionReset, .remotePairingFailed, .rsdFailed, .dvtFailed,
+             .ddiUnavailable, .coordinateSetFailed: return .service
+        case .unknown: return .unknown
         }
     }
 }
@@ -302,7 +442,8 @@ func markTunnelDisconnected() {
 
 private func tunnelConnectionLogMessage(for error: NSError) -> String {
     let target = "\(DeviceConnectionContext.targetIPAddress):49152"
-    return "Tunnel connection failed for \(target): \(error.localizedDescription) (Domain: \(error.domain), Code: \(error.code), Raw: \(String(describing: error)))"
+    let detail = BootstrapDiagnosticPrivacy.sanitize(error.localizedDescription)
+    return "Tunnel connection failed for \(target): \(detail) (Domain: \(error.domain), Code: \(error.code))"
 }
 
 private func tunnelConnectionAlertMessage(for error: NSError) -> String {

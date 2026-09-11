@@ -35,6 +35,15 @@ private enum IdeviceBridge {
         return "libidevice code \(ffiError.pointee.code): \(message)"
     }
 
+    static func snapshot(from ffiError: UnsafeMutablePointer<IdeviceFfiError>?) -> LocationBootstrapFFIError? {
+        guard let ffiError else { return nil }
+        return LocationBootstrapFFIError(
+            code: ffiError.pointee.code,
+            subcode: ffiError.pointee.sub_code,
+            message: string(from: ffiError.pointee.message) ?? "libidevice reported no detail"
+        )
+    }
+
     static func consumeFFIError(
         _ ffiError: UnsafeMutablePointer<IdeviceFfiError>?,
         fallback: String,
@@ -443,7 +452,25 @@ enum LocationSimulationCommandQueue {
     static let shared = DispatchQueue(label: "vn.truongkma.tlocation.location-sim", qos: .userInitiated)
 }
 
+/// Backward-compatible status-only entry point. New in-app callers use the
+/// detailed form below so stage, errno, and bounded retry evidence are retained.
 func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Double, _ pairingFile: String) -> Int32 {
+    simulate_location_detailed(
+        deviceIP,
+        latitude,
+        longitude,
+        pairingFile,
+        underlyingNetwork: "Unknown"
+    ).statusCode
+}
+
+func simulate_location_detailed(
+    _ deviceIP: String,
+    _ latitude: Double,
+    _ longitude: Double,
+    _ pairingFile: String,
+    underlyingNetwork: String
+) -> LocationSimulationAttemptResult {
     if let locationSimulation = LocationSimulationState.locationSimulation {
         if let ffiError = location_simulation_set(locationSimulation, latitude, longitude) {
             // Not an error yet: the code below rebuilds the session from
@@ -457,8 +484,57 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
             LocationSimulationState.cleanup()
         } else {
             LocationSimulationSession.set(active: true)
-            return LocationSimulationStatus.ok
+            // A warm update is deliberately absent from cold diagnostics. It is
+            // stronger evidence than a fresh probe and must never be disrupted by one.
+            return LocationSimulationAttemptResult(
+                statusCode: LocationSimulationStatus.ok,
+                coldBootstrapTrace: nil
+            )
         }
+    }
+
+    let sequence = ColdBootstrapSequenceNumber.next()
+    let timestamp = Date()
+    let startedAt = Date()
+    var measurements: [ColdBootstrapStageMeasurement] = []
+    var retryCount = 0
+
+    func result(
+        statusCode: Int32,
+        failure: LocationBootstrapError?
+    ) -> LocationSimulationAttemptResult {
+        LocationSimulationAttemptResult(
+            statusCode: statusCode,
+            coldBootstrapTrace: ColdBootstrapTrace(
+                sequence: sequence,
+                timestamp: timestamp,
+                targetHost: deviceIP,
+                targetPort: 49152,
+                underlyingNetwork: underlyingNetwork,
+                measurements: measurements,
+                retryCount: retryCount,
+                totalElapsed: Date().timeIntervalSince(startedAt),
+                failure: failure
+            )
+        )
+    }
+
+    func directFailure(
+        stage: ColdBootstrapStage,
+        statusCode: Int32,
+        category: ColdBootstrapFailureCategory,
+        detail: String,
+        ffi: LocationBootstrapFFIError? = nil
+    ) -> LocationBootstrapError {
+        LocationBootstrapError(
+            stage: stage,
+            statusCode: statusCode,
+            ffiCode: ffi?.code,
+            ffiSubcode: ffi?.subcode,
+            errno: ColdBootstrapErrorClassifier.errno(from: ffi),
+            category: category,
+            detail: BootstrapDiagnosticPrivacy.sanitize(detail)
+        )
     }
 
     var address = sockaddr_in()
@@ -470,118 +546,250 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         LogManager.shared.addErrorLog(
             "simulate_location failed (code \(LocationSimulationStatus.invalidIP)): “\(deviceIP)” is not a valid IPv4 address. Check the target device IP in Settings."
         )
-        return LocationSimulationStatus.invalidIP
+        let failure = directFailure(
+            stage: .waitingForTunnel,
+            statusCode: LocationSimulationStatus.invalidIP,
+            category: .invalidTarget,
+            detail: "The configured target is not a valid IPv4 address."
+        )
+        return result(statusCode: LocationSimulationStatus.invalidIP, failure: failure)
     }
 
     var pairingHandle: OpaquePointer?
     let pairingError = pairingFile.withCString { rp_pairing_file_read($0, &pairingHandle) }
     if let pairingError {
+        let ffi = IdeviceBridge.snapshot(from: pairingError)
         LogManager.shared.addErrorLog(
-            "simulate_location failed (code \(LocationSimulationStatus.pairingRead)): could not read the pairing file at \(pairingFile) — \(IdeviceBridge.detail(from: pairingError))"
+            "simulate_location failed (code \(LocationSimulationStatus.pairingRead)): could not read the pairing file — \(BootstrapDiagnosticPrivacy.sanitize(ffi?.message ?? "no upstream detail"))"
         )
         idevice_error_free(pairingError)
-        return LocationSimulationStatus.pairingRead
+        let failure = directFailure(
+            stage: .remotePairing,
+            statusCode: LocationSimulationStatus.pairingRead,
+            category: .pairingFileUnreadable,
+            detail: ffi?.message ?? "The pairing file could not be read.",
+            ffi: ffi
+        )
+        return result(statusCode: LocationSimulationStatus.pairingRead, failure: failure)
     }
 
     guard let pairingHandle else {
         LogManager.shared.addErrorLog(
-            "simulate_location failed (code \(LocationSimulationStatus.pairingRead)): reading the pairing file at \(pairingFile) reported success but returned no handle"
+            "simulate_location failed (code \(LocationSimulationStatus.pairingRead)): reading the pairing file reported success but returned no handle"
         )
-        return LocationSimulationStatus.pairingRead
+        let failure = directFailure(
+            stage: .remotePairing,
+            statusCode: LocationSimulationStatus.pairingRead,
+            category: .pairingFileUnreadable,
+            detail: "Reading the pairing file returned no handle."
+        )
+        return result(statusCode: LocationSimulationStatus.pairingRead, failure: failure)
     }
 
     defer { rp_pairing_file_free(pairingHandle) }
 
-    let providerError = withUnsafePointer(to: &address) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            tunnel_create_rppairing(
-                $0,
-                socklen_t(MemoryLayout<sockaddr_in>.stride),
-                "TLocationSimulation",
-                pairingHandle,
-                nil,
-                nil,
-                &LocationSimulationState.adapter,
-                &LocationSimulationState.handshake
-            )
+    while true {
+        let attempt = retryCount + 1
+        measurements.append(ColdBootstrapStageMeasurement(
+            attempt: attempt,
+            stage: .waitingForTunnel,
+            elapsed: nil
+        ))
+
+        let providerStartedAt = Date()
+        let providerError = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                tunnel_create_rppairing(
+                    $0,
+                    socklen_t(MemoryLayout<sockaddr_in>.stride),
+                    "TLocationSimulation",
+                    pairingHandle,
+                    nil,
+                    nil,
+                    &LocationSimulationState.adapter,
+                    &LocationSimulationState.handshake
+                )
+            }
         }
-    }
 
-    if let providerError {
-        LogManager.shared.addErrorLog(
-            "simulate_location failed (code \(LocationSimulationStatus.providerCreate)): could not open the tunnel to \(deviceIP):49152 — \(IdeviceBridge.detail(from: providerError)). Check that LocalDevVPN is connected."
+        if let providerError {
+            let ffi = IdeviceBridge.snapshot(from: providerError)
+            let socketErrno = ColdBootstrapErrorClassifier.errno(from: ffi)
+            let stage: ColdBootstrapStage = socketErrno == nil ? .remotePairing : .tcpConnect
+            measurements.append(ColdBootstrapStageMeasurement(
+                attempt: attempt,
+                stage: stage,
+                elapsed: Date().timeIntervalSince(providerStartedAt)
+            ))
+            let failure = ColdBootstrapErrorClassifier.classify(
+                stage: stage,
+                statusCode: LocationSimulationStatus.providerCreate,
+                ffi: ffi
+            )
+            LogManager.shared.addErrorLog(
+                "Cold bootstrap attempt \(attempt) failed at \(stage.displayName) for \(deviceIP):49152 — \(failure.detail)"
+            )
+            idevice_error_free(providerError)
+            LocationSimulationState.cleanup()
+
+            let delays = ColdBootstrapRecoveryPolicy.retryDelays(
+                for: failure.category,
+                underlyingNetwork: underlyingNetwork
+            )
+            guard retryCount < delays.count else {
+                return result(statusCode: LocationSimulationStatus.providerCreate, failure: failure)
+            }
+            let delay = delays[retryCount]
+            retryCount += 1
+            LogManager.shared.addInfoLog(
+                "Cold bootstrap retry \(retryCount) scheduled after \(Int(delay * 1_000)) ms for \(failure.category.displayName)."
+            )
+            Thread.sleep(forTimeInterval: delay)
+            continue
+        }
+
+        // Upstream exposes tunnel_create_rppairing as one synchronous call. Its
+        // success proves TCP connected and pairing authenticated, but does not
+        // expose their timing boundary, so TCP is recorded without invented time.
+        measurements.append(ColdBootstrapStageMeasurement(
+            attempt: attempt,
+            stage: .tcpConnect,
+            elapsed: nil
+        ))
+        measurements.append(ColdBootstrapStageMeasurement(
+            attempt: attempt,
+            stage: .remotePairing,
+            elapsed: Date().timeIntervalSince(providerStartedAt)
+        ))
+
+        let rsdStartedAt = Date()
+        let remoteServerError = remote_server_connect_rsd(
+            LocationSimulationState.adapter,
+            LocationSimulationState.handshake,
+            &LocationSimulationState.remoteServer
         )
-        idevice_error_free(providerError)
-        LocationSimulationState.cleanup()
-        return LocationSimulationStatus.providerCreate
-    }
+        if let remoteServerError {
+            let ffi = IdeviceBridge.snapshot(from: remoteServerError)
+            measurements.append(ColdBootstrapStageMeasurement(
+                attempt: attempt,
+                stage: .rsdConnect,
+                elapsed: Date().timeIntervalSince(rsdStartedAt)
+            ))
+            let failure = ColdBootstrapErrorClassifier.classify(
+                stage: .rsdConnect,
+                statusCode: LocationSimulationStatus.remoteServer,
+                ffi: ffi
+            )
+            LogManager.shared.addErrorLog(
+                "Cold bootstrap attempt \(attempt) failed at RSD — \(failure.detail)"
+            )
+            idevice_error_free(remoteServerError)
+            LocationSimulationState.cleanup()
+            let delays = ColdBootstrapRecoveryPolicy.retryDelays(
+                for: failure.category,
+                underlyingNetwork: underlyingNetwork
+            )
+            guard retryCount < delays.count else {
+                return result(statusCode: LocationSimulationStatus.remoteServer, failure: failure)
+            }
+            let delay = delays[retryCount]
+            retryCount += 1
+            Thread.sleep(forTimeInterval: delay)
+            continue
+        }
+        measurements.append(ColdBootstrapStageMeasurement(
+            attempt: attempt,
+            stage: .rsdConnect,
+            elapsed: Date().timeIntervalSince(rsdStartedAt)
+        ))
 
-    let remoteServerError = remote_server_connect_rsd(
-        LocationSimulationState.adapter,
-        LocationSimulationState.handshake,
-        &LocationSimulationState.remoteServer
-    )
-    if let remoteServerError {
-        LogManager.shared.addErrorLog(
-            "simulate_location failed (code \(LocationSimulationStatus.remoteServer)): could not connect to the remote service on \(deviceIP):49152 — \(IdeviceBridge.detail(from: remoteServerError))"
+        let channelStartedAt = Date()
+        let locationSimulationError = location_simulation_new(
+            LocationSimulationState.remoteServer,
+            &LocationSimulationState.locationSimulation
         )
-        idevice_error_free(remoteServerError)
-        LocationSimulationState.cleanup()
-        return LocationSimulationStatus.remoteServer
-    }
+        if let locationSimulationError {
+            let ffi = IdeviceBridge.snapshot(from: locationSimulationError)
+            measurements.append(ColdBootstrapStageMeasurement(
+                attempt: attempt,
+                stage: .locationSimulationChannel,
+                elapsed: Date().timeIntervalSince(channelStartedAt)
+            ))
+            let failure = ColdBootstrapErrorClassifier.classify(
+                stage: .locationSimulationChannel,
+                statusCode: LocationSimulationStatus.locationSimulation,
+                ffi: ffi
+            )
+            LogManager.shared.addErrorLog(
+                "Cold bootstrap attempt \(attempt) failed opening DVT LocationSimulation — \(failure.detail)"
+            )
+            idevice_error_free(locationSimulationError)
+            LocationSimulationState.cleanup()
+            return result(statusCode: LocationSimulationStatus.locationSimulation, failure: failure)
+        }
+        measurements.append(ColdBootstrapStageMeasurement(
+            attempt: attempt,
+            stage: .locationSimulationChannel,
+            elapsed: Date().timeIntervalSince(channelStartedAt)
+        ))
 
-    let locationSimulationError = location_simulation_new(
-        LocationSimulationState.remoteServer,
-        &LocationSimulationState.locationSimulation
-    )
-    if let locationSimulationError {
-        LogManager.shared.addErrorLog(
-            "simulate_location failed (code \(LocationSimulationStatus.locationSimulation)): the device would not start a location-simulation session — \(IdeviceBridge.detail(from: locationSimulationError)). This usually means the Developer Disk Image is not mounted."
+        // Confirmed against jkcoxson/idevice's Rust FFI implementation: this call
+        // obtains `&mut (*server).0`; it does not consume the server's Box. Retain
+        // the pointer and free it exactly once after the borrowing child.
+
+        // The session handle now exists. Published here rather than after the
+        // `location_simulation_set` below because from this point on there is
+        // something to tear down: if the set fails, `cleanup()` retracts the flag on
+        // its way out, so the two can never disagree.
+        LocationSimulationSession.set(open: true)
+
+        let coordinateStartedAt = Date()
+        let locationSetError = location_simulation_set(
+            LocationSimulationState.locationSimulation,
+            latitude,
+            longitude
         )
-        idevice_error_free(locationSimulationError)
-        LocationSimulationState.cleanup()
-        return LocationSimulationStatus.locationSimulation
-    }
+        if let locationSetError {
+            let ffi = IdeviceBridge.snapshot(from: locationSetError)
+            measurements.append(ColdBootstrapStageMeasurement(
+                attempt: attempt,
+                stage: .coordinateSet,
+                elapsed: Date().timeIntervalSince(coordinateStartedAt)
+            ))
+            let failure = ColdBootstrapErrorClassifier.classify(
+                stage: .coordinateSet,
+                statusCode: LocationSimulationStatus.locationSet,
+                ffi: ffi
+            )
+            // The coordinate is deliberately never written to the log.
+            LogManager.shared.addErrorLog(
+                "Cold bootstrap attempt \(attempt) failed setting the coordinate — \(failure.detail)"
+            )
+            idevice_error_free(locationSetError)
+            LocationSimulationState.cleanup()
+            return result(statusCode: LocationSimulationStatus.locationSet, failure: failure)
+        }
+        measurements.append(ColdBootstrapStageMeasurement(
+            attempt: attempt,
+            stage: .coordinateSet,
+            elapsed: Date().timeIntervalSince(coordinateStartedAt)
+        ))
 
-    // Confirmed against jkcoxson/idevice's Rust FFI implementation: this call
-    // obtains `&mut (*server).0`; it does not consume the server's Box. Retain
-    // the pointer and free it exactly once after the borrowing child.
+        LocationSimulationSession.set(active: true)
+        measurements.append(ColdBootstrapStageMeasurement(
+            attempt: attempt,
+            stage: .ready,
+            elapsed: nil
+        ))
 
-    // The session handle now exists. Published here rather than after the
-    // `location_simulation_set` below because from this point on there is
-    // something to tear down: if the set fails, `cleanup()` retracts the flag on
-    // its way out, so the two can never disagree.
-    LocationSimulationSession.set(open: true)
-
-    let locationSetError = location_simulation_set(
-        LocationSimulationState.locationSimulation,
-        latitude,
-        longitude
-    )
-    if let locationSetError {
-        // The coordinate is deliberately never written to the log. Which call
-        // failed and why is what diagnosis needs; *where* the user chose to
-        // appear is their business, and a log is a record that outlives the
-        // moment. Same reasoning on every other line below.
-        LogManager.shared.addErrorLog(
-            "simulate_location failed (code \(LocationSimulationStatus.locationSet)): the device rejected the coordinate — \(IdeviceBridge.detail(from: locationSetError))"
+        // Only the freshly built session is logged. The warm early return above
+        // stays silent, so this marks a user action or authoritative rebuild.
+        LogManager.shared.addInfoLog(
+            "simulate_location: cold bootstrap reached Ready on attempt \(attempt)"
         )
-        idevice_error_free(locationSetError)
-        LocationSimulationState.cleanup()
-        return LocationSimulationStatus.locationSet
+
+        return result(statusCode: LocationSimulationStatus.ok, failure: nil)
     }
-
-    LocationSimulationSession.set(active: true)
-
-    // Only the freshly built session is logged. The early return above — the
-    // path the 4-second resend loop takes on every tick — deliberately stays
-    // silent, so this line marks a user-initiated simulation (or a rebuild
-    // after the session died) and cannot flood the log.
-    LogManager.shared.addInfoLog(
-        "simulate_location: the device accepted the coordinate on a new session"
-    )
-
-    return LocationSimulationStatus.ok
 }
 
 /// Returns to real GPS while preserving the proven warm DVT/RSD transport and
