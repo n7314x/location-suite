@@ -1,0 +1,28 @@
+[package]
+name = "location_self_maintenance"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# Pinned to the exact upstream revision reviewed for the Phase 1 profile-only
+# refresh implementation. `install` is enabled only because isideload 0.3.17
+# imports idevice from modules that are compiled even when its install method is
+# unused. Location Suite never calls that install path; its existing, separately
+# pinned idevice FFI owns all phone-local device services.
+isideload = { git = "https://github.com/nab138/isideload.git", rev = "b6d111376657a59207ac26c8ef8be5cca8793cba", default-features = false, features = ["fs-storage", "install", "tokio-mt"] }
+rootcause = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# `macros` is required for `tokio::select!`, used to enforce a service timeout
+# while excluding the time a person spends in the Swift 2FA prompt.
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "debuginfo"

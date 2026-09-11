@@ -19,7 +19,7 @@ case "$output_dir" in
     ;;
 esac
 
-for tool in xcodebuild xcrun ditto zip unzip plutil lipo shasum; do
+for tool in cargo xcodebuild xcrun ditto zip unzip plutil lipo shasum; do
   command -v "$tool" >/dev/null || {
     echo "Required Apple build tool is unavailable: $tool" >&2
     exit 2
@@ -30,6 +30,12 @@ test -f "$project_path/project.pbxproj"
 test -f ios/TLocation/Info.plist
 test -f ios/TLocation/TLocation.entitlements
 test -f ios/TLocation/idevice/libidevice_ffi.a
+
+# The Apple/developer API boundary is source-built at its reviewed, locked
+# isideload revision. It remains a separate Rust static library from the
+# overnight-proven idevice FFI so rebuilding signing cannot change simulation.
+scripts/build_self_maintenance_rust.sh
+test -f ios/TLocation/self_maintenance/liblocation_self_maintenance.a
 
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
