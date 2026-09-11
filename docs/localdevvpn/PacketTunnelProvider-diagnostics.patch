@@ -5,7 +5,7 @@ index aaf79c1..f4c1a11 100644
 @@ -5,6 +5,8 @@
  //  Created by Stossy11 on 28/03/2025.
  //
- 
+
 +import Foundation
 +import Network
  import NetworkExtension
@@ -14,7 +14,7 @@ index aaf79c1..f4c1a11 100644
 @@ -16,12 +18,110 @@ private func tunnelLog(_ message: @autoclosure () -> String) {
  #endif
  }
- 
+
 +private struct TCPHeaderTrace {
 +    let sourceAddress: String
 +    let destinationAddress: String
@@ -68,7 +68,7 @@ index aaf79c1..f4c1a11 100644
 +    }
 +}
 +
- 
+
  class PacketTunnelProvider: NEPacketTunnelProvider {
      var tunnelIfaceIP: String = TunnelConstants.defaultIfaceIP
      var tunnelPeerIP: String = TunnelConstants.defaultPeerIP
@@ -115,7 +115,7 @@ index aaf79c1..f4c1a11 100644
 +            + "flags=\(trace.flags) path={\(currentPathSummary())}"
 +        )
 +    }
-     
+
      override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
 +        tunnelLog("lifecycle=start-requested")
 +        startPathDiagnostics()
@@ -131,18 +131,18 @@ index aaf79c1..f4c1a11 100644
              completionHandler(nil)
          }
 @@ -68,7 +169,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
-     
+
      func setPackets() {
          packetFlow.readPackets { [self] packets, protocols in
 +            for packet in packets { logRemotePairingHeader(packet, direction: "captured") }
              var modified = packets
-             
+
              for i in modified.indices where protocols[i].int32Value == AF_INET && modified[i].count >= 20 {
                  modified[i].withUnsafeMutableBytes { bytes in
 @@ -82,8 +184,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                  }
              }
-             
+
 +            for packet in modified { logRemotePairingHeader(packet, direction: "reinjected") }
              self.packetFlow.writePackets(modified, withProtocols: protocols)
              setPackets()
