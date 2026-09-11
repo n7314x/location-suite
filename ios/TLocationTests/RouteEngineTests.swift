@@ -1028,6 +1028,22 @@ struct LocationSimulationSessionKeeperTests {
         #expect(harness.driver.cleanupCount == 0)
     }
 
+    @Test func heartbeatTicksNeverOverlap() async {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        returnToIdle(point, in: harness)
+
+        harness.scheduler.fire()
+        harness.scheduler.fire()
+        harness.scheduler.fire()
+        #expect(harness.driver.performCount == 1)
+
+        harness.driver.completeNext(.succeeded(Date()))
+        await settle()
+        harness.scheduler.fire()
+        #expect(harness.driver.performCount == 2)
+    }
+
     @Test func thresholdFailuresCleanStaleSessionExactlyOnce() async {
         let harness = makeHarness()
         let point = beginProducer(.point, in: harness)
@@ -1110,6 +1126,19 @@ struct LocationSimulationSessionKeeperTests {
         #expect(harness.activity.startCount == 1)
         #expect(harness.activity.stopCount == 1)
         #expect(harness.activity.balance == 0)
+    }
+
+    @Test func idleSessionClosureStopsKeeperAndReleasesBackgroundActivity() {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        returnToIdle(point, in: harness)
+
+        harness.status.set(open: false, active: false)
+        harness.keeper.sessionDidClose()
+
+        #expect(harness.keeper.state == .disconnected)
+        #expect(harness.activity.balance == 0)
+        #expect(harness.activity.startCount == harness.activity.stopCount)
     }
 
     @Test func routeReturnRouteReusesOpenSession() {

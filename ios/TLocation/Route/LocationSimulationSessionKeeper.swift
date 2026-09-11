@@ -78,8 +78,8 @@ protocol LocationSimulationBackgroundActivityManaging: AnyObject {
 /// stopLocationSimulation heartbeats through an injected driver.
 @MainActor
 final class LocationSimulationSessionKeeper: ObservableObject {
-    static let heartbeatInterval: TimeInterval = 12
-    static let heartbeatFailureThreshold = 3
+    nonisolated static let heartbeatInterval: TimeInterval = 12
+    nonisolated static let heartbeatFailureThreshold = 3
     private static let successfulHeartbeatLogInterval = 25
 
     @Published private(set) var state: LocationSimulationSessionLifecycleState = .disconnected

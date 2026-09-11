@@ -216,7 +216,6 @@ final class DeviceRoutePlaybackActivityManager: RoutePlaybackActivityManaging {
 
     let sessionKeeper: LocationSimulationSessionKeeper
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
-    private var sessionChangedObserver: NSObjectProtocol?
 
     private init() {
         sessionKeeper = LocationSimulationSessionKeeper(
@@ -227,20 +226,6 @@ final class DeviceRoutePlaybackActivityManager: RoutePlaybackActivityManaging {
             backgroundActivity: DeviceLocationSimulationBackgroundActivity(),
             log: { LogManager.shared.addInfoLog($0) }
         )
-
-        sessionChangedObserver = NotificationCenter.default.addObserver(
-            forName: .locationSimulationSessionChanged,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            // A dead handle may close and rebuild within one serialized
-            // simulate_location call. Only the settled closed level is final.
-            guard !LocationSimulationSession.isOpen else { return }
-            Task { @MainActor [weak self] in
-                self?.sessionKeeper.sessionDidClose()
-                self?.endBackgroundTask()
-            }
-        }
     }
 
     func simulationDidTakeOwnership(_ lease: LocationSimulationProducerLease) {
@@ -270,6 +255,11 @@ final class DeviceRoutePlaybackActivityManager: RoutePlaybackActivityManaging {
 
     func simulationSessionDidDisconnect(_ lease: LocationSimulationDisconnectLease) {
         sessionKeeper.sessionDidDisconnect(lease)
+        endBackgroundTask()
+    }
+
+    func simulationSessionDidClose() {
+        sessionKeeper.sessionDidClose()
         endBackgroundTask()
     }
 
