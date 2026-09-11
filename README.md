@@ -56,3 +56,11 @@ and physical-device diagnostic matrix are documented in
 That document also records the iOS 27 warm-session result: a Wi-Fi-bootstrapped
 simulation can continue and switch between point and route producers on LTE,
 while a true cold LTE bootstrap may still require Wi-Fi.
+
+Unsigned tagged releases, SideStore update handoff, free-profile expiry
+warnings, structured cold-LTE stages, bounded recovery, and the exact next
+physical-device experiments are documented in
+[Releases and cold LTE diagnostics](docs/ios/releases-and-cold-lte.md). Public
+feed publication remains disabled until the documented artifact-only host
+variables are configured; private GitHub Release URLs are never used as a
+SideStore feed.

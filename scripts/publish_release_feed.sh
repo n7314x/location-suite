@@ -14,11 +14,13 @@ version_name="$(basename "$version_dir")"
 destination="$public_checkout/$version_name"
 
 if [[ -e "$destination" ]]; then
-  echo "Refusing to overwrite published immutable release $destination" >&2
-  exit 1
+  if ! diff -qr "$version_dir" "$destination" >/dev/null; then
+    echo "Refusing to overwrite published immutable release $destination" >&2
+    exit 1
+  fi
+else
+  cp -R "$version_dir" "$destination"
 fi
-
-cp -R "$version_dir" "$destination"
 mkdir -p "$public_checkout/assets"
 cp "$generated_root/assets/tlocation-icon.png" "$public_checkout/assets/tlocation-icon.png"
 cp "$generated_root/source-staging.json" "$public_checkout/source-staging.json"
@@ -33,6 +35,10 @@ python3 scripts/release_feed.py promote \
   cd "$public_checkout"
   git add "$version_name" assets/tlocation-icon.png source-staging.json source.json
   git diff --cached --check
+  if git diff --cached --quiet; then
+    echo "The exact release is already present; nothing to publish."
+    exit 0
+  fi
   git commit -m "Publish Location Suite $version_name"
   git push origin HEAD:main
 )

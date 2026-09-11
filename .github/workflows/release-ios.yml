@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: location-suite-stable-release
+  cancel-in-progress: false
+
 jobs:
   build-release:
     name: Build and validate stable release
@@ -16,7 +20,6 @@ jobs:
     env:
       RELEASE_BASE_URL: ${{ vars.LOCATION_SUITE_RELEASE_BASE_URL }}
       PUBLIC_REPOSITORY: ${{ vars.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY }}
-      PUBLIC_REPOSITORY_TOKEN: ${{ secrets.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY_TOKEN }}
 
     steps:
       - name: Check out private source
@@ -25,6 +28,8 @@ jobs:
           fetch-depth: 0
 
       - name: Require configured public artifact host
+        env:
+          PUBLIC_REPOSITORY_TOKEN: ${{ secrets.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY_TOKEN }}
         run: |
           set -euo pipefail
           test -n "$RELEASE_BASE_URL" || {
@@ -152,7 +157,6 @@ jobs:
     env:
       RELEASE_BASE_URL: ${{ vars.LOCATION_SUITE_RELEASE_BASE_URL }}
       PUBLIC_REPOSITORY: ${{ vars.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY }}
-      GH_TOKEN: ${{ secrets.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY_TOKEN }}
 
     steps:
       - name: Check out private release tooling
@@ -166,6 +170,8 @@ jobs:
           path: public-feed
 
       - name: Verify destination repository is public
+        env:
+          GH_TOKEN: ${{ secrets.LOCATION_SUITE_RELEASE_PUBLIC_REPOSITORY_TOKEN }}
         run: test "$(gh api "repos/$PUBLIC_REPOSITORY" --jq .visibility)" = "public"
 
       - name: Download validated publication bundle
