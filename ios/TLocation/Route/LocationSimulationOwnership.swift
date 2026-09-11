@@ -21,6 +21,14 @@ struct LocationSimulationProducerLease: Equatable, Sendable {
     fileprivate let generation: UInt64
 }
 
+/// A proof that no coordinate producer owned the shared session at a specific
+/// ownership generation. Idle heartbeats carry this onto the command queue;
+/// any later Point/Route claim invalidates it before the heartbeat can touch
+/// the FFI.
+struct LocationSimulationIdleLease: Equatable, Sendable {
+    fileprivate let generation: UInt64
+}
+
 /// Lock-guarded process-wide ownership for the shared location-simulation
 /// handle. Callers capture a lease when they become the producer, then recheck
 /// it on `LocationSimulationCommandQueue` immediately before touching the FFI.
@@ -76,6 +84,21 @@ final class LocationSimulationOwnership: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return producer == lease.producer && generation == lease.generation
+    }
+
+    /// Captures the current idle generation. A producer claim, another Return,
+    /// or Disconnect Session all advance the generation and retire the lease.
+    func idleLease() -> LocationSimulationIdleLease? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard producer == .none else { return nil }
+        return LocationSimulationIdleLease(generation: generation)
+    }
+
+    func isCurrent(_ lease: LocationSimulationIdleLease) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return producer == .none && generation == lease.generation
     }
 
     var currentProducer: LocationSimulationProducer {

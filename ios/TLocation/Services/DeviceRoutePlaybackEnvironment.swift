@@ -113,38 +113,154 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
     }
 }
 
+private struct DeviceLocationSimulationSessionStatus: LocationSimulationSessionStatusProviding {
+    var isSessionOpen: Bool { LocationSimulationSession.isOpen }
+    var isSimulationActive: Bool { LocationSimulationSession.isActive }
+}
+
+private final class DeviceWarmHeartbeatDriver: WarmLocationSimulationHeartbeatPerforming, @unchecked Sendable {
+    func performHeartbeat(
+        for lease: LocationSimulationIdleLease,
+        completion: @escaping @Sendable (WarmLocationSimulationHeartbeatResult) -> Void
+    ) {
+        LocationSimulationCommandQueue.shared.async {
+            guard LocationSimulationOwnership.shared.isCurrent(lease),
+                  LocationSimulationSession.isOpen,
+                  !LocationSimulationSession.isActive else {
+                completion(.stale)
+                return
+            }
+
+            let result = heartbeat_warm_location_simulation_session()
+            guard LocationSimulationOwnership.shared.isCurrent(lease) else {
+                completion(.stale)
+                return
+            }
+            completion(
+                result.succeeded
+                    ? .succeeded(Date())
+                    : .failed(result.detail)
+            )
+        }
+    }
+
+    func discardStaleSession(
+        for lease: LocationSimulationIdleLease,
+        reason: String,
+        completion: @escaping @Sendable (Bool) -> Void
+    ) {
+        LocationSimulationCommandQueue.shared.async {
+            // The Point/Route claim happens synchronously before its FFI block
+            // is enqueued. Rechecking here prevents an old heartbeat verdict
+            // from destroying the session a new producer has just claimed.
+            guard LocationSimulationOwnership.shared.isCurrent(lease),
+                  LocationSimulationSession.isOpen,
+                  !LocationSimulationSession.isActive else {
+                completion(false)
+                return
+            }
+
+            discard_stale_location_simulation_session()
+            TunnelManager.shared.recordWarmSessionFailure(
+                detail: "Warm LocationSimulation heartbeat failed repeatedly: \(reason)"
+            )
+            completion(true)
+        }
+    }
+}
+
+@MainActor
+private final class DeviceWarmHeartbeatCancellation: WarmLocationSimulationHeartbeatCancellation {
+    private var timer: Timer?
+
+    init(timer: Timer) {
+        self.timer = timer
+    }
+
+    func cancel() {
+        timer?.invalidate()
+        timer = nil
+    }
+}
+
+@MainActor
+private final class DeviceWarmHeartbeatScheduler: WarmLocationSimulationHeartbeatScheduling {
+    func scheduleRepeating(
+        every interval: TimeInterval,
+        _ action: @escaping @MainActor @Sendable () -> Void
+    ) -> WarmLocationSimulationHeartbeatCancellation {
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in
+            Task { @MainActor in action() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        return DeviceWarmHeartbeatCancellation(timer: timer)
+    }
+}
+
+@MainActor
+private final class DeviceLocationSimulationBackgroundActivity: LocationSimulationBackgroundActivityManaging {
+    func requestStart() {
+        LocationSimulationSession.setMaintained(true)
+        BackgroundLocationManager.shared.requestStart()
+    }
+
+    func requestStop() {
+        LocationSimulationSession.setMaintained(false)
+        BackgroundLocationManager.shared.requestStop()
+    }
+}
+
 @MainActor
 final class DeviceRoutePlaybackActivityManager: RoutePlaybackActivityManaging {
     static let shared = DeviceRoutePlaybackActivityManager()
 
-    private var activeLease: LocationSimulationProducerLease?
+    let sessionKeeper: LocationSimulationSessionKeeper
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+
+    private init() {
+        sessionKeeper = LocationSimulationSessionKeeper(
+            ownership: .shared,
+            status: DeviceLocationSimulationSessionStatus(),
+            heartbeat: DeviceWarmHeartbeatDriver(),
+            scheduler: DeviceWarmHeartbeatScheduler(),
+            backgroundActivity: DeviceLocationSimulationBackgroundActivity(),
+            log: { LogManager.shared.addInfoLog($0) }
+        )
+    }
 
     func simulationDidTakeOwnership(_ lease: LocationSimulationProducerLease) {
         guard LocationSimulationOwnership.shared.isCurrent(lease) else { return }
-        let wasActive = activeLease != nil
-        activeLease = lease
-        if !wasActive {
-            LocationSimulationSession.setMaintained(true)
-            BackgroundLocationManager.shared.requestStart()
-        }
+        sessionKeeper.producerDidTakeOwnership(lease)
         beginBackgroundTask()
     }
 
     func simulationDidEnd(
         _ lease: LocationSimulationProducerLease,
-        connectionUnavailable: Bool
+        reason: LocationSimulationProducerEndReason
     ) {
         // A prior producer may finish after point/route handoff. Its stale end
         // must not stop the successor's maintenance or disconnect its tunnel.
-        guard activeLease == lease else { return }
-        activeLease = nil
-        LocationSimulationSession.setMaintained(false)
-        BackgroundLocationManager.shared.requestStop()
+        guard sessionKeeper.producerDidEnd(lease, reason: reason) else { return }
         endBackgroundTask()
-        if connectionUnavailable {
+        if case .failure(connectionUnavailable: true) = reason {
             markTunnelDisconnected()
         }
+    }
+
+    func simulationSessionWillDisconnect() -> LocationSimulationDisconnectLease {
+        let lease = sessionKeeper.sessionWillDisconnect()
+        endBackgroundTask()
+        return lease
+    }
+
+    func simulationSessionDidDisconnect(_ lease: LocationSimulationDisconnectLease) {
+        sessionKeeper.sessionDidDisconnect(lease)
+        endBackgroundTask()
+    }
+
+    func simulationSessionDidClose() {
+        sessionKeeper.sessionDidClose()
+        endBackgroundTask()
     }
 
     private func beginBackgroundTask() {

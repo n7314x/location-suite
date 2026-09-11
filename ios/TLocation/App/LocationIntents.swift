@@ -331,7 +331,12 @@ enum LocationIntentRunner {
             return IntentClearResult(code: clear_simulated_location(), lease: lease)
         }
 
-        await endSimulationActivity(for: result.lease)
+        await endSimulationActivity(
+            for: result.lease,
+            reason: result.code == 0
+                ? .returnedToRealGPS
+                : .failure(connectionUnavailable: false)
+        )
 
         guard result.code == 0 else {
             LogManager.shared.addErrorLog("Shortcut clear failed with code \(result.code)")
@@ -413,14 +418,21 @@ enum LocationIntentRunner {
     }
 
     private static func endSimulationActivity(
-        for lease: LocationSimulationProducerLease?
+        for lease: LocationSimulationProducerLease?,
+        reason: LocationSimulationProducerEndReason
     ) async {
-        guard let lease else { return }
         await MainActor.run {
-            DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
-                lease,
-                connectionUnavailable: false
-            )
+            if let lease {
+                DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
+                    lease,
+                    reason: reason
+                )
+            } else if case .failure = reason {
+                // Clearing an already-idle warm session has no producer lease.
+                // If that real channel operation failed, the FFI has still
+                // closed its handles and the idle keeper must stand down.
+                DeviceRoutePlaybackActivityManager.shared.simulationSessionDidClose()
+            }
         }
     }
 

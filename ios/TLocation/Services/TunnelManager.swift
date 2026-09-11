@@ -70,6 +70,18 @@ final class TunnelManager: ObservableObject {
         }
     }
 
+    /// A repeated operation on the retained LocationSimulation channel failed,
+    /// so the warm RemotePairing transport is no longer usable. This says
+    /// nothing about whether a brand-new LocalDevVPN TCP connection would work;
+    /// keep the independently measured endpoint diagnostic unchanged.
+    func recordWarmSessionFailure(detail: String) {
+        runOnMain {
+            self.isConnected = false
+            self.lastConnectionFailureCategory = .service
+            self.lastConnectionFailure = detail
+        }
+    }
+
     func start(showErrorUI: Bool = true) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async {

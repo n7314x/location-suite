@@ -305,6 +305,11 @@ private enum LocationSimulationStatus {
     static let locationClear: Int32 = 12
 }
 
+struct WarmLocationSimulationFFIResult: Sendable {
+    let succeeded: Bool
+    let detail: String
+}
+
 private enum LocationSimulationState {
     static var adapter: OpaquePointer?
     static var handshake: OpaquePointer?
@@ -349,17 +354,16 @@ private enum LocationSimulationState {
 /// scene-phase handler in `TLocationApp`, which runs on the main thread and
 /// cannot block — can ask the question without touching a pointer.
 ///
-/// `isMaintained` is the other half of the answer, owned by the map's resend
-/// loop (`LocationSimulationView.startResendLoop`/`stopResendLoop`, main thread
-/// only). The two deliberately differ:
+/// `isMaintained` is the other half of the answer, owned by the process-wide
+/// `LocationSimulationSessionKeeper`. It covers both an active producer and an
+/// idle warm session whose heartbeat/background-location activity is running.
+/// The two deliberately differ:
 ///
-/// * open but not maintained — a Shortcut simulated while no map was alive, or
-///   the map went off screen with the device still simulating. The session is
-///   real; nothing is re-sending to it.
-/// * maintained but not open — the loop is alive and its last rebuild failed, so
-///   the next tick will try again. This is the window the foreground tunnel
-///   rebuild in `TLocationApp` must stay out of, and it is invisible to `isOpen`
-///   alone.
+/// * open but not maintained — a handle exists but no lifecycle owner is
+///   keeping the process/channel alive (for example an older external caller).
+/// * maintained but not open — a producer has claimed ownership and is about to
+///   build the first session. The foreground tunnel rebuild in `TLocationApp`
+///   must stay out of that window, which is invisible to `isOpen` alone.
 ///
 /// Both retractions post ``Notification/Name/locationSimulationSessionEnded`` so
 /// the work that stands down while a simulation is in progress can run the
@@ -388,8 +392,8 @@ enum LocationSimulationSession {
         return active
     }
 
-    /// Called by the map's resend loop as it starts and stops. Main thread only,
-    /// like the rest of that view's state.
+    /// Called by the process-wide lifecycle manager as its single balanced
+    /// long-lived activity starts and stops.
     static func setMaintained(_ newValue: Bool) {
         lock.lock()
         let didRetract = maintained && !newValue
@@ -609,6 +613,43 @@ func clear_simulated_location() -> Int32 {
     )
 
     return LocationSimulationStatus.ok
+}
+
+/// Idle-only keepalive for the already-open DVT LocationSimulation channel.
+///
+/// The upstream Rust client implements `clear` by calling
+/// `stopLocationSimulation`, reading its reply, and retaining both the channel
+/// and client. Repeating it while already on real GPS is therefore the smallest
+/// operation that proves this exact channel is alive without ever supplying a
+/// coordinate. Unlike the user-facing clear above, one failure does not destroy
+/// the handles: the session keeper applies its deterministic transient-failure
+/// threshold and calls `discard_stale_location_simulation_session` only after
+/// the threshold is reached.
+func heartbeat_warm_location_simulation_session() -> WarmLocationSimulationFFIResult {
+    guard let locationSimulation = LocationSimulationState.locationSimulation else {
+        return WarmLocationSimulationFFIResult(
+            succeeded: false,
+            detail: "There is no retained LocationSimulation handle."
+        )
+    }
+
+    if let ffiError = location_simulation_clear(locationSimulation) {
+        let detail = IdeviceBridge.detail(from: ffiError)
+        idevice_error_free(ffiError)
+        return WarmLocationSimulationFFIResult(succeeded: false, detail: detail)
+    }
+
+    // A heartbeat is only eligible while this is already false. Keep the
+    // mirror authoritative even if a future upstream implementation changes.
+    LocationSimulationSession.set(active: false)
+    return WarmLocationSimulationFFIResult(succeeded: true, detail: "")
+}
+
+/// Destructive half of the idle heartbeat failure verdict. This must only be
+/// called on `LocationSimulationCommandQueue` after its idle generation has
+/// been revalidated.
+func discard_stale_location_simulation_session() {
+    LocationSimulationState.cleanup()
 }
 
 /// Intentionally destroys the warm connection. If a fake coordinate is active,

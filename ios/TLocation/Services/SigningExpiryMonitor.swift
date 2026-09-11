@@ -113,8 +113,8 @@ final class SigningExpiryMonitor: ObservableObject {
 
         // Same two checks, and the same reasoning, as
         // `TLocationApp.attemptDeferredTunnelReconnect`: `isOpen` is a live
-        // session, `isMaintained` is a resend loop whose last rebuild failed and
-        // which is about to try again.
+        // session, `isMaintained` is the process-wide session lifecycle (active
+        // producer or warm idle keeper).
         guard !LocationSimulationSession.isOpen, !LocationSimulationSession.isMaintained else { return }
 
         isReading = true

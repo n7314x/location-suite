@@ -717,6 +717,7 @@ private final class FakeRouteActivityManager: RoutePlaybackActivityManaging {
     private(set) var ends = 0
     private(set) var connectionMarkedUnavailable = false
     private var activeLease: LocationSimulationProducerLease?
+    private var disconnectGeneration: UInt64 = 0
 
     func simulationDidTakeOwnership(_ lease: LocationSimulationProducerLease) {
         if activeLease == nil { starts += 1 }
@@ -725,12 +726,451 @@ private final class FakeRouteActivityManager: RoutePlaybackActivityManaging {
 
     func simulationDidEnd(
         _ lease: LocationSimulationProducerLease,
-        connectionUnavailable: Bool
+        reason: LocationSimulationProducerEndReason
     ) {
         guard activeLease == lease else { return }
         activeLease = nil
         ends += 1
-        connectionMarkedUnavailable = connectionMarkedUnavailable || connectionUnavailable
+        if case .failure(connectionUnavailable: true) = reason {
+            connectionMarkedUnavailable = true
+        }
+    }
+
+    func simulationSessionWillDisconnect() -> LocationSimulationDisconnectLease {
+        disconnectGeneration &+= 1
+        if activeLease != nil {
+            activeLease = nil
+            ends += 1
+        }
+        return LocationSimulationDisconnectLease(generation: disconnectGeneration)
+    }
+
+    func simulationSessionDidDisconnect(_ lease: LocationSimulationDisconnectLease) {
+    }
+}
+
+private final class FakeSessionStatus: LocationSimulationSessionStatusProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var open = false
+    private var active = false
+
+    var isSessionOpen: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return open
+    }
+
+    var isSimulationActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active
+    }
+
+    func set(open: Bool? = nil, active: Bool? = nil) {
+        lock.lock()
+        if let open { self.open = open }
+        if let active { self.active = active }
+        lock.unlock()
+    }
+}
+
+private final class FakeWarmHeartbeatDriver: WarmLocationSimulationHeartbeatPerforming, @unchecked Sendable {
+    private let lock = NSLock()
+    private let status: FakeSessionStatus
+    private var completions: [@Sendable (WarmLocationSimulationHeartbeatResult) -> Void] = []
+    private var heartbeatCalls = 0
+    private var cleanupCalls = 0
+
+    init(status: FakeSessionStatus) {
+        self.status = status
+    }
+
+    func performHeartbeat(
+        for lease: LocationSimulationIdleLease,
+        completion: @escaping @Sendable (WarmLocationSimulationHeartbeatResult) -> Void
+    ) {
+        lock.lock()
+        heartbeatCalls += 1
+        completions.append(completion)
+        lock.unlock()
+    }
+
+    func discardStaleSession(
+        for lease: LocationSimulationIdleLease,
+        reason: String,
+        completion: @escaping @Sendable (Bool) -> Void
+    ) {
+        lock.lock()
+        cleanupCalls += 1
+        lock.unlock()
+        status.set(open: false, active: false)
+        completion(true)
+    }
+
+    func completeNext(_ result: WarmLocationSimulationHeartbeatResult) {
+        lock.lock()
+        let completion = completions.isEmpty ? nil : completions.removeFirst()
+        lock.unlock()
+        completion?(result)
+    }
+
+    var performCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return heartbeatCalls
+    }
+
+    var cleanupCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return cleanupCalls
+    }
+}
+
+@MainActor
+private final class FakeWarmHeartbeatCancellation: WarmLocationSimulationHeartbeatCancellation {
+    private let onCancel: () -> Void
+    private var cancelled = false
+
+    init(onCancel: @escaping () -> Void) {
+        self.onCancel = onCancel
+    }
+
+    func cancel() {
+        guard !cancelled else { return }
+        cancelled = true
+        onCancel()
+    }
+}
+
+@MainActor
+private final class FakeWarmHeartbeatScheduler: WarmLocationSimulationHeartbeatScheduling {
+    private var action: (@MainActor @Sendable () -> Void)?
+    private(set) var scheduleCount = 0
+    private(set) var cancellationCount = 0
+
+    func scheduleRepeating(
+        every interval: TimeInterval,
+        _ action: @escaping @MainActor @Sendable () -> Void
+    ) -> WarmLocationSimulationHeartbeatCancellation {
+        scheduleCount += 1
+        self.action = action
+        return FakeWarmHeartbeatCancellation { [weak self] in
+            self?.cancellationCount += 1
+            self?.action = nil
+        }
+    }
+
+    func fire() {
+        action?()
+    }
+}
+
+@MainActor
+private final class FakeBackgroundActivity: LocationSimulationBackgroundActivityManaging {
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    private(set) var balance = 0
+
+    func requestStart() {
+        startCount += 1
+        balance += 1
+    }
+
+    func requestStop() {
+        stopCount += 1
+        balance -= 1
+    }
+}
+
+@MainActor
+struct LocationSimulationSessionKeeperTests {
+    private typealias Harness = (
+        keeper: LocationSimulationSessionKeeper,
+        ownership: LocationSimulationOwnership,
+        status: FakeSessionStatus,
+        driver: FakeWarmHeartbeatDriver,
+        scheduler: FakeWarmHeartbeatScheduler,
+        activity: FakeBackgroundActivity
+    )
+
+    private func makeHarness() -> Harness {
+        let ownership = LocationSimulationOwnership()
+        let status = FakeSessionStatus()
+        let driver = FakeWarmHeartbeatDriver(status: status)
+        let scheduler = FakeWarmHeartbeatScheduler()
+        let activity = FakeBackgroundActivity()
+        let keeper = LocationSimulationSessionKeeper(
+            ownership: ownership,
+            status: status,
+            heartbeat: driver,
+            scheduler: scheduler,
+            backgroundActivity: activity
+        )
+        return (keeper, ownership, status, driver, scheduler, activity)
+    }
+
+    private func beginProducer(
+        _ producer: LocationSimulationProducer,
+        in harness: Harness
+    ) -> LocationSimulationProducerLease {
+        let lease = harness.ownership.claim(producer)
+        harness.status.set(open: true, active: true)
+        harness.keeper.producerDidTakeOwnership(lease)
+        return lease
+    }
+
+    private func returnToIdle(
+        _ lease: LocationSimulationProducerLease,
+        in harness: Harness
+    ) {
+        harness.ownership.invalidateAll()
+        harness.status.set(open: true, active: false)
+        harness.keeper.producerDidEnd(lease, reason: .returnedToRealGPS)
+    }
+
+    private func settle() async {
+        await Task.yield()
+        await Task.yield()
+    }
+
+    @Test func returnLeavesSessionOpenAndStartsIdleKeeperWithoutClaimingProducer() {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+
+        returnToIdle(point, in: harness)
+
+        #expect(harness.status.isSessionOpen)
+        #expect(!harness.status.isSimulationActive)
+        #expect(harness.ownership.currentProducer == .none)
+        #expect(harness.keeper.state == .idleWarm)
+        #expect(harness.keeper.isIdleKeeperActive)
+        #expect(harness.scheduler.scheduleCount == 1)
+        #expect(harness.activity.balance == 1)
+    }
+
+    @Test func pointAcquisitionPausesIdleHeartbeat() {
+        let harness = makeHarness()
+        let firstPoint = beginProducer(.point, in: harness)
+        returnToIdle(firstPoint, in: harness)
+
+        let nextPoint = harness.ownership.claim(.point)
+        harness.status.set(active: true)
+        harness.keeper.producerDidTakeOwnership(nextPoint)
+        harness.scheduler.fire()
+
+        #expect(harness.keeper.state == .activePoint)
+        #expect(harness.driver.performCount == 0)
+        #expect(harness.activity.balance == 1)
+    }
+
+    @Test func routeAcquisitionPausesIdleHeartbeat() {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        returnToIdle(point, in: harness)
+
+        let route = harness.ownership.claim(.route)
+        harness.status.set(active: true)
+        harness.keeper.producerDidTakeOwnership(route)
+        harness.scheduler.fire()
+
+        #expect(harness.keeper.state == .activeRoute)
+        #expect(harness.driver.performCount == 0)
+        #expect(harness.activity.balance == 1)
+    }
+
+    @Test func returningFromPointAndRouteResumesIdleKeeper() {
+        for producer in [LocationSimulationProducer.point, .route] {
+            let harness = makeHarness()
+            let lease = beginProducer(producer, in: harness)
+
+            returnToIdle(lease, in: harness)
+
+            #expect(harness.keeper.state == .idleWarm)
+            #expect(harness.scheduler.scheduleCount == 1)
+            #expect(harness.activity.balance == 1)
+        }
+    }
+
+    @Test func disconnectStopsKeeperAndClosesSession() {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        returnToIdle(point, in: harness)
+
+        let disconnect = harness.keeper.sessionWillDisconnect()
+        harness.ownership.invalidateAll()
+        harness.status.set(open: false, active: false)
+        harness.keeper.sessionDidDisconnect(disconnect)
+        harness.scheduler.fire()
+
+        #expect(harness.keeper.state == .disconnected)
+        #expect(!harness.keeper.isIdleKeeperActive)
+        #expect(!harness.status.isSessionOpen)
+        #expect(harness.ownership.currentProducer == .none)
+        #expect(harness.driver.performCount == 0)
+        #expect(harness.activity.balance == 0)
+        #expect(harness.activity.startCount == harness.activity.stopCount)
+    }
+
+    @Test func oneHeartbeatFailureDoesNotCloseSession() async {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        returnToIdle(point, in: harness)
+
+        harness.scheduler.fire()
+        harness.driver.completeNext(.failed("transient"))
+        await settle()
+
+        #expect(harness.status.isSessionOpen)
+        #expect(harness.keeper.state == .idleWarm)
+        #expect(harness.keeper.consecutiveHeartbeatFailures == 1)
+        #expect(harness.keeper.heartbeatFailureCount == 1)
+        #expect(harness.driver.cleanupCount == 0)
+    }
+
+    @Test func heartbeatTicksNeverOverlap() async {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        returnToIdle(point, in: harness)
+
+        harness.scheduler.fire()
+        harness.scheduler.fire()
+        harness.scheduler.fire()
+        #expect(harness.driver.performCount == 1)
+
+        harness.driver.completeNext(.succeeded(Date()))
+        await settle()
+        harness.scheduler.fire()
+        #expect(harness.driver.performCount == 2)
+    }
+
+    @Test func thresholdFailuresCleanStaleSessionExactlyOnce() async {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        returnToIdle(point, in: harness)
+
+        for failure in 1...LocationSimulationSessionKeeper.heartbeatFailureThreshold {
+            harness.scheduler.fire()
+            harness.driver.completeNext(.failed("failure \(failure)"))
+            await settle()
+        }
+        harness.scheduler.fire()
+        await settle()
+
+        #expect(!harness.status.isSessionOpen)
+        #expect(harness.keeper.state == .disconnected)
+        #expect(harness.driver.cleanupCount == 1)
+        #expect(harness.activity.balance == 0)
+    }
+
+    @Test func successfulHeartbeatResetsFailureStreak() async {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        returnToIdle(point, in: harness)
+
+        harness.scheduler.fire()
+        harness.driver.completeNext(.failed("transient"))
+        await settle()
+        let heartbeatDate = Date(timeIntervalSince1970: 1_800_000_000)
+        harness.scheduler.fire()
+        harness.driver.completeNext(.succeeded(heartbeatDate))
+        await settle()
+
+        #expect(harness.keeper.consecutiveHeartbeatFailures == 0)
+        #expect(harness.keeper.heartbeatFailureCount == 1)
+        #expect(harness.keeper.lastHeartbeat == heartbeatDate)
+        #expect(harness.driver.cleanupCount == 0)
+    }
+
+    @Test func staleHeartbeatCompletionAfterProducerTakeoverCannotCleanSession() async {
+        let harness = makeHarness()
+        let firstPoint = beginProducer(.point, in: harness)
+        returnToIdle(firstPoint, in: harness)
+
+        for _ in 0..<(LocationSimulationSessionKeeper.heartbeatFailureThreshold - 1) {
+            harness.scheduler.fire()
+            harness.driver.completeNext(.failed("earlier failure"))
+            await settle()
+        }
+        harness.scheduler.fire()
+
+        let route = harness.ownership.claim(.route)
+        harness.status.set(active: true)
+        harness.keeper.producerDidTakeOwnership(route)
+        harness.driver.completeNext(.failed("late failure"))
+        await settle()
+
+        #expect(harness.keeper.state == .activeRoute)
+        #expect(harness.ownership.isCurrent(route))
+        #expect(harness.driver.cleanupCount == 0)
+        #expect(
+            harness.keeper.heartbeatFailureCount ==
+                LocationSimulationSessionKeeper.heartbeatFailureThreshold - 1
+        )
+    }
+
+    @Test func repeatedPointReturnCyclesDoNotLeakBackgroundActivity() {
+        let harness = makeHarness()
+        let first = beginProducer(.point, in: harness)
+        returnToIdle(first, in: harness)
+
+        let second = harness.ownership.claim(.point)
+        harness.status.set(active: true)
+        harness.keeper.producerDidTakeOwnership(second)
+        returnToIdle(second, in: harness)
+
+        let disconnect = harness.keeper.sessionWillDisconnect()
+        harness.status.set(open: false, active: false)
+        harness.keeper.sessionDidDisconnect(disconnect)
+
+        #expect(harness.activity.startCount == 1)
+        #expect(harness.activity.stopCount == 1)
+        #expect(harness.activity.balance == 0)
+    }
+
+    @Test func idleSessionClosureStopsKeeperAndReleasesBackgroundActivity() {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        returnToIdle(point, in: harness)
+
+        harness.status.set(open: false, active: false)
+        harness.keeper.sessionDidClose()
+
+        #expect(harness.keeper.state == .disconnected)
+        #expect(harness.activity.balance == 0)
+        #expect(harness.activity.startCount == harness.activity.stopCount)
+    }
+
+    @Test func routeReturnRouteReusesOpenSession() {
+        let harness = makeHarness()
+        let first = beginProducer(.route, in: harness)
+        returnToIdle(first, in: harness)
+
+        let second = harness.ownership.claim(.route)
+        harness.status.set(active: true)
+        harness.keeper.producerDidTakeOwnership(second)
+
+        #expect(harness.status.isSessionOpen)
+        #expect(harness.keeper.state == .activeRoute)
+        #expect(harness.ownership.isCurrent(second))
+        #expect(harness.activity.startCount == 1)
+    }
+
+    @Test func pointRoutePointHandoffsKeepOneActivityAndCurrentLease() {
+        let harness = makeHarness()
+        let point = beginProducer(.point, in: harness)
+        let route = harness.ownership.claim(.route)
+        harness.keeper.producerDidTakeOwnership(route)
+        harness.keeper.producerDidEnd(point, reason: .relinquished)
+        let finalPoint = harness.ownership.claim(.point)
+        harness.keeper.producerDidTakeOwnership(finalPoint)
+        harness.keeper.producerDidEnd(route, reason: .relinquished)
+
+        #expect(harness.keeper.state == .activePoint)
+        #expect(harness.ownership.isCurrent(finalPoint))
+        #expect(harness.activity.startCount == 1)
+        #expect(harness.activity.stopCount == 0)
+        #expect(harness.activity.balance == 1)
     }
 }
 

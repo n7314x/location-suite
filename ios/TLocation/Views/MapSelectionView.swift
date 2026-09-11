@@ -2180,10 +2180,9 @@ struct LocationSimulationView: View {
     /// here would only re-run `clear_simulated_location()` on an already-torn-down
     /// session — error 12 and a spurious alert.
     ///
-    /// This is `clear()`'s success path minus the FFI call and the keep-alive
-    /// release, so the map ends up exactly where the Stop button would leave it:
-    /// resend loop stopped, background task ended, and the pin still on screen
-    /// ready to be re-simulated.
+    /// This is `clear()`'s success path minus the FFI call and lifecycle callback,
+    /// which the intent already completed. The point loop stops while the
+    /// process-wide warm idle keeper continues outside this view.
     private func adoptExternalClear() {
         stopPointProducer()
     }
@@ -2204,7 +2203,7 @@ struct LocationSimulationView: View {
                 guard LocationSimulationOwnership.shared.isCurrent(lease) else { return }
                 switch result {
                 case .failed(let code):
-                    stopPointProducer()
+                    stopPointProducer(reason: .failure(connectionUnavailable: false))
                     pendingAlert = .message(
                         title: String(localized: "Simulation Failed"),
                         body: String(localized: "Could not simulate location (error \(code)). Make sure the device is connected and the Developer Disk Image (DDI) is mounted.")
@@ -2243,7 +2242,7 @@ struct LocationSimulationView: View {
     private func clear(onFailure: (() -> Void)? = nil, onCleared: (() -> Void)? = nil) {
         guard pairingExists, !isBusy else { return }
         LocationSimulationOwnership.shared.invalidateAll()
-        stopPointProducer()
+        let lease = disarmPointProducer()
         routePlayback.relinquishWithoutClearing()
         runLocationCommand(
             errorTitle: String(localized: "Clear Failed"),
@@ -2251,8 +2250,22 @@ struct LocationSimulationView: View {
                 String(localized: "Could not clear simulated location (error \(code)).")
             },
             operation: clear_simulated_location,
-            onFailure: onFailure
+            onFailure: {
+                if let lease {
+                    DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
+                        lease,
+                        reason: .failure(connectionUnavailable: false)
+                    )
+                }
+                onFailure?()
+            }
         ) {
+            if let lease {
+                DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
+                    lease,
+                    reason: .returnedToRealGPS
+                )
+            }
             // The simulated fix is gone; bounce the tracking session so the
             // real dot arrives as soon as CoreLocation can manage rather than
             // waiting out `distanceFilter`'s cache. Covers both the Stop
@@ -2424,10 +2437,9 @@ struct LocationSimulationView: View {
         // already retired on the command queue, in the block of the tick that
         // produced this verdict — none of them can still reach the FFI by the
         // time this runs (see `ResendGeneration`). What is left for here is the
-        // main-thread half: killing the timer, dropping the anchor, and
-        // retracting `LocationSimulationSession.isMaintained`, which is what
-        // releases the deferred tunnel rebuild below.
-        stopPointProducer()
+        // main-thread half: killing the timer, dropping the anchor, and telling
+        // the process-wide lifecycle owner that the connection failed.
+        stopPointProducer(reason: .failure(connectionUnavailable: false))
         // Same reasoning as `clear()`'s success path: whatever the device is
         // reporting now, this app should stop sitting on a cached simulated fix.
         currentLocationProvider.refreshTracking()
@@ -2540,21 +2552,40 @@ struct LocationSimulationView: View {
         return lease
     }
 
-    private func stopPointProducer() {
-        let lease = pointProducerLease
-        pointProducerLease = nil
-        retirePointLoop(lease: lease)
+    private func stopPointProducer(
+        reason: LocationSimulationProducerEndReason = .relinquished
+    ) {
+        let lease = disarmPointProducer()
+        guard let lease else { return }
+        DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
+            lease,
+            reason: reason
+        )
     }
 
-    private func retirePointLoop(lease: LocationSimulationProducerLease?) {
+    /// Retires every timer/queued point tick while leaving lifecycle completion
+    /// to the clear callback. That keeps the one Core Location activity held
+    /// continuously across Point -> Return -> idleWarm.
+    private func disarmPointProducer() -> LocationSimulationProducerLease? {
+        let lease = pointProducerLease
+        pointProducerLease = nil
+        retirePointLoop(lease: lease, notifyActivity: false)
+        return lease
+    }
+
+    private func retirePointLoop(
+        lease: LocationSimulationProducerLease?,
+        notifyActivity: Bool = true
+    ) {
         resendTimer?.invalidate()
         resendTimer = nil
         simulatedCoordinate = nil
         consecutiveResendFailures = 0
         // The timer only owed us future ticks; these two are what disarm the
         // ticks already dispatched onto the command queue (`ResendGeneration`)
-        // and let the deferred tunnel rebuild in `TLocationApp` know that
-        // nothing is maintaining a simulation any more.
+        // and prevent the old point producer from touching the shared session.
+        // Long-lived activity is now owned by the process-wide session keeper,
+        // which may carry it directly into idleWarm after Return.
         //
         // Retiring from the main thread is the right move for every caller of
         // this function — Stop, Return to Real Location, a Shortcut's clear, the
@@ -2566,10 +2597,12 @@ struct LocationSimulationView: View {
         ResendGeneration.invalidate()
         guard let lease else { return }
         LocationSimulationOwnership.shared.relinquish(lease)
-        DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
-            lease,
-            connectionUnavailable: false
-        )
+        if notifyActivity {
+            DeviceRoutePlaybackActivityManager.shared.simulationDidEnd(
+                lease,
+                reason: .relinquished
+            )
+        }
     }
 
     /// - Parameter recenter: `true` for programmatic selections (search result,
