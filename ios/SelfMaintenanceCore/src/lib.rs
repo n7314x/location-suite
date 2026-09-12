@@ -6,6 +6,8 @@
 //! chooses a team, and asks for a profile. The existing idevice FFI installs
 //! and rereads that profile from the phone.
 
+mod safe_error;
+
 use std::any::Any;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -29,6 +31,8 @@ use isideload::{
     util::fs_storage::FsStorage,
 };
 use serde::Serialize;
+
+use safe_error::{apple_login_category, report_chain, sanitize_line};
 
 static INITIALIZE_ISIDELOAD: OnceLock<()> = OnceLock::new();
 
@@ -255,109 +259,8 @@ unsafe fn set_error(output: *mut *mut c_char, category: &str, message: &str) {
     set_error_with_stage(output, category, None, message);
 }
 
-fn redact(raw: &str, apple_id: &str, password: &str) -> String {
-    let mut result = raw.to_string();
-    if !apple_id.is_empty() {
-        result = result.replace(apple_id, "<redacted-account>");
-    }
-    if !password.is_empty() {
-        result = result.replace(password, "<redacted-secret>");
-    }
-    // Error text is useful for classifying outages, but never return headers or
-    // attached developer-response bodies across the FFI boundary.
-    result.lines().next().unwrap_or_default().trim().to_string()
-}
-
 fn sanitize_panic_message(raw: &str, apple_id: &str, password: &str) -> Option<String> {
-    let mut first_line = redact(raw, apple_id, password);
-    let lower = first_line.to_ascii_lowercase();
-    let response_boundary = [
-        "response body",
-        "response:",
-        "response=",
-        "body:",
-        "body=",
-        "{",
-        "[",
-    ]
-    .iter()
-    .filter_map(|marker| lower.find(marker))
-    .min();
-    if let Some(boundary) = response_boundary {
-        first_line.truncate(boundary);
-    }
-    let mut sanitized: Vec<String> = Vec::new();
-    let mut redact_next = false;
-
-    for raw_word in first_line.split_whitespace() {
-        let lower = raw_word.to_ascii_lowercase();
-        let sensitive_labels = [
-            "authorization",
-            "cookie",
-            "password",
-            "security-code",
-            "secret",
-            "token",
-            "private-key",
-            "private_key",
-            "client-secret",
-            "x-apple-i-md",
-            "x-mme-client-info",
-            "adi_pb",
-            "machine_id",
-            "local_user_uuid",
-            "routing_info",
-        ];
-        let is_sensitive_assignment = sensitive_labels.iter().any(|label| {
-            lower.starts_with(&format!("{label}=")) || lower.starts_with(&format!("{label}:"))
-        });
-        let expects_separate_value = sensitive_labels
-            .iter()
-            .any(|label| lower == format!("{label}=") || lower == format!("{label}:"));
-        let trimmed = raw_word.trim_matches(|character: char| !character.is_ascii_alphanumeric());
-        let is_email = raw_word.contains('@');
-        let is_code = trimmed.len() == 6 && trimmed.bytes().all(|byte| byte.is_ascii_digit());
-        let is_url = lower.starts_with("http://") || lower.starts_with("https://");
-        let opaque_run = trimmed.len() >= 24
-            && trimmed.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'/' | b'=')
-            });
-
-        if redact_next || is_sensitive_assignment || is_email || is_code || is_url || opaque_run {
-            sanitized.push(
-                if is_email {
-                    "<redacted-account>"
-                } else if is_url {
-                    "<redacted-url>"
-                } else {
-                    "<redacted>"
-                }
-                .to_string(),
-            );
-        } else {
-            let clean: String = raw_word
-                .chars()
-                .filter(|character| !character.is_control())
-                .collect();
-            if !clean.is_empty() {
-                sanitized.push(clean);
-            }
-        }
-        redact_next = expects_separate_value;
-    }
-
-    let mut message = sanitized.join(" ");
-    if message.len() > 320 {
-        let boundary = message
-            .char_indices()
-            .map(|(index, _)| index)
-            .take_while(|index| *index <= 317)
-            .last()
-            .unwrap_or(0);
-        message.truncate(boundary);
-        message.push_str("...");
-    }
-    (!message.is_empty()).then_some(message)
+    sanitize_line(raw, apple_id, password)
 }
 
 fn panic_summary(
@@ -403,11 +306,6 @@ fn fallback_category(stage: SignInStage) -> &'static str {
     }
 }
 
-fn sanitize_error_message(raw: &str, stage: SignInStage, apple_id: &str, password: &str) -> String {
-    sanitize_panic_message(raw, apple_id, password)
-        .unwrap_or_else(|| fallback_message(stage).to_string())
-}
-
 fn error_category(message: &str, fallback: &'static str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("503") || lower.contains("service unavailable") {
@@ -440,27 +338,21 @@ fn sign_in_error_category(
     fallback: &'static str,
 ) -> &'static str {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("503") || lower.contains("service unavailable") {
-        return "grandSlamUnavailable";
-    }
 
     match stage {
         SignInStage::CreatingAnisetteProvider | SignInStage::PreparingStorage => {
             "anisetteUnavailable"
         }
         SignInStage::AppleLogin => {
-            if lower.contains("2fa") && (lower.contains("no ") || lower.contains("cancel")) {
-                "twoFactorCancelled"
-            } else if lower.contains("2fa") || lower.contains("two-factor") {
-                "twoFactorRequired"
-            } else if lower.contains("anisette")
-                || lower.contains("provisioning socket")
-                || lower.contains("client_info")
-            {
-                "anisetteUnavailable"
-            } else {
+            let category = apple_login_category(message);
+            if category == "appleAuthenticationFailed" {
                 fallback
+            } else {
+                category
             }
+        }
+        _ if lower.contains("503") || lower.contains("service unavailable") => {
+            "grandSlamUnavailable"
         }
         _ => fallback,
     }
@@ -471,14 +363,15 @@ impl SignInFailure {
         Self::fixed(SignInStage::ParsingInputs, category, message)
     }
 
-    fn new(
+    fn from_report(
         stage: SignInStage,
         fallback_category: &'static str,
-        raw: &str,
+        report: &rootcause::Report,
         apple_id: &str,
         password: &str,
     ) -> Self {
-        let message = sanitize_error_message(raw, stage, apple_id, password);
+        let message = report_chain(report, apple_id, password)
+            .unwrap_or_else(|| fallback_message(stage).to_string());
         Self {
             category: sign_in_error_category(stage, &message, fallback_category),
             stage,
@@ -692,10 +585,10 @@ pub unsafe extern "C" fn ls_apple_sign_in(
                             "0".to_string(),
                         )
                         .map_err(|error| {
-                            SignInFailure::new(
+                            SignInFailure::from_report(
                                 SignInStage::CreatingAnisetteProvider,
                                 "anisetteUnavailable",
-                                &error.to_string(),
+                                &error,
                                 &apple_id,
                                 &password,
                             )
@@ -706,10 +599,10 @@ pub unsafe extern "C" fn ls_apple_sign_in(
                             .login(&password, two_factor_callback(callback, callback_context))
                             .await
                             .map_err(|error| {
-                                SignInFailure::new(
+                                SignInFailure::from_report(
                                     SignInStage::AppleLogin,
                                     "appleAuthenticationFailed",
-                                    &error.to_string(),
+                                    &error,
                                     &apple_id,
                                     &password,
                                 )
@@ -718,10 +611,10 @@ pub unsafe extern "C" fn ls_apple_sign_in(
                         let mut developer_session = DeveloperSession::from_account(&mut account)
                             .await
                             .map_err(|error| {
-                                SignInFailure::new(
+                                SignInFailure::from_report(
                                     SignInStage::DeveloperSession,
                                     "developerSessionFailed",
-                                    &error.to_string(),
+                                    &error,
                                     &apple_id,
                                     &password,
                                 )
@@ -731,10 +624,10 @@ pub unsafe extern "C" fn ls_apple_sign_in(
                             .list_teams()
                             .await
                             .map_err(|error| {
-                                SignInFailure::new(
+                                SignInFailure::from_report(
                                     SignInStage::ListingTeams,
                                     "teamSelectionFailed",
-                                    &error.to_string(),
+                                    &error,
                                     &apple_id,
                                     &password,
                                 )
@@ -1040,11 +933,28 @@ mod tests {
     use std::panic::{catch_unwind, panic_any};
     use std::time::Duration;
 
+    use rootcause::prelude::*;
+
     use super::{
         charge_service_time, error_category, error_payload_json, initialize_rustls_crypto_provider,
-        panic_summary, redact, should_try_next_anisette, SignInFailure, SignInStage,
-        SignInStageTracker, SignInSummary, TeamSummary,
+        panic_summary, should_try_next_anisette, SignInFailure, SignInStage, SignInStageTracker,
+        SignInSummary, TeamSummary,
     };
+
+    fn report_failure(
+        stage: SignInStage,
+        fallback_category: &'static str,
+        raw: &str,
+    ) -> SignInFailure {
+        let report = report!(raw.to_string()).into_dynamic();
+        SignInFailure::from_report(
+            stage,
+            fallback_category,
+            &report,
+            "person@example.com",
+            "secret-value",
+        )
+    }
 
     #[test]
     fn signing_core_installs_the_rustls_provider() {
@@ -1096,26 +1006,24 @@ mod tests {
 
     #[test]
     fn ffi_error_text_removes_credentials_and_response_lines() {
-        let value = redact(
+        let failure = report_failure(
+            SignInStage::AppleLogin,
+            "appleAuthenticationFailed",
             "login for person@example.com with secret-value failed\nresponse body",
-            "person@example.com",
-            "secret-value",
         );
         assert_eq!(
-            value,
-            "login for <redacted-account> with <redacted-secret> failed"
+            failure.message,
+            "login for <redacted-account> with <redacted> failed"
         );
-        assert!(!value.contains("response body"));
+        assert!(!failure.message.contains("response body"));
     }
 
     #[test]
     fn apple_login_error_keeps_its_stage_and_authentication_fallback() {
-        let failure = SignInFailure::new(
+        let failure = report_failure(
             SignInStage::AppleLogin,
             "appleAuthenticationFailed",
             "Apple login request failed",
-            "person@example.com",
-            "secret-value",
         );
         assert_eq!(failure.category, "appleAuthenticationFailed");
         assert_eq!(failure.stage, SignInStage::AppleLogin);
@@ -1124,12 +1032,10 @@ mod tests {
 
     #[test]
     fn developer_session_error_does_not_get_reclassified_from_generic_text() {
-        let failure = SignInFailure::new(
+        let failure = report_failure(
             SignInStage::DeveloperSession,
             "developerSessionFailed",
             "Failed to get xcode token after login",
-            "person@example.com",
-            "secret-value",
         );
         assert_eq!(failure.category, "developerSessionFailed");
         assert_eq!(failure.stage, SignInStage::DeveloperSession);
@@ -1138,12 +1044,10 @@ mod tests {
 
     #[test]
     fn listing_teams_error_uses_the_operation_fallback() {
-        let failure = SignInFailure::new(
+        let failure = report_failure(
             SignInStage::ListingTeams,
             "teamSelectionFailed",
             "Developer request failed after login",
-            "person@example.com",
-            "secret-value",
         );
         assert_eq!(failure.category, "teamSelectionFailed");
         assert_eq!(failure.stage, SignInStage::ListingTeams);
@@ -1168,12 +1072,10 @@ mod tests {
 
     #[test]
     fn normal_error_message_redacts_secrets_and_response_bodies() {
-        let failure = SignInFailure::new(
+        let failure = report_failure(
             SignInStage::DeveloperSession,
             "developerSessionFailed",
             "account other@example.com token=opaque-value 123456 response body: private data",
-            "person@example.com",
-            "secret-value",
         );
         assert!(!failure.message.contains("other@example.com"));
         assert!(!failure.message.contains("opaque-value"));
@@ -1183,17 +1085,28 @@ mod tests {
 
     #[test]
     fn empty_normal_error_uses_a_stage_specific_fallback() {
-        let failure = SignInFailure::new(
-            SignInStage::DeveloperSession,
-            "developerSessionFailed",
-            "",
-            "person@example.com",
-            "secret-value",
-        );
+        let failure = report_failure(SignInStage::DeveloperSession, "developerSessionFailed", "");
         assert_eq!(
             failure.message,
             "Could not create the Apple developer session."
         );
+    }
+
+    #[test]
+    fn apple_login_distinguishes_anisette_503_from_grandslam_503() {
+        let anisette = report_failure(
+            SignInStage::AppleLogin,
+            "appleAuthenticationFailed",
+            "Failed to get anisette data for login: HTTP request failed with status 503",
+        );
+        assert_eq!(anisette.category, "anisetteUnavailable");
+
+        let grandslam = report_failure(
+            SignInStage::AppleLogin,
+            "appleAuthenticationFailed",
+            "GrandSlam returned HTTP 503",
+        );
+        assert_eq!(grandslam.category, "grandSlamUnavailable");
     }
 
     #[test]

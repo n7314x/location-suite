@@ -234,7 +234,7 @@ enum AppleDeveloperBridge {
               let error = try? JSONDecoder().decode(SelfMaintenanceError.self, from: data) else {
             return SelfMaintenanceError(category: .unknown, message: "The self-maintenance operation failed.")
         }
-        let message = SensitiveDiagnosticRedactor.sanitizedSingleLine(
+        let message = SensitiveDiagnosticRedactor.sanitizedChain(
             error.message,
             knownSecrets: knownSecrets,
             fallback: error.userFacingSummary

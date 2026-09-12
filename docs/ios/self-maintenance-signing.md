@@ -53,10 +53,12 @@ credentials, cancelled 2FA, and Apple GrandSlam outages do not fan out into
 repeated login attempts.
 
 The password is passed to isideload's Apple login and never to the anisette
-endpoint. Rust logging has no subscriber, FFI errors are reduced to one line,
-and Swift redacts known credentials and token-shaped values before exposing an
-error. A failed sign-in produces one safe log entry with its stage, category,
-and sanitized one-line detail; refresh-failure logs contain only the category.
+endpoint. Rust logging has no subscriber. Sign-in failures are reduced to a
+bounded, sanitized chain of at most eight one-line contexts and 1,200 total
+characters. Swift applies the same bounds and redaction again before exposing
+the chain. A failed sign-in produces one safe log entry with its stage,
+category, and the same sanitized chain; refresh-failure logs contain only the
+category.
 The 2FA code crosses a synchronous callback, is submitted to Apple, then is
 discarded; it is not logged or persisted.
 
@@ -78,15 +80,52 @@ JSON and Swift. Account & Signing visibly shows the summary, expanded technical
 detail, exact stage, and category. Gate 1 remains failed until a physical build
 shows `Apple developer session is ready.`
 
-SideInstaller `main` was checked again and remains the pinned `9272b907`
-revision; isideload `main` likewise remains the pinned `b6d11137` revision.
-SideInstaller goes directly from `AppleAccount` login to
-`DeveloperSession::from_account`, then lets `SideloaderBuilder::get_team` list
-teams. It does not persist or initialize extra account state in between, add
-call-site headers/client metadata, special-case terms/account state, or perform
-free-team setup before opening the developer session. Device registration for a
-free team happens later, before profile creation. No post-login sequence change
-was ported without a returned physical error that supports it.
+The third physical Gate 1 attempt used `https://ani.stikstore.app` as the sole
+endpoint and reached the same `appleLogin` / `appleAuthenticationFailed`
+result, with no 2FA prompt, developer session, or team list. Provider creation
+therefore succeeds with both tested v3 endpoints and the failure is inside
+`AppleAccount::login`.
+
+Pinned `rootcause` 0.12.1 represents propagated context as report nodes.
+`Report::iter_reports()` visits the root and descendants depth-first, and each
+`ReportRef` exposes `format_current_context_unhooked()` plus
+`current_context_error_source()` for an ordinary `Error::source()` chain.
+`Report::to_string()` was not top-level-only: the default report formatter
+includes the complete tree, but begins with a newline. The previous sanitizer
+selected `lines().next()`, received that empty formatter header, and replaced
+it with the stage fallback. The new extractor reads individual contexts and
+ordinary sources only. It never visits report attachments (where isideload can
+store response/plist material) and never uses Debug formatting.
+
+SideInstaller's `format!("login failed: {e}")` interpolates that same full
+`rootcause` 0.12.1 display tree; it is not a more precise typed diagnostic API.
+It also has no equivalent attachment-exclusion and bounded-redaction boundary,
+so copying its formatting would risk exposing response material. Location
+Suite instead uses `iter_reports()`, `format_current_context_unhooked()`, typed
+context downcasts, and `current_context_error_source()`/`Error::source()`.
+
+SideInstaller `main` was checked again and remains `9272b907`; isideload `main`
+likewise remains the Location Suite pin `b6d11137`. SideInstaller's wrapper
+does go directly from `AppleAccount` login to `DeveloperSession::from_account`,
+then lets `SideloaderBuilder::get_team` list teams, but its patched dependency is
+a vendored isideload 0.2.22 snapshot at `e319d931`, not current 0.3.17. That
+older RemoteV3 implementation fetches `/v3/client_info` from the anisette
+server; current 0.3.17 hard-codes client metadata. It also uses the older sync
+2FA callback and a different reqwest/TLS feature set. The provider inputs are
+otherwise equivalent: selected endpoint, persistent filesystem storage, and
+serial `"0"`. Its machine name is supplied only after login while building the
+sideloader, so it cannot explain an `appleLogin` failure.
+
+Current iLoader `348eefd7` uses isideload 0.3.17 from its
+`apple-codesign-quick` lock revision `f6a4d5db`, while Location Suite uses later
+main `b6d11137`. iLoader lowercases the account, uses persistent keyring (or
+filesystem) storage, serial `"0"`, an async 2FA callback, AWS-LC as the rustls
+provider, and no outer 45-second service budget. Its isideload revision sends
+`com.apple.akd/1.0` client metadata and disables idle HTTP pooling; the Location
+Suite pin sends Xcode client metadata and no longer disables that pool. These
+are real source differences, but neither source establishes which one caused
+this device's failure. No authentication behavior or dependency pin was
+changed before the newly exposed physical error identifies a relevant class.
 
 Current isideload does not expose a reusable authenticated Apple session/token
 that survives process launch. The developer session therefore remains in memory
@@ -163,9 +202,10 @@ Background App Refresh.
 5. Enter the six-digit Apple code if prompted. Select the team whose identifier
    matches the installed profile if the app cannot select it uniquely.
 
-For the third diagnostic attempt, install the newer IPA over the current app,
-stay on Wi-Fi with LocalDevVPN connected, enter credentials, tap **Sign In /
-Test Developer Session** once, and capture the full Status card. Do not tap
+For the fourth diagnostic attempt, install the newer IPA over the current app,
+stay on Wi-Fi with LocalDevVPN connected, configure one anisette endpoint,
+enter credentials on-device, tap **Sign In / Test Developer Session** once, and
+capture the full Status card including **Technical Details**. Do not tap
 **Refresh Signing Now** unless the card says `Apple developer session is ready.`
 
 Pass evidence:

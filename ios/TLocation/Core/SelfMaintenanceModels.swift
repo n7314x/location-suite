@@ -2,10 +2,18 @@ import Foundation
 
 enum SelfMaintenanceFailureCategory: String, Codable, CaseIterable, Sendable {
     case anisetteUnavailable
+    case anisetteRejected
     case appleAuthenticationFailed
+    case appleAccountLocked
+    case appleNetworkUnavailable
     case twoFactorRequired
     case twoFactorCancelled
+    case twoFactorFailed
     case grandSlamUnavailable
+    case invalidClientMetadata
+    case termsRequired
+    case malformedAppleResponse
+    case unknownAppleLoginResponse
     case developerSessionFailed
     case signingCorePanic
     case teamSelectionFailed
@@ -65,7 +73,7 @@ struct SelfMaintenanceError: Error, Codable, Equatable, LocalizedError, Sendable
     }
 
     var technicalDetail: String {
-        SensitiveDiagnosticRedactor.sanitizedSingleLine(message, fallback: fallbackMessage)
+        SensitiveDiagnosticRedactor.sanitizedChain(message, fallback: fallbackMessage)
     }
 
     var hasDistinctTechnicalDetail: Bool {
@@ -84,12 +92,28 @@ struct SelfMaintenanceError: Error, Codable, Equatable, LocalizedError, Sendable
         switch category {
         case .anisetteUnavailable, .grandSlamUnavailable:
             return "Apple signing services are temporarily unavailable."
+        case .anisetteRejected:
+            return "Apple rejected the anisette data."
         case .appleAuthenticationFailed:
             return "Could not sign in to the Apple Account."
+        case .appleAccountLocked:
+            return "The Apple Account is locked."
+        case .appleNetworkUnavailable:
+            return "Apple sign-in could not reach the network."
         case .twoFactorRequired:
             return "Apple requires two-factor authentication."
         case .twoFactorCancelled:
             return "Two-factor authentication was cancelled."
+        case .twoFactorFailed:
+            return "Apple two-factor authentication failed."
+        case .invalidClientMetadata:
+            return "Apple rejected the sign-in client metadata."
+        case .termsRequired:
+            return "The Apple Account requires an agreement or terms review."
+        case .malformedAppleResponse:
+            return "Apple returned a response that could not be read."
+        case .unknownAppleLoginResponse:
+            return "Apple returned an unknown sign-in response."
         case .developerSessionFailed:
             return "Could not create the Apple developer session."
         case .signingCorePanic:
@@ -359,12 +383,19 @@ enum SigningReminderSchedule {
 }
 
 enum SensitiveDiagnosticRedactor {
+    private static let maximumChainDepth = 8
+    private static let maximumChainCharacters = 1_200
+    private static let maximumLineCharacters = 240
+
     private static let tokenPatterns = [
         #"github_pat_[A-Za-z0-9_]+"#,
         #"gh[pousr]_[A-Za-z0-9]+"#,
-        #"(?i)(authorization|cookie|password|security-code|2fa|xcode\.auth|spd|token|secret|private[_ -]?key|client-secret|x-apple-i-md[^\s:=]*|x-mme-client-info|adi_pb|machine_id|local_user_uuid|routing_info|p12)\s*[:=]\s*[^\s,;]+"#,
+        #"(?i)\b(authorization|proxy-authorization|cookie|set-cookie|x-apple-i-md[^\s:=]*|x-mme-client-info|x-mme-device-id|x-apple-identity-token)\b\s*[:=][^\r\n]*"#,
+        #"(?i)\b(password|passwd|security[-_ ]?code|two[-_ ]?factor[-_ ]?code|2fa[-_ ]?code|xcode\.auth|spd|access[-_ ]?token|refresh[-_ ]?token|token|secret|private[_ -]?key|client[-_ ]?secret|adi_pb|machine[-_ ]?id|local[-_ ]?user[-_ ]?(?:uuid|id)|device[-_ ]?(?:unique[-_ ]?)?(?:identifier|id)|udid|serial[-_ ]?(?:number)?|routing[-_ ]?info|dsid|adsid|gsidmstoken|p12)\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|(?:bearer\s+)?[^\s,;]+)"#,
         #"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"#,
         #"\b[0-9]{6}\b"#,
+        #"(?i)\bhttps?://[^\s]+"#,
+        #"\b(?:[A-Fa-f0-9]{24,}|[A-Za-z0-9_+/=-]{24,}|[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]{12,}){2})\b"#,
         #"(?i)(latitude|longitude|coordinates?)\s*[:=]\s*[-+0-9., ]+"#
     ]
 
@@ -390,12 +421,27 @@ enum SensitiveDiagnosticRedactor {
         knownSecrets: [String] = [],
         fallback: String = "The self-maintenance operation failed."
     ) -> String {
-        var result = redact(value, knownSecrets: knownSecrets)
+        let rawFirstLine = value
             .components(separatedBy: .newlines)
             .first?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let firstLine = rawFirstLine.unicodeScalars.map { scalar in
+            CharacterSet.controlCharacters.contains(scalar) ? " " : String(scalar)
+        }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = firstLine.lowercased()
+        if lower.hasPrefix("{") || lower.hasPrefix("[")
+            || lower.hasPrefix("<?xml") || lower.hasPrefix("<plist")
+            || lower.hasPrefix("bplist") || lower.contains("-----begin")
+            || lower.contains("private key material")
+            || lower.contains("certificate key material") {
+            return fallback
+        }
+        var result = firstLine
         let responseBoundary = [
-            "response body", "response:", "response=", "body:", "body="
+            "response body", "response-body", "raw response", "response payload",
+            "body:", "body=", ": {", ": [", "<?xml", "<plist", "bplist",
+            "pairing content", "pairing-content", "pairing data", "pairing-data",
+            "pair record:", "pair record=", "pairing record:", "pairing record="
         ]
             .compactMap { result.range(of: $0, options: .caseInsensitive)?.lowerBound }
             .min()
@@ -403,6 +449,43 @@ enum SensitiveDiagnosticRedactor {
             result = String(result[..<responseBoundary])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        result = redact(result, knownSecrets: knownSecrets)
+        if result.count > maximumLineCharacters {
+            result = String(result.prefix(maximumLineCharacters - 3)) + "..."
+        }
         return result.isEmpty ? fallback : result
+    }
+
+    static func sanitizedChain(
+        _ value: String,
+        knownSecrets: [String] = [],
+        fallback: String = "The self-maintenance operation failed."
+    ) -> String {
+        var lines: [String] = []
+        var characterCount = 0
+        for rawLine in value.components(separatedBy: .newlines) {
+            guard lines.count < maximumChainDepth else { break }
+            let line = sanitizedSingleLine(
+                rawLine,
+                knownSecrets: knownSecrets,
+                fallback: ""
+            )
+            guard !line.isEmpty, !lines.contains(line) else { continue }
+            let separatorCount = lines.isEmpty ? 0 : 1
+            let available = maximumChainCharacters - characterCount - separatorCount
+            guard available > 0 else { break }
+            let bounded: String
+            if line.count <= available {
+                bounded = line
+            } else if available <= 3 {
+                bounded = String(repeating: ".", count: available)
+            } else {
+                bounded = String(line.prefix(available - 3)) + "..."
+            }
+            lines.append(bounded)
+            characterCount += separatorCount + bounded.count
+            if bounded.count == available { break }
+        }
+        return lines.isEmpty ? fallback : lines.joined(separator: "\n")
     }
 }

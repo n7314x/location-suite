@@ -33,10 +33,25 @@ branch:
   [`b6d111376657a59207ac26c8ef8be5cca8793cba`](https://github.com/nab138/isideload/commit/b6d111376657a59207ac26c8ef8be5cca8793cba).
   This is the exact revision in `SelfMaintenanceCore/Cargo.toml` and
   `Cargo.lock`; it is not a floating Git dependency.
+- iLoader `main` at
+  [`348eefd7de78e9bc612c9d619b8b1e7a80ba3ba0`](https://github.com/nab138/iloader/commit/348eefd7de78e9bc612c9d619b8b1e7a80ba3ba0).
+  Its lockfile resolves the `apple-codesign-quick` isideload branch to
+  `f6a4d5dba717d72fc2af63eaba26b27ba44116be`, which predates and differs from
+  Location Suite's isideload `main` pin.
 
 SideInstaller and SideStore are research references, not runtime dependencies.
 Location Suite's Phase 1 runtime dependency remains LocalDevVPN plus Apple and
 the selected anisette service.
+
+At the SideInstaller pin, `[patch]` redirects isideload to a vendored 0.2.22
+snapshot based on `e319d931`, with one unrelated app-extension signing patch.
+Its authentication implementation obtains client metadata from the anisette
+server. Location Suite's 0.3.17 pin instead supplies fixed Xcode/AuthKit client
+metadata. Current iLoader's `f6a4d5db` snapshot supplies fixed `akd` metadata,
+lowercases the account, disables idle HTTP pooling, and installs AWS-LC rather
+than ring as its explicit rustls provider. These concrete differences are
+recorded for diagnosis; they are not evidence by themselves that any one is
+responsible for a particular Apple response.
 
 ## libidevice FFI ownership
 

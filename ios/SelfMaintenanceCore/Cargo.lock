@@ -2413,6 +2413,8 @@ name = "location_self_maintenance"
 version = "0.1.0"
 dependencies = [
  "isideload",
+ "regex",
+ "reqwest",
  "rootcause",
  "rustls",
  "serde",

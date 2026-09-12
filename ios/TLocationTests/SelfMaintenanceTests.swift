@@ -49,6 +49,19 @@ struct SelfMaintenancePolicyTests {
         #expect(error.hasDistinctTechnicalDetail)
     }
 
+    @Test func nestedTechnicalDetailPreservesSafeCauseLines() {
+        let chain = "Failed to log in to Apple ID\nCause: GrandSlam returned HTTP 503"
+        let error = SelfMaintenanceError(
+            category: .grandSlamUnavailable,
+            stage: "appleLogin",
+            message: chain
+        )
+        #expect(error.userFacingSummary == "Could not sign in to the Apple Account.")
+        #expect(error.technicalDetail == chain)
+        #expect(error.hasDistinctTechnicalDetail)
+        #expect(error.safeSignInLogMessage.contains(chain))
+    }
+
     @Test func emptyErrorMessageGetsAUsefulFallback() {
         let error = SelfMaintenanceError(
             category: .developerSessionFailed,
@@ -79,6 +92,52 @@ struct SelfMaintenancePolicyTests {
         }
         #expect(error.safeSignInLogMessage.contains("stage=developerSession"))
         #expect(error.safeSignInLogMessage.contains("category=developerSessionFailed"))
+    }
+
+    @Test func signInChainRedactionPreservesCausesAndSuppressesBodies() {
+        let raw = """
+        Failed to log in person@example.com
+        Cause: authorization: Bearer abcdefghijklmnopqrstuvwxyz012345
+        Cause: token=opaque-value password=hunter2 code 123456
+        Cause: password="two word secret"
+        Cause: malformed response body: {"secret":"private"}
+        """
+        let chain = SensitiveDiagnosticRedactor.sanitizedChain(
+            raw,
+            knownSecrets: ["hunter2"]
+        )
+        #expect(chain.components(separatedBy: .newlines).count == 5)
+        #expect(!chain.contains("person@example.com"))
+        #expect(!chain.contains("abcdefghijklmnopqrstuvwxyz012345"))
+        #expect(!chain.contains("opaque-value"))
+        #expect(!chain.contains("hunter2"))
+        #expect(!chain.contains("two word secret"))
+        #expect(!chain.contains("123456"))
+        #expect(!chain.contains("private"))
+        #expect(chain.contains("Cause: malformed"))
+    }
+
+    @Test func signInChainRedactionSuppressesPairingAndDeviceIdentifiers() {
+        let raw = """
+        Failed to parse pairing data: HostID=private
+        Cause: device_id=short-device-id serial_number=short-serial dsid=1234567890
+        """
+        let chain = SensitiveDiagnosticRedactor.sanitizedChain(raw)
+        #expect(chain.contains("Failed to parse"))
+        #expect(!chain.contains("HostID"))
+        #expect(!chain.contains("short-device-id"))
+        #expect(!chain.contains("short-serial"))
+        #expect(!chain.contains("1234567890"))
+    }
+
+    @Test func signInChainRedactionIsBounded() {
+        let raw = (0..<20)
+            .map { "Cause: context-\($0)-" + String(repeating: "x", count: 300) }
+            .joined(separator: "\n")
+        let chain = SensitiveDiagnosticRedactor.sanitizedChain(raw)
+        #expect(chain.components(separatedBy: .newlines).count <= 8)
+        #expect(chain.count <= 1_200)
+        #expect(chain.components(separatedBy: .newlines).allSatisfy { $0.count <= 240 })
     }
 
     @Test func normalSignInSuccessPayloadStillDecodes() throws {
