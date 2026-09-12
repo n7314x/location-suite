@@ -315,7 +315,12 @@ pub(crate) fn apple_login_category(chain: &str) -> &'static str {
     let lower = chain.to_ascii_lowercase();
     let mentions_anisette = lower.contains("anisette") || lower.contains("provisioning socket");
 
-    if mentions_anisette
+    if lower.contains("status 429")
+         || lower.contains("http 429")
+         || lower.contains("too many requests")
+    {
+        "appleRateLimited"
+    } else if mentions_anisette
         && (lower.contains("status 503")
             || lower.contains("http 503")
             || lower.contains("service unavailable"))
@@ -687,5 +692,15 @@ mod tests {
         let report = report!(String::from("{\"password\":\"private\"}")).into_dynamic();
         assert_eq!(report_chain(&report, "", ""), None);
         assert_eq!(sanitize_line("", "", ""), None);
+    }
+
+    #[test]
+    fn http_429_is_classified_as_rate_limited() {
+        let chain = "Failed to log in to Apple ID\n\
+                    Cause: Failed to send proof login requests\n\
+                    Cause: Recieved error response from grandslam\n\
+                    Cause: HTTP requests failed with status 429.";
+
+        assert_eq!(apple_login_category(chain), "appleRateLimited");
     }
 }

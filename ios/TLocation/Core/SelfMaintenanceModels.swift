@@ -1,6 +1,7 @@
 import Foundation
 
 enum SelfMaintenanceFailureCategory: String, Codable, CaseIterable, Sendable {
+    case appleRateLimited
     case anisetteUnavailable
     case anisetteRejected
     case appleAuthenticationFailed
@@ -56,6 +57,9 @@ struct SelfMaintenanceError: Error, Codable, Equatable, LocalizedError, Sendable
         if category == .grandSlamUnavailable {
             return "Apple signing services are temporarily unavailable."
         }
+        if category == .appleRateLimited {
+            return "Apple is temporarily limiting sign-in attempts."
+        }
         switch stage {
         case "creatingAnisetteProvider":
             return "Could not create the anisette provider."
@@ -93,6 +97,8 @@ struct SelfMaintenanceError: Error, Codable, Equatable, LocalizedError, Sendable
 
     private var fallbackMessage: String {
         switch category {
+        case .appleRateLimited:
+            return "Apple is temporarily limiting sign-in attempts. Wait a while before trying again."
         case .anisetteUnavailable, .grandSlamUnavailable:
             return "Apple signing services are temporarily unavailable."
         case .anisetteRejected:
