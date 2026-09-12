@@ -56,7 +56,7 @@ struct SelfMaintenancePolicyTests {
             stage: "appleLogin",
             message: chain
         )
-        #expect(error.userFacingSummary == "Could not sign in to the Apple Account.")
+        #expect(error.userFacingSummary == "Apple signing services are temporarily unavailable.")
         #expect(error.technicalDetail == chain)
         #expect(error.hasDistinctTechnicalDetail)
         #expect(error.safeSignInLogMessage.contains(chain))

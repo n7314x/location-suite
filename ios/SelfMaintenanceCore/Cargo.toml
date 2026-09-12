@@ -9,6 +9,7 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
+async-trait = "0.1"
 # Pinned to the exact upstream revision reviewed for the Phase 1 profile-only
 # refresh implementation. `install` is enabled only because isideload 0.3.17
 # imports idevice from modules that are compiled even when its install method is

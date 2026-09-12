@@ -20,8 +20,11 @@ use std::sync::{
 use std::time::Duration;
 
 use isideload::{
-    anisette::remote_v3::RemoteV3AnisetteProvider,
+    anisette::{
+        remote_v3::RemoteV3AnisetteProvider, AnisetteClientInfo, AnisetteData, AnisetteProvider,
+    },
     auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
+    auth::grandslam::GrandSlam,
     dev::{
         app_ids::AppIdsApi,
         developer_session::DeveloperSession,
@@ -35,6 +38,42 @@ use serde::Serialize;
 use safe_error::{apple_login_category, report_chain, sanitize_line};
 
 static INITIALIZE_ISIDELOAD: OnceLock<()> = OnceLock::new();
+
+const AKD_CLIENT_INFO: &str =
+    "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+const AKD_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
+
+/// Preserves the pinned RemoteV3 provider behavior while applying upstream's
+/// GrandSlam client-identity fix from isideload PR #11.
+struct AkdRemoteV3AnisetteProvider(RemoteV3AnisetteProvider);
+
+impl AkdRemoteV3AnisetteProvider {
+    fn new(provider: RemoteV3AnisetteProvider) -> Self {
+        Self(provider)
+    }
+}
+
+#[async_trait::async_trait]
+impl AnisetteProvider for AkdRemoteV3AnisetteProvider {
+    async fn get_anisette_data(&self) -> Result<AnisetteData, rootcause::Report> {
+        self.0.get_anisette_data().await
+    }
+
+    async fn get_client_info(&self) -> Result<AnisetteClientInfo, rootcause::Report> {
+        Ok(AnisetteClientInfo {
+            client_info: AKD_CLIENT_INFO.to_string(),
+            user_agent: AKD_USER_AGENT.to_string(),
+        })
+    }
+
+    async fn provision(&mut self, grand_slam: Arc<GrandSlam>) -> Result<(), rootcause::Report> {
+        self.0.provision(grand_slam).await
+    }
+
+    fn needs_provisioning(&self) -> Result<bool, rootcause::Report> {
+        self.0.needs_provisioning()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -593,6 +632,7 @@ pub unsafe extern "C" fn ls_apple_sign_in(
                                 &password,
                             )
                         })?;
+                        let anisette = AkdRemoteV3AnisetteProvider::new(anisette);
                         stage.set(SignInStage::AppleLogin);
                         let mut account = AppleAccount::builder(&apple_id)
                             .anisette_provider(anisette)
@@ -933,12 +973,16 @@ mod tests {
     use std::panic::{catch_unwind, panic_any};
     use std::time::Duration;
 
+    use isideload::{
+        anisette::{remote_v3::RemoteV3AnisetteProvider, AnisetteProvider},
+        util::fs_storage::FsStorage,
+    };
     use rootcause::prelude::*;
 
     use super::{
         charge_service_time, error_category, error_payload_json, initialize_rustls_crypto_provider,
-        panic_summary, should_try_next_anisette, SignInFailure, SignInStage, SignInStageTracker,
-        SignInSummary, TeamSummary,
+        panic_summary, should_try_next_anisette, AkdRemoteV3AnisetteProvider, SignInFailure,
+        SignInStage, SignInStageTracker, SignInSummary, TeamSummary,
     };
 
     fn report_failure(
@@ -960,6 +1004,29 @@ mod tests {
     fn signing_core_installs_the_rustls_provider() {
         initialize_rustls_crypto_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn effective_grandslam_client_info_uses_akd_identity() {
+        initialize_rustls_crypto_provider();
+        let upstream = RemoteV3AnisetteProvider::new(
+            "https://anisette.invalid",
+            Box::new(FsStorage::new(std::env::temp_dir())),
+            "0".to_string(),
+        )
+        .expect("the provider can be created without a network request");
+        let provider = AkdRemoteV3AnisetteProvider::new(upstream);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let client_info = runtime
+            .block_on(provider.get_client_info())
+            .expect("fixed client info");
+
+        assert!(!client_info.client_info.contains("com.apple.dt.Xcode"));
+        assert!(client_info.client_info.contains("com.apple.akd/1.0"));
+        assert_eq!(client_info.user_agent, "akd/1.0 CFNetwork/808.1.4");
     }
 
     #[test]

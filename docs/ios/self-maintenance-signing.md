@@ -86,6 +86,28 @@ result, with no 2FA prompt, developer session, or team list. Provider creation
 therefore succeeds with both tested v3 endpoints and the failure is inside
 `AppleAccount::login`.
 
+The resulting HTTP 503 has since been confirmed upstream as an Apple edge
+rejection of an `X-MMe-Client-Info` value containing `com.apple.dt.Xcode`.
+isideload PR #11 changes only that value to `com.apple.akd/1.0`, but its merge
+commit `f2fd29ab` is on the `apple-codesign-quick` line, which diverged from the
+Location Suite pin and includes unrelated dependency, authentication, 2FA,
+storage, and signing changes. Location Suite therefore remains pinned to
+isideload `b6d11137` and wraps `RemoteV3AnisetteProvider`: anisette data,
+provisioning, storage, transport, and the existing User-Agent all delegate to
+the pinned provider, while only `get_client_info` returns the fixed akd client
+identity.
+
+This is the value on the real request path. `AppleAccount::builder` stores the
+wrapped provider in its `AnisetteDataGenerator`; `AppleAccount::new` asks that
+generator for client info and passes it into `GrandSlam::new`; and
+`GrandSlam::base_headers` writes its `client_info` into
+`X-MMe-Client-Info`. `AppleAccount::login` then sends both SRP requests through
+`GrandSlam::plist_request` to the URL bag's `gsService`,
+`https://gsa.apple.com/grandslam/GsService2`. A deterministic Rust test creates
+the wrapped provider and requires its effective client info to contain
+`com.apple.akd/1.0`, exclude `com.apple.dt.Xcode`, and retain
+`akd/1.0 CFNetwork/808.1.4` as the User-Agent.
+
 Pinned `rootcause` 0.12.1 represents propagated context as report nodes.
 `Report::iter_reports()` visits the root and descendants depth-first, and each
 `ReportRef` exposes `format_current_context_unhooked()` plus
@@ -122,10 +144,9 @@ main `b6d11137`. iLoader lowercases the account, uses persistent keyring (or
 filesystem) storage, serial `"0"`, an async 2FA callback, AWS-LC as the rustls
 provider, and no outer 45-second service budget. Its isideload revision sends
 `com.apple.akd/1.0` client metadata and disables idle HTTP pooling; the Location
-Suite pin sends Xcode client metadata and no longer disables that pool. These
-are real source differences, but neither source establishes which one caused
-this device's failure. No authentication behavior or dependency pin was
-changed before the newly exposed physical error identifies a relevant class.
+Suite pin originally supplied Xcode client metadata and no longer disables that
+pool. The confirmed fix overrides only the blocked client identity; it does not
+adopt the branch's HTTP pooling or other behavioral changes.
 
 Current isideload does not expose a reusable authenticated Apple session/token
 that survives process launch. The developer session therefore remains in memory
@@ -202,11 +223,13 @@ Background App Refresh.
 5. Enter the six-digit Apple code if prompted. Select the team whose identifier
    matches the installed profile if the app cannot select it uniquely.
 
-For the fourth diagnostic attempt, install the newer IPA over the current app,
-stay on Wi-Fi with LocalDevVPN connected, configure one anisette endpoint,
-enter credentials on-device, tap **Sign In / Test Developer Session** once, and
-capture the full Status card including **Technical Details**. Do not tap
-**Refresh Signing Now** unless the card says `Apple developer session is ready.`
+For the next Gate 1 attempt, install the newer IPA over the current app, stay on
+Wi-Fi with LocalDevVPN connected, configure one v3 anisette endpoint, enter
+credentials on-device, and tap **Sign In / Test Developer Session** once. The
+expected progression is Apple login, a 2FA prompt if Apple requires it,
+developer-session creation, team listing, then
+`Apple developer session is ready.` Stop there; do not tap **Refresh Signing
+Now** during Gate 1.
 
 Pass evidence:
 

@@ -53,6 +53,9 @@ struct SelfMaintenanceError: Error, Codable, Equatable, LocalizedError, Sendable
     var errorDescription: String? { technicalDetail }
 
     var userFacingSummary: String {
+        if category == .grandSlamUnavailable {
+            return "Apple signing services are temporarily unavailable."
+        }
         switch stage {
         case "creatingAnisetteProvider":
             return "Could not create the anisette provider."

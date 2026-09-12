@@ -32,7 +32,9 @@ branch:
 - isideload `0.3.17` at
   [`b6d111376657a59207ac26c8ef8be5cca8793cba`](https://github.com/nab138/isideload/commit/b6d111376657a59207ac26c8ef8be5cca8793cba).
   This is the exact revision in `SelfMaintenanceCore/Cargo.toml` and
-  `Cargo.lock`; it is not a floating Git dependency.
+  `Cargo.lock`; it is not a floating Git dependency. Location Suite wraps its
+  RemoteV3 provider to apply isideload PR #11's one-field GrandSlam client-info
+  fix without taking that branch's unrelated changes.
 - iLoader `main` at
   [`348eefd7de78e9bc612c9d619b8b1e7a80ba3ba0`](https://github.com/nab138/iloader/commit/348eefd7de78e9bc612c9d619b8b1e7a80ba3ba0).
   Its lockfile resolves the `apple-codesign-quick` isideload branch to
@@ -49,9 +51,10 @@ Its authentication implementation obtains client metadata from the anisette
 server. Location Suite's 0.3.17 pin instead supplies fixed Xcode/AuthKit client
 metadata. Current iLoader's `f6a4d5db` snapshot supplies fixed `akd` metadata,
 lowercases the account, disables idle HTTP pooling, and installs AWS-LC rather
-than ring as its explicit rustls provider. These concrete differences are
-recorded for diagnosis; they are not evidence by themselves that any one is
-responsible for a particular Apple response.
+than ring as its explicit rustls provider. Apple has since been confirmed to
+reject the Xcode identifier before credential validation. Location Suite's
+wrapper now supplies `com.apple.akd/1.0` while preserving the pinned provider's
+other behavior.
 
 ## libidevice FFI ownership
 
