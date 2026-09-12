@@ -316,8 +316,8 @@ pub(crate) fn apple_login_category(chain: &str) -> &'static str {
     let mentions_anisette = lower.contains("anisette") || lower.contains("provisioning socket");
 
     if lower.contains("status 429")
-         || lower.contains("http 429")
-         || lower.contains("too many requests")
+            || lower.contains("http 429")
+            || lower.contains("too many requests")
     {
         "appleRateLimited"
     } else if mentions_anisette
@@ -698,7 +698,7 @@ mod tests {
     fn http_429_is_classified_as_rate_limited() {
         let chain = "Failed to log in to Apple ID\n\
                     Cause: Failed to send proof login requests\n\
-                    Cause: Recieved error response from grandslam\n\
+                    Cause: Received error response from grandslam\n\
                     Cause: HTTP requests failed with status 429.";
 
         assert_eq!(apple_login_category(chain), "appleRateLimited");
