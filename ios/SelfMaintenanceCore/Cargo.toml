@@ -15,7 +15,7 @@ async-trait = "0.1"
 # imports idevice from modules that are compiled even when its install method is
 # unused. Location Suite never calls that install path; its existing, separately
 # pinned idevice FFI owns all phone-local device services.
-isideload = { git = "https://github.com/nab138/isideload.git", rev = "b6d111376657a59207ac26c8ef8be5cca8793cba", default-features = false, features = ["fs-storage", "install", "tokio-mt"] }
+isideload = { git = "https://github.com/n7314x/isideload.git", rev = "3d077b6011045bc3bb52b566151ab8810501ec54", default-features = false, features = ["fs-storage", "install", "tokio-mt"] }
 regex = "1.13"
 reqwest = { version = "0.13", default-features = false }
 rootcause = "0.12"
