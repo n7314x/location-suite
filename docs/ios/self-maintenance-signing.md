@@ -55,9 +55,10 @@ repeated login attempts.
 The password is passed to isideload's Apple login and never to the anisette
 endpoint. Rust logging has no subscriber, FFI errors are reduced to one line,
 and Swift redacts known credentials and token-shaped values before exposing an
-error. Logs contain only operation categories for refresh failures. The 2FA code
-crosses a synchronous callback, is submitted to Apple, then is discarded; it is
-not logged or persisted.
+error. A failed sign-in produces one safe log entry with its stage, category,
+and sanitized one-line detail; refresh-failure logs contain only the category.
+The 2FA code crosses a synchronous callback, is submitted to Apple, then is
+discarded; it is not logged or persisted.
 
 The first physical Gate 1 attempt on iOS 27 stopped in the Rust panic boundary.
 The pinned isideload revision enables reqwest's `rustls-no-provider` feature, so
@@ -66,6 +67,26 @@ anisette client, as that revision's own example requires. A caught panic is
 reported as `signingCorePanic` with the latest safe stage and a one-line,
 redacted string payload. Non-string payloads report only the stage. Response
 bodies and backtraces are never returned to the UI.
+
+The second physical Gate 1 attempt confirmed that the provider panic is fixed,
+then returned the ordinary category `developerSessionFailed`. The old path
+converted the anisette-provider, Apple-login, developer-session, and team-list
+errors into plain strings and applied one shared `developerSessionFailed`
+fallback afterward. The diagnostic candidate now keeps the operation's stage,
+sensible fallback category, and sanitized upstream message together through FFI
+JSON and Swift. Account & Signing visibly shows the summary, expanded technical
+detail, exact stage, and category. Gate 1 remains failed until a physical build
+shows `Apple developer session is ready.`
+
+SideInstaller `main` was checked again and remains the pinned `9272b907`
+revision; isideload `main` likewise remains the pinned `b6d11137` revision.
+SideInstaller goes directly from `AppleAccount` login to
+`DeveloperSession::from_account`, then lets `SideloaderBuilder::get_team` list
+teams. It does not persist or initialize extra account state in between, add
+call-site headers/client metadata, special-case terms/account state, or perform
+free-team setup before opening the developer session. Device registration for a
+free team happens later, before profile creation. No post-login sequence change
+was ported without a returned physical error that supports it.
 
 Current isideload does not expose a reusable authenticated Apple session/token
 that survives process launch. The developer session therefore remains in memory
@@ -141,6 +162,11 @@ Background App Refresh.
    password, then tap **Sign In / Test Developer Session**.
 5. Enter the six-digit Apple code if prompted. Select the team whose identifier
    matches the installed profile if the app cannot select it uniquely.
+
+For the third diagnostic attempt, install the newer IPA over the current app,
+stay on Wi-Fi with LocalDevVPN connected, enter credentials, tap **Sign In /
+Test Developer Session** once, and capture the full Status card. Do not tap
+**Refresh Signing Now** unless the card says `Apple developer session is ready.`
 
 Pass evidence:
 

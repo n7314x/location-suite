@@ -108,7 +108,9 @@ final class SelfMaintenanceService: ObservableObject {
                 expirationDate: SigningExpiryMonitor.shared.reading?.expirationDate
             )
         } catch {
-            publish(error: normalize(error))
+            let normalized = normalize(error)
+            publish(error: normalized)
+            LogManager.shared.addWarningLog(normalized.safeSignInLogMessage)
         }
     }
 

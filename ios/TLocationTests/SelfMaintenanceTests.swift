@@ -20,7 +20,72 @@ struct SelfMaintenancePolicyTests {
         let payload = #"{"category":"signingCorePanic","message":"Signing core panic during appleLogin."}"#
         let error = try JSONDecoder().decode(SelfMaintenanceError.self, from: Data(payload.utf8))
         #expect(error.category == .signingCorePanic)
+        #expect(error.stage == nil)
         #expect(error.message == "Signing core panic during appleLogin.")
+    }
+
+    @Test func stageAwareFFIErrorDecodesAndRoundTrips() throws {
+        let payload = #"{"category":"developerSessionFailed","stage":"developerSession","message":"Failed to get xcode token from Apple account"}"#
+        let decoded = try JSONDecoder().decode(SelfMaintenanceError.self, from: Data(payload.utf8))
+        #expect(decoded.category == .developerSessionFailed)
+        #expect(decoded.stage == "developerSession")
+        #expect(decoded.message == "Failed to get xcode token from Apple account")
+
+        let roundTripped = try JSONDecoder().decode(
+            SelfMaintenanceError.self,
+            from: JSONEncoder().encode(decoded)
+        )
+        #expect(roundTripped == decoded)
+    }
+
+    @Test func stageSpecificTechnicalDetailIsVisibleAndUseful() {
+        let error = SelfMaintenanceError(
+            category: .developerSessionFailed,
+            stage: "developerSession",
+            message: "Failed to get xcode token from Apple account"
+        )
+        #expect(error.userFacingSummary == "Could not create the Apple developer session.")
+        #expect(error.technicalDetail == "Failed to get xcode token from Apple account")
+        #expect(error.hasDistinctTechnicalDetail)
+    }
+
+    @Test func emptyErrorMessageGetsAUsefulFallback() {
+        let error = SelfMaintenanceError(
+            category: .developerSessionFailed,
+            stage: "developerSession",
+            message: "  \n"
+        )
+        #expect(error.technicalDetail == "Could not create the Apple developer session.")
+        #expect(!error.hasDistinctTechnicalDetail)
+    }
+
+    @Test func signInDiagnosticAndLogLineRedactSecrets() {
+        let raw = "person@example.com password=hunter2 token=opaque-value 123456 response body: private data"
+        let error = SelfMaintenanceError(
+            category: .developerSessionFailed,
+            stage: "developerSession",
+            message: SensitiveDiagnosticRedactor.sanitizedSingleLine(
+                raw,
+                knownSecrets: ["hunter2"]
+            )
+        )
+        let values = [error.technicalDetail, error.safeSignInLogMessage]
+        for value in values {
+            #expect(!value.contains("person@example.com"))
+            #expect(!value.contains("hunter2"))
+            #expect(!value.contains("opaque-value"))
+            #expect(!value.contains("123456"))
+            #expect(!value.contains("private data"))
+        }
+        #expect(error.safeSignInLogMessage.contains("stage=developerSession"))
+        #expect(error.safeSignInLogMessage.contains("category=developerSessionFailed"))
+    }
+
+    @Test func normalSignInSuccessPayloadStillDecodes() throws {
+        let payload = #"{"anisetteEndpoint":"https://anisette.invalid","teams":[{"identifier":"TEAM123","name":"Personal Team","teamType":"Individual","status":"active"}]}"#
+        let summary = try JSONDecoder().decode(AccountSignInSummary.self, from: Data(payload.utf8))
+        #expect(summary.anisetteEndpoint == "https://anisette.invalid")
+        #expect(summary.teams.map(\.identifier) == ["TEAM123"])
     }
 
     @Test func expiryThresholdStartsAt72Hours() {

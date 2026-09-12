@@ -176,6 +176,7 @@ enum AppleDeveloperBridge {
             ls_account_session_free(session)
             throw SelfMaintenanceError(
                 category: .developerSessionFailed,
+                stage: "buildingResult",
                 message: "The developer-session response could not be read."
             )
         }
@@ -228,17 +229,20 @@ enum AppleDeveloperBridge {
         guard let pointer else {
             return SelfMaintenanceError(category: .unknown, message: "The self-maintenance operation failed.")
         }
-        let sanitized = SensitiveDiagnosticRedactor.redact(
-            String(cString: pointer),
-            knownSecrets: knownSecrets
-        )
-        guard let data = sanitized.data(using: .utf8),
+        let payload = String(cString: pointer)
+        guard let data = payload.data(using: .utf8),
               let error = try? JSONDecoder().decode(SelfMaintenanceError.self, from: data) else {
             return SelfMaintenanceError(category: .unknown, message: "The self-maintenance operation failed.")
         }
-        if error.category == .anisetteUnavailable || error.category == .grandSlamUnavailable {
-            return .serviceUnavailable(error.category)
-        }
-        return error
+        let message = SensitiveDiagnosticRedactor.sanitizedSingleLine(
+            error.message,
+            knownSecrets: knownSecrets,
+            fallback: error.userFacingSummary
+        )
+        return SelfMaintenanceError(
+            category: error.category,
+            stage: error.stage,
+            message: message
+        )
     }
 }

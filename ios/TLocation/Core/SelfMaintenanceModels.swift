@@ -29,15 +29,76 @@ enum SelfMaintenanceFailureCategory: String, Codable, CaseIterable, Sendable {
 
 struct SelfMaintenanceError: Error, Codable, Equatable, LocalizedError, Sendable {
     let category: SelfMaintenanceFailureCategory
+    let stage: String?
     let message: String
 
-    var errorDescription: String? { message }
+    init(
+        category: SelfMaintenanceFailureCategory,
+        stage: String? = nil,
+        message: String
+    ) {
+        self.category = category
+        self.stage = stage
+        self.message = message
+    }
 
-    static func serviceUnavailable(_ category: SelfMaintenanceFailureCategory) -> SelfMaintenanceError {
-        SelfMaintenanceError(
-            category: category,
-            message: "Apple signing services are temporarily unavailable."
-        )
+    var errorDescription: String? { technicalDetail }
+
+    var userFacingSummary: String {
+        switch stage {
+        case "creatingAnisetteProvider":
+            return "Could not create the anisette provider."
+        case "appleLogin":
+            return "Could not sign in to the Apple Account."
+        case "developerSession":
+            return "Could not create the Apple developer session."
+        case "listingTeams":
+            return "Could not list Apple developer teams."
+        case "buildingResult":
+            return "Could not prepare the developer-session response."
+        case "initializingCore", "installingCryptoProvider", "initializingErrorHooks",
+             "parsingInputs", "creatingRuntime", "preparingStorage":
+            return "Could not initialize Apple developer sign-in."
+        default:
+            return fallbackMessage
+        }
+    }
+
+    var technicalDetail: String {
+        SensitiveDiagnosticRedactor.sanitizedSingleLine(message, fallback: fallbackMessage)
+    }
+
+    var hasDistinctTechnicalDetail: Bool {
+        technicalDetail != userFacingSummary
+    }
+
+    var safeSignInLogMessage: String {
+        let stageValue = stage.flatMap { $0.isEmpty ? nil : $0 } ?? "unavailable"
+        return "Self-maintenance sign-in failed "
+            + "stage=\(stageValue) "
+            + "category=\(category.rawValue) "
+            + "detail=\(technicalDetail)"
+    }
+
+    private var fallbackMessage: String {
+        switch category {
+        case .anisetteUnavailable, .grandSlamUnavailable:
+            return "Apple signing services are temporarily unavailable."
+        case .appleAuthenticationFailed:
+            return "Could not sign in to the Apple Account."
+        case .twoFactorRequired:
+            return "Apple requires two-factor authentication."
+        case .twoFactorCancelled:
+            return "Two-factor authentication was cancelled."
+        case .developerSessionFailed:
+            return "Could not create the Apple developer session."
+        case .signingCorePanic:
+            return "The signing core stopped unexpectedly."
+        case .teamSelectionFailed:
+            return "Could not list or select an Apple developer team."
+        default:
+            return "The self-maintenance operation failed."
+        }
     }
 }
 
@@ -301,7 +362,9 @@ enum SensitiveDiagnosticRedactor {
     private static let tokenPatterns = [
         #"github_pat_[A-Za-z0-9_]+"#,
         #"gh[pousr]_[A-Za-z0-9]+"#,
-        #"(?i)(password|security-code|2fa|xcode\.auth|spd|token|private[_ -]?key|p12)\s*[:=]\s*[^\s,;]+"#,
+        #"(?i)(authorization|cookie|password|security-code|2fa|xcode\.auth|spd|token|secret|private[_ -]?key|client-secret|x-apple-i-md[^\s:=]*|x-mme-client-info|adi_pb|machine_id|local_user_uuid|routing_info|p12)\s*[:=]\s*[^\s,;]+"#,
+        #"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"#,
+        #"\b[0-9]{6}\b"#,
         #"(?i)(latitude|longitude|coordinates?)\s*[:=]\s*[-+0-9., ]+"#
     ]
 
@@ -320,5 +383,26 @@ enum SensitiveDiagnosticRedactor {
             )
         }
         return result
+    }
+
+    static func sanitizedSingleLine(
+        _ value: String,
+        knownSecrets: [String] = [],
+        fallback: String = "The self-maintenance operation failed."
+    ) -> String {
+        var result = redact(value, knownSecrets: knownSecrets)
+            .components(separatedBy: .newlines)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let responseBoundary = [
+            "response body", "response:", "response=", "body:", "body="
+        ]
+            .compactMap { result.range(of: $0, options: .caseInsensitive)?.lowerBound }
+            .min()
+        if let responseBoundary {
+            result = String(result[..<responseBoundary])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return result.isEmpty ? fallback : result
     }
 }

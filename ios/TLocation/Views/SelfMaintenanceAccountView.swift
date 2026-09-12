@@ -13,6 +13,7 @@ struct SelfMaintenanceAccountView: View {
 
     @State private var password = ""
     @State private var verificationCode = ""
+    @State private var technicalDetailsExpanded = true
 
     var body: some View {
         Form {
@@ -104,20 +105,36 @@ struct SelfMaintenanceAccountView: View {
                 }
             }
 
-            if let message = maintenance.statusMessage {
+            if let error = maintenance.lastError {
                 Section("Status") {
                     Label(
-                        message,
-                        systemImage: maintenance.lastError == nil
-                            ? "checkmark.circle.fill"
-                            : "exclamationmark.triangle.fill"
+                        error.userFacingSummary,
+                        systemImage: "exclamationmark.triangle.fill"
                     )
-                    .foregroundStyle(maintenance.lastError == nil ? .green : .orange)
-                    if let error = maintenance.lastError {
-                        Text(error.category.rawValue)
+                    .foregroundStyle(.orange)
+                    if error.hasDistinctTechnicalDetail {
+                        DisclosureGroup(
+                            "Technical Details",
+                            isExpanded: $technicalDetailsExpanded
+                        ) {
+                            Text(error.technicalDetail)
+                                .font(.caption)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    if let stage = error.stage, !stage.isEmpty {
+                        Text("Stage: \(stage)")
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
                     }
+                    Text(error.category.rawValue)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            } else if let message = maintenance.statusMessage {
+                Section("Status") {
+                    Label(message, systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
                 }
             }
         }
