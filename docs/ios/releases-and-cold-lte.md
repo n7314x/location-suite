@@ -1,9 +1,9 @@
 # Releases, free signing, and cold LTE diagnostics
 
-Implementation snapshot: 2026-09-10. This document covers only unsigned release
-delivery, SideStore handoff, signing-expiry guidance, and cold phone-local
-RemotePairing observability/recovery. It does not change route or saved-location
-features.
+Implementation snapshot: 2026-09-10, with the Phase 1 self-maintenance addendum
+below. This document covers unsigned release delivery, the legacy SideStore
+handoff, signing-expiry guidance, and cold phone-local RemotePairing
+observability/recovery. It does not change route or saved-location features.
 
 ## Release architecture
 
@@ -120,23 +120,25 @@ presented as:
 - at or below 24 hours: urgent warning and the existing foreground card;
 - elapsed: explicit expired status.
 
-The profile expiration includes date and time. Near expiry, **Open SideStore to
-Refresh** opens SideStore normally because no documented direct-refresh URL
-exists. A later device read—not the act of opening SideStore—is what proves a
-new expiration.
+The profile expiration includes date and time. PR #4's near-expiry action opened
+SideStore because no direct refresh existed in Location Suite. Phase 1 now adds
+an in-app profile-only attempt: it authenticates, requests a profile for the
+installed team/App ID, installs it through misagent, and accepts success only
+when a second device read reports a later expiry. This remains a physical-test
+candidate; [the Phase 1 document](self-maintenance-signing.md) is authoritative
+for its gates. SideStore remains only the older release-install handoff, not a
+dependency of the new profile refresh.
 
-If Apple's GrandSlam/authentication service returns 503 or SideStore reports
-malformed data, Location Suite leaves the installed app, cached expiration,
-certificate, and profile untouched. The already-issued profile remains usable
-until its displayed expiration. Retry SideStore later; Location Suite never
-revokes or recreates certificates.
+If Apple GrandSlam returns 503 or anisette is unavailable, Location Suite leaves
+the installed app, cached expiration, certificate, and profile untouched. The
+already-issued profile remains usable until its displayed expiration. Retry
+later; Phase 1 exposes no certificate create/revoke API.
 
-With a free Apple Account, CI now automates tests, unsigned archive/package,
+With a free Apple Account, CI automates tests, unsigned archive/package,
 metadata/hash/feed creation, publication after hosting is configured, daily feed
-validation, in-app update detection, expiry detection, and SideStore handoff.
-The user/SideStore still must authenticate when needed, sign locally, install or
-update, and renew the seven-day profile. Background App Refresh is not assumed,
-so invisible unattended renewal is not promised.
+validation, update detection, expiry detection, and compilation of the direct
+profile-refresh candidate. Background App Refresh is not assumed, so invisible
+unattended renewal is not promised.
 
 ## Cold bootstrap state machine
 

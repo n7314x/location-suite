@@ -9,7 +9,8 @@ import Foundation
 /// from the device, when that read happened, and when it is worth reading again.
 ///
 /// The value is read from `misagent`, the service that serves the provisioning
-/// profiles iOS validates against, so it tracks SideStore refreshes. See
+/// profiles iOS validates against, so it tracks both Location Suite's direct
+/// profile refresh and profiles installed by another recovery tool. See
 /// ``AppSigningInfo`` for why the app bundle is not read instead.
 ///
 /// The reading is persisted, because it cannot be taken on demand: it needs a
@@ -76,23 +77,17 @@ final class SigningExpiryMonitor: ObservableObject {
     /// the same queue every location-simulation command uses, and never on the
     /// main thread. That is not incidental:
     ///
-    /// * The read borrows `JITEnableContext`'s tunnel, and `withTunnelHandles`
-    ///   will call `ensureTunnel()` — i.e. `tunnel_create_rppairing` against
-    ///   `<targetIP>:49152`, the single-occupancy endpoint (errno 48, "address
-    ///   already in use") that `simulate_location` also handshakes against. That
-    ///   is precisely the collision `startTunnelAfterPendingLocationCommands` and
-    ///   `TLocationApp`'s deferred rebuild already serialise on this queue, so a
-    ///   third caller joins them rather than inventing a queue of its own that
-    ///   could race them both.
+    /// * The read only borrows a transport that is already open: first the idle
+    ///   retained LocationSimulation adapter/handshake, otherwise
+    ///   `JITEnableContext`'s existing pair. It never calls `ensureTunnel()`,
+    ///   performs a second RemotePairing handshake, or tears down the warm
+    ///   LocationSimulation session.
     /// * Being serial, it also means one read at a time and never a read
     ///   overlapping a resend.
     ///
-    /// The cost is that a simulation command issued while a read is in flight
-    /// waits for it — a couple of RSD round trips, the same tax the deferred
-    /// tunnel rebuild already pays. The `LocationSimulationSession` gate below
-    /// keeps that to the case where a simulation starts *during* the read; when
-    /// one is already running the read is simply skipped, and the next call takes
-    /// it. Nothing here is urgent enough to make a simulation wait for it.
+    /// A simulation command issued while a read is in flight waits for its few
+    /// RSD round trips. When a simulation is already active the read is skipped;
+    /// nothing here is urgent enough to disturb a working simulation.
     func refreshIfPossible(reason: String) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { self.refreshIfPossible(reason: reason) }
@@ -105,24 +100,20 @@ final class SigningExpiryMonitor: ObservableObject {
             return
         }
 
-        // Deliberately does not *build* a tunnel. Reading an expiry is not worth
-        // a handshake the user did not ask for, and `ensureTunnel()` inside the
-        // read would do exactly that. Riding an already-connected tunnel keeps
-        // this feature incapable of causing a connection.
-        guard TunnelManager.shared.isConnected else { return }
-
-        // Same two checks, and the same reasoning, as
-        // `TLocationApp.attemptDeferredTunnelReconnect`: `isOpen` is a live
-        // session, `isMaintained` is the process-wide session lifecycle (active
-        // producer or warm idle keeper).
-        guard !LocationSimulationSession.isOpen, !LocationSimulationSession.isMaintained else { return }
+        // Deliberately does not *build* a tunnel. It can borrow either the idle
+        // warm LocationSimulation RSD transport or JITEnableContext's existing
+        // tunnel, but it never destroys the former or creates a competing
+        // RemotePairing handshake.
+        let plan = DeviceMaintenanceTransport.plan
+        guard plan == .reuseWarmSession || plan == .reuseExistingTunnel else { return }
+        guard !LocationSimulationSession.isActive else { return }
 
         isReading = true
         LocationSimulationCommandQueue.shared.async { [weak self] in
             // Re-checked on the far side of the serial queue, where the state has
             // settled: a `simulate_location` that was mid-rebuild when the checks
             // above ran has returned by the time this block starts.
-            let outcome: Reading? = (LocationSimulationSession.isOpen || LocationSimulationSession.isMaintained)
+            let outcome: Reading? = LocationSimulationSession.isActive
                 ? nil
                 : Self.readFromDevice(reason: reason)
 
@@ -152,7 +143,7 @@ final class SigningExpiryMonitor: ObservableObject {
         }
 
         do {
-            let profiles = try JITEnableContext.shared.fetchAllProvisioningProfiles()
+            let profiles = try DeviceMaintenanceTransport.readProfiles()
             let expiry = AppSigningInfo.expirationDate(
                 forBundleIdentifier: bundleIdentifier,
                 in: profiles
@@ -201,6 +192,22 @@ final class SigningExpiryMonitor: ObservableObject {
             newReading.checkedAt.timeIntervalSince1970,
             forKey: UserDefaults.Keys.signingExpiryCheckedAt
         )
+        SigningExpiryNotificationScheduler.shared.scheduleIfAuthorized(
+            expirationDate: newReading.expirationDate
+        )
+    }
+
+    /// Commits a value only after the profile refresh pipeline has installed a
+    /// profile and reread it from misagent. Apple API output is never allowed to
+    /// call this method directly.
+    func recordAuthoritativeReading(expirationDate: Date?, checkedAt: Date) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async {
+                self.recordAuthoritativeReading(expirationDate: expirationDate, checkedAt: checkedAt)
+            }
+            return
+        }
+        store(Reading(expirationDate: expirationDate, checkedAt: checkedAt))
     }
 
     /// The timestamp is what records that a read ever happened, so its absence —

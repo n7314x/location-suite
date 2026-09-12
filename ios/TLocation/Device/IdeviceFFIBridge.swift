@@ -88,6 +88,21 @@ private enum IdeviceBridge {
         return value
     }
 
+    static func stringValue(from plist: plist_t?, fieldName: String) throws -> String {
+        guard let plist else {
+            throw makeError(message: "\(fieldName) was not returned by lockdownd")
+        }
+        var value: UnsafeMutablePointer<CChar>?
+        plist_get_string_val(plist, &value)
+        defer {
+            if let value { plist_mem_free(value) }
+        }
+        guard let value, let result = String(validatingUTF8: value), !result.isEmpty else {
+            throw makeError(message: "Failed to decode \(fieldName)")
+        }
+        return result
+    }
+
     static func withTunnelHandles<T>(
         for context: JITEnableContext,
         _ body: (OpaquePointer, OpaquePointer) throws -> T
@@ -142,6 +157,119 @@ private enum IdeviceBridge {
 
         return (adapterHandle, handshakeHandle)
     }
+
+    static func withExistingTunnelHandles<T>(
+        for context: JITEnableContext,
+        _ body: (OpaquePointer, OpaquePointer) throws -> T
+    ) throws -> T {
+        guard let adapter = context.adapterHandle,
+              let handshake = context.handshakeHandle else {
+            throw makeError(domain: "maintenance", message: "No existing device-management tunnel is available.")
+        }
+        return try body(adapter, handshake)
+    }
+
+    static func fetchAllProvisioningProfiles(
+        adapter: OpaquePointer,
+        handshake: OpaquePointer
+    ) throws -> [Data] {
+        try withConnectedClient(
+            fallback: "Failed to connect to misagent",
+            missingClientMessage: "Misagent client was not created",
+            domain: "profiles",
+            connect: { misagent_connect_rsd(adapter, handshake, $0) },
+            cleanup: { misagent_client_free($0) }
+        ) { misagentClient in
+            var profilePointers: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?
+            var profileLengths: UnsafeMutablePointer<Int>?
+            var profileCount = 0
+
+            if let ffiError = misagent_copy_all(
+                misagentClient,
+                &profilePointers,
+                &profileLengths,
+                &profileCount
+            ) {
+                throw consumeFFIError(
+                    ffiError,
+                    fallback: "Failed to fetch provisioning profiles",
+                    domain: "profiles"
+                )
+            }
+
+            defer {
+                if let profilePointers, let profileLengths {
+                    misagent_free_profiles(profilePointers, profileLengths, profileCount)
+                }
+            }
+
+            guard let profilePointers, let profileLengths else { return [] }
+            return (0..<profileCount).compactMap { index in
+                guard let bytes = profilePointers[index] else { return nil }
+                return Data(bytes: bytes, count: profileLengths[index])
+            }
+        }
+    }
+
+    static func installProvisioningProfile(
+        _ profile: Data,
+        adapter: OpaquePointer,
+        handshake: OpaquePointer
+    ) throws {
+        try withConnectedClient(
+            fallback: "Failed to connect to misagent",
+            missingClientMessage: "Misagent client was not created",
+            domain: "profiles",
+            connect: { misagent_connect_rsd(adapter, handshake, $0) },
+            cleanup: { misagent_client_free($0) }
+        ) { misagentClient in
+            let error = profile.withUnsafeBytes { buffer in
+                misagent_install(
+                    misagentClient,
+                    buffer.bindMemory(to: UInt8.self).baseAddress,
+                    profile.count
+                )
+            }
+            if let error {
+                throw consumeFFIError(
+                    error,
+                    fallback: "Failed to install the provisioning profile",
+                    domain: "profiles"
+                )
+            }
+        }
+    }
+
+    static func deviceIdentity(
+        adapter: OpaquePointer,
+        handshake: OpaquePointer
+    ) throws -> MaintenanceDeviceIdentity {
+        try withConnectedClient(
+            fallback: "Failed to connect to lockdownd",
+            missingClientMessage: "Lockdownd client was not created",
+            domain: "maintenance",
+            connect: { lockdownd_connect_rsd(adapter, handshake, $0) },
+            cleanup: { lockdownd_client_free($0) }
+        ) { client in
+            func read(_ key: String) throws -> String {
+                var value: plist_t?
+                if let error = lockdownd_get_value(client, key, nil, &value) {
+                    throw consumeFFIError(
+                        error,
+                        fallback: "Failed to query \(key)",
+                        domain: "maintenance"
+                    )
+                }
+                defer { if let value { plist_free(value) } }
+                return try stringValue(from: value, fieldName: key)
+            }
+
+            return MaintenanceDeviceIdentity(
+                udid: try read("UniqueDeviceID"),
+                name: try read("DeviceName")
+            )
+        }
+    }
 }
 
 extension JITEnableContext {
@@ -176,11 +304,11 @@ extension JITEnableContext {
 
     /// Every provisioning profile installed on this device, as raw CMS blobs.
     ///
-    /// Read-only, and deliberately the *only* misagent call in the app: nothing
-    /// here installs (`misagent_install`) or removes (`misagent_remove`) a
-    /// profile. These are the profiles iOS itself validates against, which is why
-    /// they are worth reading — unlike the bundle's `embedded.mobileprovision`,
-    /// they move when SideStore refreshes the app.
+    /// Read-only. The separate self-maintenance path may install with
+    /// `misagent_install`, but neither path removes profiles. These are the
+    /// profiles iOS itself validates against, which is why they are worth
+    /// reading — unlike the bundle's `embedded.mobileprovision`, they can move
+    /// after a profile-only refresh.
     ///
     /// Ownership, straight from `idevice.h`:
     ///
@@ -201,43 +329,7 @@ extension JITEnableContext {
     ///   through `withConnectedClient`'s `cleanup`.
     func fetchAllProvisioningProfiles() throws -> [Data] {
         try IdeviceBridge.withTunnelHandles(for: self) { adapter, handshake in
-            try IdeviceBridge.withConnectedClient(
-                fallback: "Failed to connect to misagent",
-                missingClientMessage: "Misagent client was not created",
-                domain: "profiles",
-                connect: { misagent_connect_rsd(adapter, handshake, $0) },
-                cleanup: { misagent_client_free($0) }
-            ) { misagentClient in
-                var profilePointers: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?
-                var profileLengths: UnsafeMutablePointer<Int>?
-                var profileCount = 0
-
-                if let ffiError = misagent_copy_all(misagentClient, &profilePointers, &profileLengths, &profileCount) {
-                    throw IdeviceBridge.consumeFFIError(
-                        ffiError,
-                        fallback: "Failed to fetch provisioning profiles",
-                        domain: "profiles"
-                    )
-                }
-
-                defer {
-                    if let profilePointers, let profileLengths {
-                        misagent_free_profiles(profilePointers, profileLengths, profileCount)
-                    }
-                }
-
-                guard let profilePointers, let profileLengths else { return [] }
-
-                var result: [Data] = []
-                result.reserveCapacity(profileCount)
-
-                for index in 0..<profileCount {
-                    guard let bytes = profilePointers[index] else { continue }
-                    result.append(Data(bytes: bytes, count: profileLengths[index]))
-                }
-
-                return result
-            }
+            try IdeviceBridge.fetchAllProvisioningProfiles(adapter: adapter, handshake: handshake)
         }
     }
 
@@ -401,6 +493,24 @@ enum LocationSimulationSession {
         return active
     }
 
+    /// Borrows the already-retained RSD transport. Callers run on
+    /// `LocationSimulationCommandQueue`, the only queue allowed to replace or
+    /// free these handles. Opening misagent/lockdownd as additional RSD services
+    /// leaves the retained LocationSimulation client and warm keeper untouched.
+    static func withWarmTunnelHandles<T>(
+        _ body: (OpaquePointer, OpaquePointer) throws -> T
+    ) throws -> T {
+        guard let adapter = LocationSimulationState.adapter,
+              let handshake = LocationSimulationState.handshake,
+              isOpen else {
+            throw SelfMaintenanceError(
+                category: .deviceTransportUnavailable,
+                message: "The retained device session is no longer available."
+            )
+        }
+        return try body(adapter, handshake)
+    }
+
     /// Called by the process-wide lifecycle manager as its single balanced
     /// long-lived activity starts and stops.
     static func setMaintained(_ newValue: Bool) {
@@ -444,6 +554,105 @@ enum LocationSimulationSession {
     private static func postSessionChanged() {
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: .locationSimulationSessionChanged, object: nil)
+        }
+    }
+}
+
+struct MaintenanceDeviceIdentity: Sendable {
+    let udid: String
+    let name: String
+}
+
+struct MaintenanceDeviceSnapshot: Sendable {
+    let identity: MaintenanceDeviceIdentity
+    let profiles: [Data]
+    let transport: MaintenanceTransportPlan
+}
+
+/// Device-service access for self-maintenance. This never creates or destroys a
+/// RemotePairing tunnel. It borrows the warm LocationSimulation transport when
+/// idle, otherwise the already-established JIT/RSD transport. An active
+/// simulation always wins and an LTE-only cold refresh is refused.
+enum DeviceMaintenanceTransport {
+    static var plan: MaintenanceTransportPlan {
+        MaintenanceTransportPlanner.plan(
+            warmSessionOpen: LocationSimulationSession.isOpen,
+            simulationActive: LocationSimulationSession.isActive,
+            existingTunnelAvailable: JITEnableContext.shared.hasExistingTunnelHandles,
+            cellular: TunnelManager.shared.underlyingNetwork == .cellular
+        )
+    }
+
+    static func snapshot() throws -> MaintenanceDeviceSnapshot {
+        let selectedPlan = plan
+        return try withHandles(plan: selectedPlan) { adapter, handshake in
+            MaintenanceDeviceSnapshot(
+                identity: try IdeviceBridge.deviceIdentity(adapter: adapter, handshake: handshake),
+                profiles: try IdeviceBridge.fetchAllProvisioningProfiles(
+                    adapter: adapter,
+                    handshake: handshake
+                ),
+                transport: selectedPlan
+            )
+        }
+    }
+
+    static func readProfiles() throws -> [Data] {
+        try withHandles(plan: plan) { adapter, handshake in
+            try IdeviceBridge.fetchAllProvisioningProfiles(
+                adapter: adapter,
+                handshake: handshake
+            )
+        }
+    }
+
+    static func installAndReadProfiles(_ profile: Data) throws -> [Data] {
+        try withHandles(plan: plan) { adapter, handshake in
+            try IdeviceBridge.installProvisioningProfile(
+                profile,
+                adapter: adapter,
+                handshake: handshake
+            )
+            return try IdeviceBridge.fetchAllProvisioningProfiles(
+                adapter: adapter,
+                handshake: handshake
+            )
+        }
+    }
+
+    private static func withHandles<T>(
+        plan: MaintenanceTransportPlan,
+        _ body: (OpaquePointer, OpaquePointer) throws -> T
+    ) throws -> T {
+        // Recheck on LocationSimulationCommandQueue immediately before touching
+        // a handle. A simulation may have started after the main-actor preflight
+        // but before this block reached the queue.
+        guard !LocationSimulationSession.isActive else {
+            throw SelfMaintenanceError(
+                category: .deviceTransportUnavailable,
+                message: "An active location simulation owns the device session. Stop it before refreshing signing; its warm session was not disturbed."
+            )
+        }
+        switch plan {
+        case .reuseWarmSession:
+            return try LocationSimulationSession.withWarmTunnelHandles(body)
+        case .reuseExistingTunnel:
+            return try IdeviceBridge.withExistingTunnelHandles(for: .shared, body)
+        case .blockedBySimulation:
+            throw SelfMaintenanceError(
+                category: .deviceTransportUnavailable,
+                message: "An active location simulation owns the device session. Stop it before refreshing signing; its warm session was not disturbed."
+            )
+        case .requireWiFi:
+            throw SelfMaintenanceError(
+                category: .deviceTransportUnavailable,
+                message: "A warm device session is not available on LTE. Connect Wi-Fi before refreshing signing; the existing warm simulation session was not disturbed."
+            )
+        case .unavailable:
+            throw SelfMaintenanceError(
+                category: .localDevVPNUnavailable,
+                message: "Connect LocalDevVPN and establish the device connection before refreshing signing."
+            )
         }
     }
 }

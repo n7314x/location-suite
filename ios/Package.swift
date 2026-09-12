@@ -21,7 +21,8 @@ let package = Package(
             sources: [
                 "ReleaseUpdateModels.swift",
                 "SigningExpiryPolicy.swift",
-                "ColdBootstrapModels.swift"
+                "ColdBootstrapModels.swift",
+                "SelfMaintenanceModels.swift"
             ]
         ),
         .target(
@@ -36,7 +37,8 @@ let package = Package(
             sources: [
                 "RouteEngineTests.swift",
                 "ReleaseUpdateTests.swift",
-                "ColdBootstrapTests.swift"
+                "ColdBootstrapTests.swift",
+                "SelfMaintenanceTests.swift"
             ]
         )
     ]
