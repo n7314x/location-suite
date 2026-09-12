@@ -61,7 +61,11 @@ for name in tracked:
     except UnicodeDecodeError:
         continue
 
-    # Remove trailing spaces/tabs and guarantee exactly one final newline.
+	# Leave completely empty files alone.
+    if original == "":
+        continue
+
+    # Remove trailing spaces/tabs and guarantee one final newline.
     lines = [line.rstrip() for line in original.splitlines()]
     formatted = "\n".join(lines) + "\n"
 
