@@ -59,6 +59,14 @@ error. Logs contain only operation categories for refresh failures. The 2FA code
 crosses a synchronous callback, is submitted to Apple, then is discarded; it is
 not logged or persisted.
 
+The first physical Gate 1 attempt on iOS 27 stopped in the Rust panic boundary.
+The pinned isideload revision enables reqwest's `rustls-no-provider` feature, so
+Location Suite now installs isideload's ring provider before constructing the
+anisette client, as that revision's own example requires. A caught panic is
+reported as `signingCorePanic` with the latest safe stage and a one-line,
+redacted string payload. Non-string payloads report only the stage. Response
+bodies and backtraces are never returned to the UI.
+
 Current isideload does not expose a reusable authenticated Apple session/token
 that survives process launch. The developer session therefore remains in memory
 only. Routine foreground renewal after relaunch requires either password entry

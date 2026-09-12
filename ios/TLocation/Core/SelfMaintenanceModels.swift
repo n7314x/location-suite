@@ -7,6 +7,7 @@ enum SelfMaintenanceFailureCategory: String, Codable, CaseIterable, Sendable {
     case twoFactorCancelled
     case grandSlamUnavailable
     case developerSessionFailed
+    case signingCorePanic
     case teamSelectionFailed
     case deviceRegistrationFailed
     case certificateUnavailable

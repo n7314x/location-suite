@@ -16,6 +16,13 @@ private final class FakeSecretStorage: SecretStorage, @unchecked Sendable {
 }
 
 struct SelfMaintenancePolicyTests {
+    @Test func signingCorePanicCategoryDecodesWithoutCollapsingToUnknown() throws {
+        let payload = #"{"category":"signingCorePanic","message":"Signing core panic during appleLogin."}"#
+        let error = try JSONDecoder().decode(SelfMaintenanceError.self, from: Data(payload.utf8))
+        #expect(error.category == .signingCorePanic)
+        #expect(error.message == "Signing core panic during appleLogin.")
+    }
+
     @Test func expiryThresholdStartsAt72Hours() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let base = SigningRefreshHistory.empty
