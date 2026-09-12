@@ -316,8 +316,8 @@ pub(crate) fn apple_login_category(chain: &str) -> &'static str {
     let mentions_anisette = lower.contains("anisette") || lower.contains("provisioning socket");
 
     if lower.contains("status 429")
-            || lower.contains("http 429")
-            || lower.contains("too many requests")
+        || lower.contains("http 429")
+        || lower.contains("too many requests")
     {
         "appleRateLimited"
     } else if mentions_anisette
