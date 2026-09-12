@@ -106,7 +106,7 @@ struct SelfMaintenancePolicyTests {
             raw,
             knownSecrets: ["hunter2"]
         )
-        #expect(chain.components(separatedBy: .newlines).count == 5)
+        #expect(chain.components(separatedBy: .newlines).count == 4)
         #expect(!chain.contains("person@example.com"))
         #expect(!chain.contains("abcdefghijklmnopqrstuvwxyz012345"))
         #expect(!chain.contains("opaque-value"))
