@@ -143,6 +143,7 @@ struct SettingsView: View {
     @State private var simulationSessionOpen = LocationSimulationSession.isOpen
     @State private var simulationActive = LocationSimulationSession.isActive
     @State private var isDisconnectingSession = false
+    @State private var diagnosticsCopied = false
 
     /// Watched, not owned. Holds the last signing expiry read from the device;
     /// this view shows it and asks for a refresh, and never reads the app bundle.
@@ -308,6 +309,20 @@ struct SettingsView: View {
                 updateSection
 
                 Section("Connection Diagnostics") {
+                    Button {
+                        UIPasteboard.general.string = connectionDiagnosticsText
+                        diagnosticsCopied = true
+
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            diagnosticsCopied = false
+                        }
+                    } label: {
+                        Label(
+                            diagnosticsCopied ? "Copied Diagnostics" : "Copy Diagnostics",
+                            systemImage: diagnosticsCopied ? "checkmark.circle.fill" : "doc.on.doc"
+                        )
+                    }
+
                     diagnosticRow("Underlying Network", value: tunnel.underlyingNetwork.rawValue)
                     diagnosticRow(
                         "Fresh LocalDevVPN Endpoint Reachable",
@@ -523,6 +538,77 @@ struct SettingsView: View {
             Text("Existing DDI files will be removed before downloading fresh copies.")
         }
     }
+
+    private var connectionDiagnosticsText: String {
+    let yes = String(localized: "Yes")
+    let no = String(localized: "No")
+
+    var lines: [String] = [
+        "Location Suite Connection Diagnostics",
+        "App Version: \(appVersion)",
+        "iOS Version: \(UIDevice.current.systemVersion)",
+        "",
+        "Underlying Network: \(tunnel.underlyingNetwork.rawValue)",
+        "Fresh LocalDevVPN Endpoint Reachable: \(tunnel.endpointReachability.rawValue)",
+        "RemotePairing Transport: \(tunnel.isConnected ? yes : no)",
+        "DDI Ready: \(mounting.coolisMounted ? yes : no)",
+        "Simulation Service Session: \(simulationSessionOpen ? yes : no)",
+        "Simulation Active: \(simulationActive ? yes : no)",
+        "Coordinate Producer: \(String(describing: LocationSimulationOwnership.shared.currentProducer).capitalized)",
+        "Warm Session Keeper: \(warmSessionKeeper.isIdleKeeperActive ? "Active" : "Inactive")",
+        "Last Warm Heartbeat: \(warmSessionKeeper.lastHeartbeat.map { syncTimestampFormatter.string(from: $0) } ?? "Never")",
+        "Warm Heartbeat Failures: \(warmSessionKeeper.heartbeatFailureCount)",
+        "Warm Session State: \(warmSessionKeeper.state.rawValue)",
+        "Target: \(DeviceConnectionContext.targetIPAddress):49152"
+    ]
+
+    if let trace = tunnel.lastColdBootstrap {
+        lines.append("")
+        lines.append("Cold Bootstrap Stage: \(trace.finalStage.displayName)")
+        lines.append("Cold Bootstrap Result: \(trace.resultDescription)")
+        lines.append(
+            "Last Cold Bootstrap Attempt: \(syncTimestampFormatter.string(from: trace.timestamp))"
+        )
+        lines.append(
+            "Last Cold Bootstrap Duration: \(String(format: "%.3f s", trace.totalElapsed))"
+        )
+        lines.append("Cold Bootstrap Retry Count: \(trace.retryCount)")
+
+        lines.append("Cold Bootstrap Stage Timings:")
+
+        for measurement in trace.measurements {
+            let elapsed = measurement.elapsed.map {
+                String(format: "%.3fs", $0)
+            } ?? "combined"
+
+            lines.append(
+                "  #\(measurement.attempt) \(measurement.stage.displayName): \(elapsed)"
+            )
+        }
+
+        if let failure = trace.failure {
+            lines.append("Last Socket Error: \(failure.detail)")
+            lines.append(
+                "Last errno: \(failure.errno.map(String.init) ?? "Not available")"
+            )
+            lines.append("Failure Message: \(failure.userMessage)")
+        }
+    } else {
+        lines.append("")
+        lines.append("Cold Bootstrap Result: Not attempted")
+    }
+
+    if let category = tunnel.lastConnectionFailureCategory {
+        lines.append("")
+        lines.append("Last Connection Failure: \(category.rawValue)")
+
+        if let detail = tunnel.lastConnectionFailure {
+            lines.append("Failure Detail: \(detail)")
+        }
+    }
+
+    return lines.joined(separator: "\n")
+}
 
     private func diagnosticRow(_ title: LocalizedStringKey, value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
