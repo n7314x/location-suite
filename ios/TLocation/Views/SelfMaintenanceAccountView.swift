@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SelfMaintenanceAccountView: View {
     @ObservedObject private var maintenance = SelfMaintenanceService.shared
@@ -14,6 +15,7 @@ struct SelfMaintenanceAccountView: View {
     @State private var password = ""
     @State private var verificationCode = ""
     @State private var technicalDetailsExpanded = true
+    @State private var technicalDetailsCopied = false
 
     var body: some View {
         Form {
@@ -120,6 +122,22 @@ struct SelfMaintenanceAccountView: View {
                             Text(error.technicalDetail)
                                 .font(.caption)
                                 .textSelection(.enabled)
+
+                            Button {
+                                UIPasteboard.general.string = error.technicalDetail
+                                technicalDetailsCopied = true
+
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    technicalDetailsCopied = false
+                                }
+                            } label: {
+                                Label(
+                                    technicalDetailsCopied ? "Copied" : "Copy Technical Details",
+                                    systemImage: technicalDetailsCopied
+                                        ? "checkmark.circle.fill"
+                                        : "doc.on.doc"
+                                )
+                            }
                         }
                     }
                     if let stage = error.stage, !stage.isEmpty {
