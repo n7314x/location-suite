@@ -5,6 +5,7 @@
 //  Adapts the route domain to the existing phone-local simulation session.
 //
 
+import Combine
 import Foundation
 import UIKit
 
@@ -51,7 +52,10 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
         guard result.statusCode == 0 else {
             if let bootstrapError = result.coldBootstrapTrace?.failure {
                 throw RoutePlaybackFailure(
-                    reason: Self.failureReason(for: bootstrapError.category),
+                    reason: LTEPreparationRecoveryPolicy.shouldOffer(
+                        trace: result.coldBootstrapTrace,
+                        warmSessionOpen: LocationSimulationSession.isOpen
+                    ) ? .lteSessionPreparationRequired : Self.failureReason(for: bootstrapError.category),
                     message: bootstrapError.userMessage
                 )
             }
@@ -136,6 +140,130 @@ struct DeviceRouteLocationSimulationSink: RouteLocationSimulationSink {
 private struct DeviceLocationSimulationSessionStatus: LocationSimulationSessionStatusProviding {
     var isSessionOpen: Bool { LocationSimulationSession.isOpen }
     var isSimulationActive: Bool { LocationSimulationSession.isActive }
+}
+
+enum LocationSimulationPreparationOutcome: Sendable {
+    case ready(reusedOpenSession: Bool)
+    case failed(LocationSimulationAttemptResult)
+    /// Point, Route, or Disconnect advanced ownership while preparation was
+    /// queued or inside its synchronous FFI call.
+    case superseded
+}
+
+/// Coordinates the UI-facing prepare action with the same ownership generation,
+/// command queue, handles, and idle keeper used by Point and Route.
+@MainActor
+final class LocationSimulationSessionPreparer: ObservableObject {
+    static let shared = LocationSimulationSessionPreparer()
+
+    @Published private(set) var isPreparing = false
+
+    private enum QueueOutcome: Sendable {
+        case ready(
+            result: LocationSimulationAttemptResult,
+            reusedOpenSession: Bool,
+            preparationLease: LocationSimulationPreparationLease,
+            idleLease: LocationSimulationIdleLease
+        )
+        case failed(
+            result: LocationSimulationAttemptResult,
+            preparationLease: LocationSimulationPreparationLease
+        )
+        case superseded(preparationLease: LocationSimulationPreparationLease)
+    }
+
+    private init() {}
+
+    func prepare() async -> LocationSimulationPreparationOutcome {
+        if isPreparing { return .superseded }
+
+        let ownership = LocationSimulationOwnership.shared
+        guard let preparationLease = ownership.beginPreparation() else {
+            // An active producer or another preparation is authoritative. This
+            // operation never steals a Point/Route lease merely to call it idle.
+            return .superseded
+        }
+
+        isPreparing = true
+        DeviceRoutePlaybackActivityManager.shared.simulationPreparationWillBegin(preparationLease)
+
+        let deviceIP = DeviceConnectionContext.targetIPAddress
+        let pairingFilePath = PairingFileStore.prepareURL().path
+        let network = TunnelManager.shared.underlyingNetwork.rawValue
+
+        let queueOutcome: QueueOutcome = await withCheckedContinuation { continuation in
+            LocationSimulationCommandQueue.shared.async {
+                guard ownership.isCurrent(preparationLease) else {
+                    continuation.resume(returning: .superseded(
+                        preparationLease: preparationLease
+                    ))
+                    return
+                }
+
+                let reusedOpenSession = LocationSimulationSession.isOpen
+                let result = prepare_location_simulation_session_detailed(
+                    deviceIP,
+                    pairingFilePath,
+                    underlyingNetwork: network
+                )
+
+                guard ownership.isCurrent(preparationLease) else {
+                    continuation.resume(returning: .superseded(
+                        preparationLease: preparationLease
+                    ))
+                    return
+                }
+
+                if result.statusCode == 0,
+                   let idleLease = ownership.finishPreparation(preparationLease) {
+                    continuation.resume(returning: .ready(
+                        result: result,
+                        reusedOpenSession: reusedOpenSession,
+                        preparationLease: preparationLease,
+                        idleLease: idleLease
+                    ))
+                } else {
+                    _ = ownership.cancelPreparation(preparationLease)
+                    continuation.resume(returning: .failed(
+                        result: result,
+                        preparationLease: preparationLease
+                    ))
+                }
+            }
+        }
+
+        isPreparing = false
+        switch queueOutcome {
+        case .ready(let result, let reused, let lease, let idleLease):
+            guard DeviceRoutePlaybackActivityManager.shared.simulationPreparationDidSucceed(
+                lease,
+                idleLease: idleLease
+            ) else {
+                _ = DeviceRoutePlaybackActivityManager.shared.simulationPreparationDidFail(lease)
+                return .superseded
+            }
+            TunnelManager.shared.recordPreparationResult(
+                result,
+                reusedOpenSession: reused
+            )
+            MountingProgress.shared.recordDeveloperServiceReady()
+            return .ready(reusedOpenSession: reused)
+
+        case .failed(let result, let lease):
+            guard DeviceRoutePlaybackActivityManager.shared.simulationPreparationDidFail(lease) else {
+                return .superseded
+            }
+            TunnelManager.shared.recordPreparationResult(
+                result,
+                reusedOpenSession: false
+            )
+            return .failed(result)
+
+        case .superseded(let lease):
+            _ = DeviceRoutePlaybackActivityManager.shared.simulationPreparationDidFail(lease)
+            return .superseded
+        }
+    }
 }
 
 private final class DeviceWarmHeartbeatDriver: WarmLocationSimulationHeartbeatPerforming, @unchecked Sendable {
@@ -252,6 +380,28 @@ final class DeviceRoutePlaybackActivityManager: RoutePlaybackActivityManaging {
         guard LocationSimulationOwnership.shared.isCurrent(lease) else { return }
         sessionKeeper.producerDidTakeOwnership(lease)
         beginBackgroundTask()
+    }
+
+    func simulationPreparationWillBegin(_ lease: LocationSimulationPreparationLease) {
+        sessionKeeper.preparationWillBegin(lease)
+        beginBackgroundTask()
+    }
+
+    @discardableResult
+    func simulationPreparationDidSucceed(
+        _ lease: LocationSimulationPreparationLease,
+        idleLease: LocationSimulationIdleLease
+    ) -> Bool {
+        let accepted = sessionKeeper.preparationDidSucceed(lease, idleLease: idleLease)
+        if accepted { endBackgroundTask() }
+        return accepted
+    }
+
+    @discardableResult
+    func simulationPreparationDidFail(_ lease: LocationSimulationPreparationLease) -> Bool {
+        let accepted = sessionKeeper.preparationDidFail(lease)
+        if accepted { endBackgroundTask() }
+        return accepted
     }
 
     func simulationDidEnd(

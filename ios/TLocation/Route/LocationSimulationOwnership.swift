@@ -29,6 +29,13 @@ struct LocationSimulationIdleLease: Equatable, Sendable {
     fileprivate let generation: UInt64
 }
 
+/// Exclusive reservation for opening an idle session without claiming a
+/// coordinate producer. Point, Route, Return, or Disconnect invalidates it by
+/// advancing the same generation used by every other lifecycle command.
+struct LocationSimulationPreparationLease: Equatable, Sendable {
+    fileprivate let generation: UInt64
+}
+
 /// Lock-guarded process-wide ownership for the shared location-simulation
 /// handle. Callers capture a lease when they become the producer, then recheck
 /// it on `LocationSimulationCommandQueue` immediately before touching the FFI.
@@ -39,6 +46,7 @@ final class LocationSimulationOwnership: @unchecked Sendable {
     private let lock = NSLock()
     private var generation: UInt64 = 0
     private var producer: LocationSimulationProducer = .none
+    private var preparationInProgress = false
     private var sessionOpen = false
 
     init() {}
@@ -50,6 +58,7 @@ final class LocationSimulationOwnership: @unchecked Sendable {
         defer { lock.unlock() }
         generation &+= 1
         producer = newProducer
+        preparationInProgress = false
         return LocationSimulationProducerLease(producer: newProducer, generation: generation)
     }
 
@@ -62,6 +71,7 @@ final class LocationSimulationOwnership: @unchecked Sendable {
         guard producer == lease.producer, generation == lease.generation else { return false }
         generation &+= 1
         producer = .none
+        preparationInProgress = false
         return true
     }
 
@@ -77,7 +87,53 @@ final class LocationSimulationOwnership: @unchecked Sendable {
             : LocationSimulationProducerLease(producer: producer, generation: generation)
         generation &+= 1
         producer = .none
+        preparationInProgress = false
         return previous
+    }
+
+    /// Reserves the no-producer generation before preparation is queued. A
+    /// second preparation cannot start, and producer/disconnect claims can
+    /// supersede this reservation through the normal generation mechanism.
+    func beginPreparation() -> LocationSimulationPreparationLease? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard producer == .none, !preparationInProgress else { return nil }
+        generation &+= 1
+        preparationInProgress = true
+        return LocationSimulationPreparationLease(generation: generation)
+    }
+
+    func isCurrent(_ lease: LocationSimulationPreparationLease) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return producer == .none
+            && preparationInProgress
+            && generation == lease.generation
+    }
+
+    /// Converts a successful preparation reservation into the idle lease the
+    /// existing heartbeat keeper already understands.
+    func finishPreparation(
+        _ lease: LocationSimulationPreparationLease
+    ) -> LocationSimulationIdleLease? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard producer == .none,
+              preparationInProgress,
+              generation == lease.generation else { return nil }
+        preparationInProgress = false
+        return LocationSimulationIdleLease(generation: generation)
+    }
+
+    @discardableResult
+    func cancelPreparation(_ lease: LocationSimulationPreparationLease) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard producer == .none,
+              preparationInProgress,
+              generation == lease.generation else { return false }
+        preparationInProgress = false
+        return true
     }
 
     func isCurrent(_ lease: LocationSimulationProducerLease) -> Bool {
@@ -91,14 +147,16 @@ final class LocationSimulationOwnership: @unchecked Sendable {
     func idleLease() -> LocationSimulationIdleLease? {
         lock.lock()
         defer { lock.unlock() }
-        guard producer == .none else { return nil }
+        guard producer == .none, !preparationInProgress else { return nil }
         return LocationSimulationIdleLease(generation: generation)
     }
 
     func isCurrent(_ lease: LocationSimulationIdleLease) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return producer == .none && generation == lease.generation
+        return producer == .none
+            && !preparationInProgress
+            && generation == lease.generation
     }
 
     var currentProducer: LocationSimulationProducer {

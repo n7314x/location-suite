@@ -139,9 +139,11 @@ struct SettingsView: View {
     /// change the user makes over in system Settings.
     @ObservedObject private var backgroundLocation = BackgroundLocationManager.shared
     @ObservedObject private var warmSessionKeeper = DeviceRoutePlaybackActivityManager.shared.sessionKeeper
+    @ObservedObject private var sessionPreparer = LocationSimulationSessionPreparer.shared
     @State private var simulationSessionOpen = LocationSimulationSession.isOpen
     @State private var simulationActive = LocationSimulationSession.isActive
     @State private var isDisconnectingSession = false
+    @State private var preparationMessage: (text: String, isError: Bool)?
 
     /// Watched, not owned. Holds the last signing expiry read from the device;
     /// this view shows it and asks for a refresh, and never reads the app bundle.
@@ -306,6 +308,36 @@ struct SettingsView: View {
                 updateSection
 
                 Section("Connection Diagnostics") {
+                    Button {
+                        prepareLTESessionPressed()
+                    } label: {
+                        Label("Prepare LTE Session", systemImage: "antenna.radiowaves.left.and.right")
+                    }
+                    .disabled(!pairingFileExists || simulationActive || sessionPreparer.isPreparing)
+
+                    if sessionPreparer.isPreparing {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Opening RemotePairing and LocationSimulation without setting a coordinate…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if let preparationMessage {
+                        Label(
+                            preparationMessage.text,
+                            systemImage: preparationMessage.isError
+                                ? "exclamationmark.triangle.fill"
+                                : "checkmark.circle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(preparationMessage.isError ? .red : .green)
+                        .textSelection(.enabled)
+                    } else {
+                        Text("With LocalDevVPN connected, this opens and retains an idle developer session without selecting or sending a location. For cold cellular recovery, keep Wi-Fi off and turn on Airplane Mode before tapping; Location Suite does not change those settings itself.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     diagnosticRow("Underlying Network", value: tunnel.underlyingNetwork.rawValue)
                     diagnosticRow(
                         "Fresh LocalDevVPN Endpoint Reachable",
@@ -313,7 +345,9 @@ struct SettingsView: View {
                     )
                     diagnosticRow(
                         "RemotePairing Transport",
-                        value: tunnel.isConnected ? String(localized: "Yes") : String(localized: "No")
+                        value: (tunnel.isConnected || simulationSessionOpen)
+                            ? String(localized: "Yes")
+                            : String(localized: "No")
                     )
                     diagnosticRow(
                         "DDI Ready",
@@ -353,6 +387,7 @@ struct SettingsView: View {
                     diagnosticRow("Target", value: "\(DeviceConnectionContext.targetIPAddress):49152")
 
                     if let trace = tunnel.lastColdBootstrap {
+                        diagnosticRow("Cold Bootstrap Operation", value: trace.operation.displayName)
                         diagnosticRow("Cold Bootstrap Stage", value: trace.finalStage.displayName)
                         diagnosticRow("Cold Bootstrap Result", value: trace.resultDescription)
                         diagnosticRow(
@@ -530,6 +565,41 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.trailing)
                 .textSelection(.enabled)
+        }
+    }
+
+    private func prepareLTESessionPressed() {
+        guard pairingFileExists, !sessionPreparer.isPreparing else { return }
+        preparationMessage = nil
+        Task { @MainActor in
+            let outcome = await sessionPreparer.prepare()
+            switch outcome {
+            case .ready(let reusedOpenSession):
+                preparationMessage = (
+                    reusedOpenSession
+                        ? String(localized: "LTE session is already ready and was retained. You can turn Airplane Mode off.")
+                        : String(localized: "LTE session ready. You can turn Airplane Mode off."),
+                    false
+                )
+            case .failed(let result):
+                if let failure = result.coldBootstrapTrace?.failure {
+                    let errnoLine = failure.errno.map { " • errno \($0)" } ?? ""
+                    preparationMessage = (
+                        "\(failure.userMessage) Stage: \(failure.stage.displayName) • Status \(failure.statusCode)\(errnoLine) • \(failure.detail)",
+                        true
+                    )
+                } else {
+                    preparationMessage = (
+                        String(localized: "Session preparation failed with status \(result.statusCode)."),
+                        true
+                    )
+                }
+            case .superseded:
+                preparationMessage = (
+                    String(localized: "Preparation was superseded by another Point, Route, or Disconnect Session action."),
+                    true
+                )
+            }
         }
     }
 

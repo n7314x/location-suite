@@ -9,6 +9,21 @@ import Foundation
 import idevice
 import Darwin
 
+/// Serializes only creation of fresh RemotePairing transports. The retained
+/// LocationSimulation handles remain confined to LocationSimulationCommandQueue;
+/// this gate also covers JIT/DDI callers that may create their separate tunnel
+/// from another queue, preventing two handshakes from occupying 10.7.0.1:49152
+/// at the same instant.
+enum RemotePairingHandshakeGate {
+    private static let lock = NSLock()
+
+    static func withLock<T>(_ operation: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation()
+    }
+}
+
 final class JITEnableContext {
     static let shared = JITEnableContext()
 
@@ -150,19 +165,28 @@ final class JITEnableContext {
         }
 
         var tunnel = TunnelHandles()
-        let ffiError = hostname.withCString { hostname in
-            withUnsafePointer(to: &addr) { pointer in
-                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    tunnel_create_rppairing(
-                        $0,
-                        socklen_t(MemoryLayout<sockaddr_in>.stride),
-                        hostname,
-                        pairingFile,
-                        nil,
-                        nil,
-                        &tunnel.adapter,
-                        &tunnel.handshake
-                    )
+        let ffiError = try RemotePairingHandshakeGate.withLock {
+            guard !LocationSimulationSession.isOpen,
+                  !LocationSimulationSession.isMaintained else {
+                throw makeError(
+                    "Fresh JIT tunnel creation deferred while LocationSimulation owns the phone-local connection.",
+                    code: -19
+                )
+            }
+            return hostname.withCString { hostname in
+                withUnsafePointer(to: &addr) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        tunnel_create_rppairing(
+                            $0,
+                            socklen_t(MemoryLayout<sockaddr_in>.stride),
+                            hostname,
+                            pairingFile,
+                            nil,
+                            nil,
+                            &tunnel.adapter,
+                            &tunnel.handshake
+                        )
+                    }
                 }
             }
         }

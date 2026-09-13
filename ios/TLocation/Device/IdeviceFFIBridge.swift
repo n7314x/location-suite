@@ -471,7 +471,60 @@ func simulate_location_detailed(
     _ pairingFile: String,
     underlyingNetwork: String
 ) -> LocationSimulationAttemptResult {
+    perform_location_simulation_bootstrap_detailed(
+        deviceIP,
+        pairingFile,
+        underlyingNetwork: underlyingNetwork,
+        operation: .coordinate(latitude: latitude, longitude: longitude)
+    )
+}
+
+/// Opens and retains the complete phone-local LocationSimulation service stack
+/// without ever setting a coordinate. Callers must serialize this on
+/// `LocationSimulationCommandQueue` and transfer a current idle ownership lease
+/// to the warm-session keeper after success.
+func prepare_location_simulation_session_detailed(
+    _ deviceIP: String,
+    _ pairingFile: String,
+    underlyingNetwork: String
+) -> LocationSimulationAttemptResult {
+    perform_location_simulation_bootstrap_detailed(
+        deviceIP,
+        pairingFile,
+        underlyingNetwork: underlyingNetwork,
+        operation: .prepareSession
+    )
+}
+
+private enum LocationSimulationBootstrapOperation {
+    case prepareSession
+    case coordinate(latitude: Double, longitude: Double)
+
+    var diagnosticOperation: ColdBootstrapOperation {
+        switch self {
+        case .prepareSession: return .sessionPreparation
+        case .coordinate: return .coordinateSimulation
+        }
+    }
+}
+
+private func perform_location_simulation_bootstrap_detailed(
+    _ deviceIP: String,
+    _ pairingFile: String,
+    underlyingNetwork: String,
+    operation: LocationSimulationBootstrapOperation
+) -> LocationSimulationAttemptResult {
     if let locationSimulation = LocationSimulationState.locationSimulation {
+        guard case .coordinate(let latitude, let longitude) = operation else {
+            // The retained handle is the prepared service session. Reusing it
+            // must not issue even a coordinate-free service command: the
+            // existing idle keeper already owns heartbeat validation.
+            return LocationSimulationAttemptResult(
+                statusCode: LocationSimulationStatus.ok,
+                coldBootstrapTrace: nil
+            )
+        }
+
         if let ffiError = location_simulation_set(locationSimulation, latitude, longitude) {
             // Not an error yet: the code below rebuilds the session from
             // scratch and either succeeds or logs why it did not. Worth a line
@@ -511,6 +564,7 @@ func simulate_location_detailed(
                 targetHost: deviceIP,
                 targetPort: 49152,
                 underlyingNetwork: underlyingNetwork,
+                operation: operation.diagnosticOperation,
                 measurements: measurements,
                 retryCount: retryCount,
                 totalElapsed: Date().timeIntervalSince(startedAt),
@@ -543,6 +597,7 @@ func simulate_location_detailed(
 
     let inetResult = deviceIP.withCString { inet_pton(AF_INET, $0, &address.sin_addr) }
     guard inetResult == 1 else {
+        LocationSimulationState.cleanup()
         LogManager.shared.addErrorLog(
             "simulate_location failed (code \(LocationSimulationStatus.invalidIP)): “\(deviceIP)” is not a valid IPv4 address. Check the target device IP in Settings."
         )
@@ -563,6 +618,7 @@ func simulate_location_detailed(
             "simulate_location failed (code \(LocationSimulationStatus.pairingRead)): could not read the pairing file — \(BootstrapDiagnosticPrivacy.sanitize(ffi?.message ?? "no upstream detail"))"
         )
         idevice_error_free(pairingError)
+        LocationSimulationState.cleanup()
         let failure = directFailure(
             stage: .remotePairing,
             statusCode: LocationSimulationStatus.pairingRead,
@@ -574,6 +630,7 @@ func simulate_location_detailed(
     }
 
     guard let pairingHandle else {
+        LocationSimulationState.cleanup()
         LogManager.shared.addErrorLog(
             "simulate_location failed (code \(LocationSimulationStatus.pairingRead)): reading the pairing file reported success but returned no handle"
         )
@@ -597,18 +654,20 @@ func simulate_location_detailed(
         ))
 
         let providerStartedAt = Date()
-        let providerError = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                tunnel_create_rppairing(
-                    $0,
-                    socklen_t(MemoryLayout<sockaddr_in>.stride),
-                    "TLocationSimulation",
-                    pairingHandle,
-                    nil,
-                    nil,
-                    &LocationSimulationState.adapter,
-                    &LocationSimulationState.handshake
-                )
+        let providerError = RemotePairingHandshakeGate.withLock {
+            withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    tunnel_create_rppairing(
+                        $0,
+                        socklen_t(MemoryLayout<sockaddr_in>.stride),
+                        "TLocationSimulation",
+                        pairingHandle,
+                        nil,
+                        nil,
+                        &LocationSimulationState.adapter,
+                        &LocationSimulationState.handshake
+                    )
+                }
             }
         }
 
@@ -646,6 +705,18 @@ func simulate_location_detailed(
             )
             Thread.sleep(forTimeInterval: delay)
             continue
+        }
+
+        guard LocationSimulationState.adapter != nil,
+              LocationSimulationState.handshake != nil else {
+            let failure = directFailure(
+                stage: .remotePairing,
+                statusCode: LocationSimulationStatus.providerCreate,
+                category: .remotePairingFailed,
+                detail: "RemotePairing reported success without returning complete transport handles."
+            )
+            LocationSimulationState.cleanup()
+            return result(statusCode: LocationSimulationStatus.providerCreate, failure: failure)
         }
 
         // Upstream exposes tunnel_create_rppairing as one synchronous call. Its
@@ -697,6 +768,16 @@ func simulate_location_detailed(
             Thread.sleep(forTimeInterval: delay)
             continue
         }
+        guard LocationSimulationState.remoteServer != nil else {
+            let failure = directFailure(
+                stage: .rsdConnect,
+                statusCode: LocationSimulationStatus.remoteServer,
+                category: .rsdFailed,
+                detail: "RSD reported success without returning a RemoteServer handle."
+            )
+            LocationSimulationState.cleanup()
+            return result(statusCode: LocationSimulationStatus.remoteServer, failure: failure)
+        }
         measurements.append(ColdBootstrapStageMeasurement(
             attempt: attempt,
             stage: .rsdConnect,
@@ -727,6 +808,16 @@ func simulate_location_detailed(
             LocationSimulationState.cleanup()
             return result(statusCode: LocationSimulationStatus.locationSimulation, failure: failure)
         }
+        guard LocationSimulationState.locationSimulation != nil else {
+            let failure = directFailure(
+                stage: .locationSimulationChannel,
+                statusCode: LocationSimulationStatus.locationSimulation,
+                category: .dvtFailed,
+                detail: "DVT reported success without returning a LocationSimulation handle."
+            )
+            LocationSimulationState.cleanup()
+            return result(statusCode: LocationSimulationStatus.locationSimulation, failure: failure)
+        }
         measurements.append(ColdBootstrapStageMeasurement(
             attempt: attempt,
             stage: .locationSimulationChannel,
@@ -742,6 +833,25 @@ func simulate_location_detailed(
         // something to tear down: if the set fails, `cleanup()` retracts the flag on
         // its way out, so the two can never disagree.
         LocationSimulationSession.set(open: true)
+
+        if case .prepareSession = operation {
+            // Preparation deliberately stops here. In particular, do not call
+            // location_simulation_set or manufacture a coordinateSet stage.
+            LocationSimulationSession.set(active: false)
+            measurements.append(ColdBootstrapStageMeasurement(
+                attempt: attempt,
+                stage: .ready,
+                elapsed: nil
+            ))
+            LogManager.shared.addInfoLog(
+                "prepare_location_simulation_session: cold bootstrap reached Ready on attempt \(attempt) without setting a coordinate"
+            )
+            return result(statusCode: LocationSimulationStatus.ok, failure: nil)
+        }
+
+        guard case .coordinate(let latitude, let longitude) = operation else {
+            preconditionFailure("Unhandled location simulation bootstrap operation")
+        }
 
         let coordinateStartedAt = Date()
         let locationSetError = location_simulation_set(
