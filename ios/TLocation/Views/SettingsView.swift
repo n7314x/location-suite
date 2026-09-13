@@ -85,6 +85,7 @@ struct SettingsView: View {
     /// of an already-active simulation, never the initial "Simulate Location"
     /// call, the pin, or anything else shown on screen.
     @AppStorage("naturalGPSDrift") private var naturalGPSDrift = false
+    @AppStorage(UserDefaults.Keys.autoRefreshSigning) private var autoRefreshSigning = true
 
     /// Mirrors `LanguageSettings.selected`; the `onChange` below is what writes
     /// the matching `AppleLanguages` override.
@@ -144,10 +145,12 @@ struct SettingsView: View {
     @State private var simulationActive = LocationSimulationSession.isActive
     @State private var isDisconnectingSession = false
     @State private var preparationMessage: (text: String, isError: Bool)?
+    @State private var diagnosticsCopied = false
 
     /// Watched, not owned. Holds the last signing expiry read from the device;
     /// this view shows it and asks for a refresh, and never reads the app bundle.
     @ObservedObject private var signing = SigningExpiryMonitor.shared
+    @ObservedObject private var maintenance = SelfMaintenanceService.shared
     @ObservedObject private var updates = UpdateService.shared
     @ObservedObject private var tunnel = TunnelManager.shared
     @ObservedObject private var mounting = MountingProgress.shared
@@ -275,9 +278,9 @@ struct SettingsView: View {
 
                 bookmarkSyncSection
 
-                Section("Advanced") {
-                    signingExpiryRows
+                selfMaintenanceSection
 
+                Section("Advanced") {
                     HStack {
                         Text("Target Device IP")
                         Spacer()
@@ -336,6 +339,20 @@ struct SettingsView: View {
                         Text("With LocalDevVPN connected, this opens and retains an idle developer session without selecting or sending a location. For cold cellular recovery, keep Wi-Fi off and turn on Airplane Mode before tapping; Location Suite does not change those settings itself.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+
+                    Button {
+                        UIPasteboard.general.string = connectionDiagnosticsText
+                        diagnosticsCopied = true
+
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            diagnosticsCopied = false
+                        }
+                    } label: {
+                        Label(
+                            diagnosticsCopied ? "Copied Diagnostics" : "Copy Diagnostics",
+                            systemImage: diagnosticsCopied ? "checkmark.circle.fill" : "doc.on.doc"
+                        )
                     }
 
                     diagnosticRow("Underlying Network", value: tunnel.underlyingNetwork.rawValue)
@@ -557,6 +574,78 @@ struct SettingsView: View {
         }
     }
 
+    private var connectionDiagnosticsText: String {
+        let yes = String(localized: "Yes")
+        let no = String(localized: "No")
+
+        var lines: [String] = [
+            "Location Suite Connection Diagnostics",
+            "App Version: \(appVersion)",
+            "iOS Version: \(UIDevice.current.systemVersion)",
+            "",
+            "Underlying Network: \(tunnel.underlyingNetwork.rawValue)",
+            "Fresh LocalDevVPN Endpoint Reachable: \(tunnel.endpointReachability.rawValue)",
+            "RemotePairing Transport: \((tunnel.isConnected || simulationSessionOpen) ? yes : no)",
+            "DDI Ready: \(mounting.coolisMounted ? yes : no)",
+            "Simulation Service Session: \(simulationSessionOpen ? yes : no)",
+            "Simulation Active: \(simulationActive ? yes : no)",
+            "Coordinate Producer: \(String(describing: LocationSimulationOwnership.shared.currentProducer).capitalized)",
+            "Warm Session Keeper: \(warmSessionKeeper.isIdleKeeperActive ? "Active" : "Inactive")",
+            "Last Warm Heartbeat: \(warmSessionKeeper.lastHeartbeat.map { syncTimestampFormatter.string(from: $0) } ?? "Never")",
+            "Warm Heartbeat Failures: \(warmSessionKeeper.heartbeatFailureCount)",
+            "Warm Session State: \(warmSessionKeeper.state.rawValue)",
+            "Target: \(DeviceConnectionContext.targetIPAddress):49152"
+        ]
+
+        if let trace = tunnel.lastColdBootstrap {
+            lines.append("")
+            lines.append("Cold Bootstrap Operation: \(trace.operation.displayName)")
+            lines.append("Cold Bootstrap Stage: \(trace.finalStage.displayName)")
+            lines.append("Cold Bootstrap Result: \(trace.resultDescription)")
+            lines.append(
+                "Last Cold Bootstrap Attempt: \(syncTimestampFormatter.string(from: trace.timestamp))"
+            )
+            lines.append(
+                "Last Cold Bootstrap Duration: \(String(format: "%.3f s", trace.totalElapsed))"
+            )
+            lines.append("Cold Bootstrap Retry Count: \(trace.retryCount)")
+
+            lines.append("Cold Bootstrap Stage Timings:")
+
+            for measurement in trace.measurements {
+                let elapsed = measurement.elapsed.map {
+                    String(format: "%.3fs", $0)
+                } ?? "combined"
+
+                lines.append(
+                    "  #\(measurement.attempt) \(measurement.stage.displayName): \(elapsed)"
+                )
+            }
+
+            if let failure = trace.failure {
+                lines.append("Last Socket Error: \(failure.detail)")
+                lines.append(
+                    "Last errno: \(failure.errno.map(String.init) ?? "Not available")"
+                )
+                lines.append("Failure Message: \(failure.userMessage)")
+            }
+        } else {
+            lines.append("")
+            lines.append("Cold Bootstrap Result: Not attempted")
+        }
+
+        if let category = tunnel.lastConnectionFailureCategory {
+            lines.append("")
+            lines.append("Last Connection Failure: \(category.rawValue)")
+
+            if let detail = tunnel.lastConnectionFailure {
+                lines.append("Failure Detail: \(detail)")
+            }
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
     private func diagnosticRow(_ title: LocalizedStringKey, value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text(title)
@@ -605,14 +694,77 @@ struct SettingsView: View {
 
     // MARK: - Signing Expiry
 
+    @ViewBuilder
+    private var selfMaintenanceSection: some View {
+        Section("Self Maintenance") {
+            HStack {
+                Text("Apple Account")
+                Spacer()
+                Text(maintenance.isSignedIn ? "Signed In" : "Not Signed In")
+                    .foregroundStyle(.secondary)
+            }
+
+            signingExpiryRows
+
+            Toggle("Auto Refresh Signing", isOn: $autoRefreshSigning)
+                .onChange(of: autoRefreshSigning) { _, enabled in
+                    guard enabled else { return }
+                    Task {
+                        await SigningExpiryNotificationScheduler.shared.requestAuthorizationAndSchedule(
+                            expirationDate: signing.reading?.expirationDate
+                        )
+                    }
+                }
+
+            if let lastSuccess = maintenance.history.lastSuccess {
+                HStack {
+                    Text("Last Refresh")
+                    Spacer()
+                    Text(syncTimestampFormatter.string(from: lastSuccess))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Button {
+                Task { await maintenance.refreshSigningNow() }
+            } label: {
+                if maintenance.isWorking {
+                    Label("Refreshing…", systemImage: "arrow.triangle.2.circlepath")
+                } else {
+                    Label("Refresh Signing Now", systemImage: "arrow.triangle.2.circlepath")
+                }
+            }
+            .disabled(maintenance.isWorking || LocationSimulationSession.isActive)
+
+            if maintenance.lastError?.category == .localDevVPNUnavailable
+                || maintenance.lastError?.category == .deviceTransportUnavailable {
+                Link(destination: SettingsLinks.localDevVPN) {
+                    Label("Open LocalDevVPN", systemImage: "network")
+                }
+            }
+
+            NavigationLink {
+                SelfMaintenanceAccountView()
+            } label: {
+                Label("Account Settings", systemImage: "person.crop.circle")
+            }
+
+            if let message = maintenance.statusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(maintenance.lastError == nil ? Color.secondary : Color.orange)
+            }
+        }
+    }
+
     /// What the device last said about when this install's signature expires,
     /// and when it said it.
     ///
     /// Three honest states, and no fourth:
     ///
     /// * never read — says so. It does **not** fall back to the date baked into
-    ///   the app bundle at install time, which stops moving the moment SideStore
-    ///   first refreshes the app and from then on reads as long expired.
+    ///   the app bundle at install time, which stops moving after the first
+    ///   profile-only refresh and from then on eventually reads as expired.
     /// * read, no profile for this app — says that too. An App Store or
     ///   TrollStore install has no expiry to report, which is not "expired".
     /// * read — the date, how long is left, and when it was checked.
@@ -633,14 +785,9 @@ struct SettingsView: View {
                 Text(syncTimestampFormatter.string(from: reading.checkedAt))
                     .foregroundStyle(.secondary)
             }
-            Text("Read from the provisioning profile on this device, so it follows a SideStore refresh.")
+            Text("Read from the active provisioning profile on this device. A refresh succeeds only when this value moves later.")
                 .font(.caption).foregroundStyle(.secondary)
             if signingSeverity != .normal, signingSeverity != .unknown {
-                Button("Open SideStore to Refresh") {
-                    UIApplication.shared.open(SettingsLinks.sideStore)
-                }
-                Text("Location Suite only reports the profile expiration. SideStore performs the refresh; return here afterward to verify that the expiration moved later.")
-                    .font(.caption).foregroundStyle(.secondary)
                 Text("If Apple's authentication service is temporarily unavailable, the current profile remains valid until the expiration shown above. Retry later; Location Suite never revokes or recreates certificates.")
                     .font(.caption).foregroundStyle(.secondary)
             }

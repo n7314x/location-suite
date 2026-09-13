@@ -5,7 +5,7 @@ extension UserDefaults {
         static let targetDeviceIP = "TunnelDeviceIP"
         /// `timeIntervalSince1970` of the signing expiry the user chose to stop being
         /// warned about. Keyed to the date rather than stored as a plain flag so that
-        /// refreshing in SideStore — which mints a new certificate and a new expiry —
+        /// renewing the device profile — which produces a later expiry —
         /// brings the warning back next week instead of silencing it forever.
         static let suppressedExpiryWarning = "suppressedExpiryWarning"
 
@@ -18,6 +18,15 @@ extension UserDefaults {
         /// Its absence is what "never checked" means, so a failed read must never
         /// write it.
         static let signingExpiryCheckedAt = "signingExpiryCheckedAt"
+
+        static let appleAccountEmail = "selfMaintenance.appleAccountEmail"
+        static let rememberApplePassword = "selfMaintenance.rememberApplePassword"
+        static let selectedDeveloperTeam = "selfMaintenance.selectedDeveloperTeam"
+        static let anisettePrimaryEndpoint = "selfMaintenance.anisettePrimaryEndpoint"
+        static let anisetteFallbackEndpoints = "selfMaintenance.anisetteFallbackEndpoints"
+        static let autoRefreshSigning = "selfMaintenance.autoRefreshSigning"
+        static let signingRefreshHistory = "selfMaintenance.signingRefreshHistory"
+        static let signingForegroundPromptAt = "selfMaintenance.signingForegroundPromptAt"
 
         /// Last successfully parsed stable update and its check timestamp. A
         /// failed network or decoding attempt never removes this cache.

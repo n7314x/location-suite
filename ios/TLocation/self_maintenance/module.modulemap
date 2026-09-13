@@ -1,0 +1,5 @@
+module LocationSelfMaintenance [system] {
+    header "location_self_maintenance.h"
+    link "location_self_maintenance"
+    export *
+}

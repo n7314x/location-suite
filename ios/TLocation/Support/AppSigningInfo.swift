@@ -8,9 +8,9 @@ import Foundation
 /// Turns provisioning-profile bytes into an expiry date, and an expiry date into
 /// the words the UI shows.
 ///
-/// TLocation is normally sideloaded through SideStore. With a free Apple ID the
-/// signing certificate only lasts 7 days, and once it lapses the app refuses to
-/// launch and has to be reinstalled — so the app warns before that happens.
+/// With a free Apple Account the provisioning profile normally lasts seven
+/// days. Once it lapses the app refuses to launch and cannot repair itself, so
+/// the app warns before that happens.
 ///
 /// This type is deliberately pure: bytes and dates in, dates and strings out. It
 /// never decides *when* to look, and never touches the device. Where the profiles
@@ -18,15 +18,23 @@ import Foundation
 /// that type's business.
 ///
 /// The bundle's own `embedded.mobileprovision` is **not** read here, and must not
-/// be. That file is written at install time and is never rewritten when SideStore
-/// refreshes the app: a refresh renews the profile at the system level only
-/// (SideStore PR #846 removed the install step from refresh). Reading it reports
-/// the expiry of whichever certificate was current when the app was last
-/// *installed*, which after the first weekly refresh is always in the past — a
+/// be. That file is written at install time and is not rewritten by a
+/// profile-only refresh. Reading it reports the profile expiry from the last
+/// full installation, which after the first weekly refresh eventually lies in
+/// the past — a
 /// red "expired" row and a warning card on every launch, on a perfectly healthy
 /// signature. `misagent` reports the profiles iOS actually validates against, so
 /// it moves when a refresh moves it, and it is the only source used.
 enum AppSigningInfo {
+    struct ProfileMetadata {
+        let data: Data
+        let expirationDate: Date
+        /// Developer-portal identifier without the team prefix from
+        /// `application-identifier`.
+        let portalBundleIdentifier: String
+        let teamIdentifier: String?
+    }
+
     /// Remaining time at or below which the launch warning is shown.
     static let warningThreshold: TimeInterval = 24 * 60 * 60
 
@@ -58,13 +66,38 @@ enum AppSigningInfo {
     /// TrollStore install looks like — no profile names this app — and the
     /// caller must never turn it into a warning.
     static func expirationDate(forBundleIdentifier bundleIdentifier: String, in profiles: [Data]) -> Date? {
-        profiles.compactMap { profile -> Date? in
+        currentProfile(forBundleIdentifier: bundleIdentifier, in: profiles)?.expirationDate
+    }
+
+    /// The newest installed profile that actually covers this app. Besides the
+    /// expiry, this supplies the exact developer-portal App ID and team prefix
+    /// used by the current working installation. Profile renewal must use these
+    /// values; guessing from an account's first team could consume a free App ID
+    /// slot and still produce a profile that cannot validate the executable.
+    static func currentProfile(
+        forBundleIdentifier bundleIdentifier: String,
+        in profiles: [Data]
+    ) -> ProfileMetadata? {
+        profiles.compactMap { profile -> ProfileMetadata? in
             guard let plist = plist(fromProfile: profile),
-                  covers(bundleIdentifier: bundleIdentifier, plist: plist) else {
+                  covers(bundleIdentifier: bundleIdentifier, plist: plist),
+                  let expirationDate = plist["ExpirationDate"] as? Date,
+                  let entitlements = plist["Entitlements"] as? [String: Any],
+                  let applicationIdentifier = entitlements["application-identifier"] as? String,
+                  let separator = applicationIdentifier.firstIndex(of: ".") else {
                 return nil
             }
-            return plist["ExpirationDate"] as? Date
-        }.max()
+            let derivedTeam = String(applicationIdentifier[..<separator])
+            let portalIdentifier = String(applicationIdentifier[applicationIdentifier.index(after: separator)...])
+            guard !portalIdentifier.isEmpty else { return nil }
+            let explicitTeam = entitlements["com.apple.developer.team-identifier"] as? String
+            return ProfileMetadata(
+                data: profile,
+                expirationDate: expirationDate,
+                portalBundleIdentifier: portalIdentifier,
+                teamIdentifier: explicitTeam ?? derivedTeam
+            )
+        }.max { $0.expirationDate < $1.expirationDate }
     }
 
     /// Whether a profile's entitlements name this app.
@@ -160,8 +193,8 @@ enum AppSigningInfo {
 /// The "don't show again for this expiry" checkbox on the launch warning.
 ///
 /// Keyed to the expiry date itself rather than stored as a plain flag, so that
-/// refreshing in SideStore — which mints a new certificate and a new expiry —
-/// brings the warning back next week instead of silencing it forever.
+/// renewing the device profile — which produces a later expiry — brings the
+/// warning back next week instead of silencing it forever.
 ///
 /// That was the intent from the start and it never worked, because the expiry it
 /// was keyed to came from the app bundle and so never changed: ticking the box

@@ -453,6 +453,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/TLocation/idevice",
+					"$(PROJECT_DIR)/TLocation/self_maintenance",
 				);
 				INFOPLIST_FILE = TLocation/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Location Suite";
@@ -478,6 +479,7 @@
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/TLocation/idevice",
+					"$(PROJECT_DIR)/TLocation/self_maintenance",
 				);
 				LOCATION_SUITE_SOURCE_URL = "";
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
@@ -490,7 +492,7 @@
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_INCLUDE_PATHS = "$(inherited) $(PROJECT_DIR)/TLocation/idevice";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(PROJECT_DIR)/TLocation/idevice $(PROJECT_DIR)/TLocation/self_maintenance";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -517,6 +519,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/TLocation/idevice",
+					"$(PROJECT_DIR)/TLocation/self_maintenance",
 				);
 				INFOPLIST_FILE = TLocation/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Location Suite";
@@ -542,6 +545,7 @@
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/TLocation/idevice",
+					"$(PROJECT_DIR)/TLocation/self_maintenance",
 				);
 				LOCATION_SUITE_SOURCE_URL = "";
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
@@ -554,7 +558,7 @@
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_INCLUDE_PATHS = "$(inherited) $(PROJECT_DIR)/TLocation/idevice";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(PROJECT_DIR)/TLocation/idevice $(PROJECT_DIR)/TLocation/self_maintenance";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				XROS_DEPLOYMENT_TARGET = 2.2;

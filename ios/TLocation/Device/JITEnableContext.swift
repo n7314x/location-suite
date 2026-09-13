@@ -53,6 +53,7 @@ final class JITEnableContext {
 
     var adapterHandle: OpaquePointer? { adapter }
     var handshakeHandle: OpaquePointer? { handshake }
+    var hasExistingTunnelHandles: Bool { adapter != nil && handshake != nil }
 
     private init() {
         // The FFI logger is initialised with both sinks disabled.
