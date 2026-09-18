@@ -317,13 +317,15 @@ private enum PendingAlert {
 private enum PendingSheet: Identifiable {
     case bookmarks
     case savedRoutes
+    case routeSchedules
     case settings
 
     var id: Int {
         switch self {
         case .bookmarks: return 0
         case .savedRoutes: return 1
-        case .settings: return 2
+        case .routeSchedules: return 2
+        case .settings: return 3
         }
     }
 }
@@ -496,6 +498,8 @@ struct LocationSimulationView: View {
     @State private var directionsCoordinator = RouteDirectionsCoordinator()
     @StateObject private var routePlayback = RoutePlaybackController.deviceController()
     @StateObject private var savedRouteLibrary = SavedRouteLibrary.shared
+    @StateObject private var routeScheduleLibrary = RouteScheduleLibrary.shared
+    @StateObject private var routeScheduleRunner = RouteScheduleRunner()
 
     // Bookmarks
     @State private var bookmarks: [LocationBookmark] = []
@@ -1350,6 +1354,14 @@ struct LocationSimulationView: View {
                 SavedRoutesView(library: savedRouteLibrary) { route in
                     loadSavedRoute(route)
                 }
+            case .routeSchedules:
+                RouteSchedulesView(
+                    library: routeScheduleLibrary,
+                    routes: savedRouteLibrary.routes,
+                    runner: routeScheduleRunner
+                ) { schedule in
+                    startSchedule(schedule)
+                }
             case .settings:
                 SettingsView()
             }
@@ -1389,7 +1401,10 @@ struct LocationSimulationView: View {
         }
         .onAppear {
             loadBookmarks()
-            Task { await savedRouteLibrary.reload() }
+            Task {
+                await savedRouteLibrary.reload()
+                await routeScheduleLibrary.reload()
+            }
             routePlayback.setSpeedMultiplier(routeSpeedMultiplier, mode: routeMovementMode)
             // A live foreground location session for as long as the map is
             // visible. Without it the only Core Location session in the app is
@@ -1407,6 +1422,7 @@ struct LocationSimulationView: View {
             routePlayback.setSpeedMultiplier(clamped, mode: routeMovementMode)
         }
         .onDisappear {
+            routeScheduleRunner.cancel()
             // Balances the `startTracking()` above: no GPS runs while the map
             // is off screen.
             currentLocationProvider.stopTracking()
@@ -1612,6 +1628,12 @@ struct LocationSimulationView: View {
                 pendingSheet = .savedRoutes
             } label: {
                 Label("Saved Routes", systemImage: "tray.full")
+            }
+
+            Button {
+                pendingSheet = .routeSchedules
+            } label: {
+                Label("Route Schedules", systemImage: "calendar.badge.clock")
             }
 
             Button {
@@ -1902,6 +1924,7 @@ struct LocationSimulationView: View {
     }
 
     private func clearRoute() {
+        routeScheduleRunner.cancel()
         guard routePlayback.canEditRoute else { return }
         routeResolutionTask?.cancel()
         routeResolutionTask = nil
@@ -2156,7 +2179,52 @@ struct LocationSimulationView: View {
         showStatusMessage(String(localized: "Loaded \(document.name)"))
     }
 
+    private func startSchedule(_ schedule: RouteScheduleDocument) {
+        guard !routeScheduleRunner.isRunning else { return }
+        guard routePlayback.canEditRoute else {
+            presentAlert(.message(
+                title: String(localized: "Route Busy"),
+                body: String(localized: "Stop the current route before starting a schedule.")
+            ))
+            return
+        }
+
+        do {
+            let warnings = try RouteScheduleValidator.validate(
+                schedule,
+                routes: savedRouteLibrary.routes
+            )
+            if !warnings.isEmpty {
+                let detail = warnings.map {
+                    "\($0.fromRouteName) → \($0.toRouteName): \(Int($0.distance.rounded())) m"
+                }.joined(separator: "\n")
+                showStatusMessage(String(localized: "Schedule armed. Route jumps: \(detail)"))
+            } else if let startAt = schedule.startAt, startAt > Date() {
+                showStatusMessage(String(localized: "Schedule armed for \(startAt.formatted(date: .omitted, time: .shortened))"))
+            } else {
+                showStatusMessage(String(localized: "Schedule started"))
+            }
+        } catch {
+            presentAlert(.message(
+                title: String(localized: "Could Not Start Schedule"),
+                body: error.localizedDescription
+            ))
+            return
+        }
+
+        routeLoopMode = .off
+        routePlayback.setLoopMode(.off)
+        routeScheduleRunner.start(
+            schedule,
+            routes: savedRouteLibrary.routes,
+            playback: routePlayback
+        ) {
+            stopPointProducer()
+        }
+    }
+
     private func stopRoute() {
+        routeScheduleRunner.cancel()
         guard routePlayback.canStopRoute else { return }
         Task {
             let didHold = await routePlayback.stopRoute()
@@ -2708,6 +2776,7 @@ struct LocationSimulationView: View {
     /// guaranteed to be running at the moment the camera is handed back to
     /// `.userLocation` below.
     private func returnToRealLocation() {
+        routeScheduleRunner.cancel()
         if routePlayback.canReturnToRealLocation {
             isReturningToRealLocation = true
             Task {

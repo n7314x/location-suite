@@ -1820,3 +1820,74 @@ struct RoutePlaybackControllerTests {
         #expect(disconnectCount == 1)
     }
 }
+
+
+struct RouteScheduleTests {
+    @Test func scheduleRejectsEmptyStepsAndInvalidPause() throws {
+        #expect(throws: RouteScheduleValidationError.emptySchedule) {
+            try RouteScheduleDocument(name: "Empty", steps: [])
+        }
+        #expect(throws: RouteScheduleValidationError.invalidPause) {
+            _ = try RouteScheduleStep(routeID: "route_a", pauseAfter: -1)
+        }
+    }
+
+    @Test func scheduleValidationDetectsMissingAndUnresolvedRoutes() throws {
+        let step = try RouteScheduleStep(routeID: "route_missing")
+        let schedule = try RouteScheduleDocument(name: "Missing", steps: [step])
+        #expect(throws: RouteScheduleValidationError.missingRoute("route_missing")) {
+            try RouteScheduleValidator.validate(schedule, routes: [])
+        }
+
+        let a = try point(0, 0)
+        let b = try point(0, 0.001)
+        let unresolved = try LocationRouteDocument(
+            id: "route_unresolved",
+            name: "Unresolved",
+            anchors: [a, b]
+        )
+        let unresolvedSchedule = try RouteScheduleDocument(
+            name: "Unresolved",
+            steps: [try RouteScheduleStep(routeID: unresolved.id)]
+        )
+        #expect(throws: RouteScheduleValidationError.unresolvedRoute("Unresolved")) {
+            try RouteScheduleValidator.validate(unresolvedSchedule, routes: [unresolved])
+        }
+    }
+
+    @Test func scheduleWarnsAboutLargeRouteJump() throws {
+        let a0 = try point(0, 0)
+        let a1 = try point(0, 0.001)
+        let b0 = try point(1, 1)
+        let b1 = try point(1, 1.001)
+
+        let first = try LocationRouteDocument(
+            id: "route_schedule_a",
+            name: "A",
+            anchors: [a0, a1],
+            resolvedGeometry: try ResolvedRouteGeometry(points: [a0, a1])
+        )
+        let second = try LocationRouteDocument(
+            id: "route_schedule_b",
+            name: "B",
+            anchors: [b0, b1],
+            resolvedGeometry: try ResolvedRouteGeometry(points: [b0, b1])
+        )
+        let schedule = try RouteScheduleDocument(
+            name: "Jump",
+            steps: [
+                try RouteScheduleStep(routeID: first.id, pauseAfter: 60),
+                try RouteScheduleStep(routeID: second.id)
+            ]
+        )
+
+        let warnings = try RouteScheduleValidator.validate(
+            schedule,
+            routes: [first, second]
+        )
+        #expect(warnings.count == 1)
+        #expect(warnings[0].fromRouteName == "A")
+        #expect(warnings[0].toRouteName == "B")
+        #expect(warnings[0].distance > RouteScheduleValidator.jumpWarningDistance)
+    }
+}

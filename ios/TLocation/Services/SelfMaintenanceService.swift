@@ -36,6 +36,10 @@ final class SelfMaintenanceService: ObservableObject {
         qos: .userInitiated
     )
     private var session: AppleDeveloperSessionHandle?
+    /// A live Apple developer session cannot be serialized safely. On each app
+    /// process we rebuild it once from the device-only Keychain credential when
+    /// the user enabled Remember Password.
+    private var didAttemptRememberedSessionRestore = false
 
     init(defaults: UserDefaults = .standard, secrets: SecretStorage = KeychainSecretStore()) {
         self.defaults = defaults
@@ -101,6 +105,7 @@ final class SelfMaintenanceService: ObservableObject {
                 try secrets.remove(account: SelfMaintenanceSecretAccount.applePassword)
             }
             apply(prepared)
+            didAttemptRememberedSessionRestore = true
             statusMessage = selectedTeamIdentifier == nil
                 ? "Choose the personal team that signed this installation."
                 : "Apple developer session is ready."
@@ -112,6 +117,41 @@ final class SelfMaintenanceService: ObservableObject {
             publish(error: normalized)
             LogManager.shared.addWarningLog(normalized.safeSignInLogMessage)
         }
+    }
+
+    func restoreRememberedSessionIfNeeded() async {
+        guard session == nil, !didAttemptRememberedSessionRestore else { return }
+        didAttemptRememberedSessionRestore = true
+
+        guard defaults.bool(forKey: UserDefaults.Keys.rememberApplePassword),
+              let appleID = defaults.string(forKey: UserDefaults.Keys.appleAccountEmail)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !appleID.isEmpty,
+              let passwordData = try? secrets.data(for: SelfMaintenanceSecretAccount.applePassword),
+              let passwordData,
+              let password = String(data: passwordData, encoding: .utf8),
+              !password.isEmpty else {
+            return
+        }
+
+        let primary = defaults.string(forKey: UserDefaults.Keys.anisettePrimaryEndpoint)
+            ?? Self.defaultAnisetteEndpoint
+        let fallbacks = defaults.string(forKey: UserDefaults.Keys.anisetteFallbackEndpoints)
+            ?? Self.defaultAnisetteFallbacks
+
+        await signIn(
+            appleID: appleID,
+            password: password,
+            rememberPassword: true,
+            primaryAnisetteEndpoint: primary,
+            fallbackAnisetteEndpoints: fallbacks
+        )
+    }
+
+    /// Allows an explicit foreground/manual retry after a transient restore
+    /// failure without creating repeated automatic Apple login attempts.
+    func allowRememberedSessionRestoreRetry() {
+        if session == nil { didAttemptRememberedSessionRestore = false }
     }
 
     func selectTeam(_ identifier: String) async {
@@ -140,6 +180,7 @@ final class SelfMaintenanceService: ObservableObject {
     }
 
     func signOut() {
+        didAttemptRememberedSessionRestore = true
         session = nil
         availableTeams = []
         activeAnisetteEndpoint = nil

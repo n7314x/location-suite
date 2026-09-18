@@ -572,6 +572,7 @@ struct SettingsView: View {
         } message: {
             Text("Existing DDI files will be removed before downloading fresh copies.")
         }
+        .modifier(TwoFactorPromptOverlayModifier())
     }
 
     private var connectionDiagnosticsText: String {

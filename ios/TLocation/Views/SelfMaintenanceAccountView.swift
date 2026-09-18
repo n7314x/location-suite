@@ -3,7 +3,6 @@ import UIKit
 
 struct SelfMaintenanceAccountView: View {
     @ObservedObject private var maintenance = SelfMaintenanceService.shared
-    @ObservedObject private var twoFactor = TwoFactorPromptCoordinator.shared
 
     @AppStorage(UserDefaults.Keys.appleAccountEmail) private var appleAccount = ""
     @AppStorage(UserDefaults.Keys.rememberApplePassword) private var rememberPassword = false
@@ -13,7 +12,6 @@ struct SelfMaintenanceAccountView: View {
     private var anisetteFallbacks = SelfMaintenanceService.defaultAnisetteFallbacks
 
     @State private var password = ""
-    @State private var verificationCode = ""
     @State private var technicalDetailsExpanded = true
     @State private var technicalDetailsCopied = false
 
@@ -161,12 +159,7 @@ struct SelfMaintenanceAccountView: View {
         .onChange(of: rememberPassword) { _, isEnabled in
             if !isEnabled { maintenance.forgetRememberedPassword() }
         }
-        .sheet(
-            isPresented: Binding(
-                get: { twoFactor.isPresenting },
-                set: { if !$0, twoFactor.isPresenting { twoFactor.cancel() } }
-            )
-        ) {
+ {
             NavigationStack {
                 Form {
                     Section {

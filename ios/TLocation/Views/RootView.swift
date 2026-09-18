@@ -155,13 +155,19 @@ struct RootView: View {
             MountingProgress.shared.checkforMounted()
             signing.refreshIfPossible(reason: "launch")
             evaluateExpiryWarning()
-            Task { await maintenance.handleForegroundActivation() }
+            Task {
+                    await maintenance.restoreRememberedSessionIfNeeded()
+                    await maintenance.handleForegroundActivation()
+                }
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 signing.refreshIfPossible(reason: "a return to the foreground")
                 evaluateExpiryWarning()
-                Task { await maintenance.handleForegroundActivation() }
+                Task {
+                    await maintenance.restoreRememberedSessionIfNeeded()
+                    await maintenance.handleForegroundActivation()
+                }
             }
         }
         // The tunnel is almost never up at the instant `onAppear` runs, so this is
@@ -169,14 +175,20 @@ struct RootView: View {
         .onChange(of: tunnel.isConnected) { _, isConnected in
             if isConnected {
                 signing.refreshIfPossible(reason: "the tunnel connecting")
-                Task { await maintenance.handleForegroundActivation() }
+                Task {
+                    await maintenance.restoreRememberedSessionIfNeeded()
+                    await maintenance.handleForegroundActivation()
+                }
             }
         }
         // A reading landing seconds after launch is the normal case, so the
         // decision is retried whenever one does rather than only at `onAppear`.
         .onChange(of: signing.reading) { _, _ in
             evaluateExpiryWarning()
-            Task { await maintenance.handleForegroundActivation() }
+            Task {
+                    await maintenance.restoreRememberedSessionIfNeeded()
+                    await maintenance.handleForegroundActivation()
+                }
         }
         .onReceive(statusTimer) { _ in
             // Cheap existence check only. `prepareURL()` does directory creation and a
@@ -212,6 +224,7 @@ struct RootView: View {
         } message: { action in
             Text(action.message)
         }
+        .modifier(TwoFactorPromptOverlayModifier())
     }
 
     // MARK: - Signing expiry warning
