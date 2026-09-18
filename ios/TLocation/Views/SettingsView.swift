@@ -161,12 +161,22 @@ struct SettingsView: View {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     }
 
+    private var appBuild: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+    }
+
+    private var appVersionDisplay: String {
+        "Version \(appVersion) (\(appBuild))"
+    }
+
     var body: some View {
         NavigationStack {
             Form {
+                appOverviewSection
+
                 languageSection
 
-                Section("Pairing File") {
+                Section("Device Pairing") {
                     if pairingFileExists {
                         Label("Pairing file imported", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
@@ -210,12 +220,22 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("Background Keep-Alive") {
+                Section("Simulation & Background") {
+                    Toggle(isOn: $naturalGPSDrift) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Natural GPS Drift")
+                            Text("Adds subtle movement so the simulated position behaves more like a real GPS fix.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
                     Toggle(isOn: $keepAliveLocation) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Background Location")
-                            Text("Uses low-accuracy location to stay alive while simulating or keeping a warm session.")
-                                .font(.caption).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Background Keep-Alive")
+                            Text("Keeps the simulation or warm session active when Location Suite is in the background.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                     .onChange(of: keepAliveLocation) { _, _ in
@@ -223,16 +243,6 @@ struct SettingsView: View {
                     }
 
                     alwaysAuthorizationWarning
-                }
-
-                Section("Simulation") {
-                    Toggle(isOn: $naturalGPSDrift) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Natural GPS Drift")
-                            Text("Adds a few metres of random movement so the simulated position looks like a real GPS fix.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
 
                     Button(role: .destructive) {
                         isDisconnectingSession = true
@@ -245,12 +255,12 @@ struct SettingsView: View {
                     }
                     .disabled(!simulationSessionOpen || isDisconnectingSession)
 
-                    Text("Disconnect Session returns to real GPS and closes the warm developer connection. Return on the map keeps it available for later LTE use.")
+                    Text("Disconnecting returns the phone to real GPS and closes the warm developer connection.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Bookmarks") {
+                Section("Saved Locations") {
                     Text(bookmarkCountText)
                         .foregroundStyle(bookmarks.isEmpty ? .secondary : .primary)
 
@@ -280,7 +290,9 @@ struct SettingsView: View {
 
                 selfMaintenanceSection
 
-                Section("Advanced") {
+                updateSection
+
+                Section("Advanced Connection") {
                     HStack {
                         Text("Target Device IP")
                         Spacer()
@@ -307,8 +319,6 @@ struct SettingsView: View {
                         Text(result.text).font(.caption).foregroundStyle(result.isError ? .red : .green)
                     }
                 }
-
-                updateSection
 
                 Section("Connection Diagnostics") {
                     Button {
@@ -461,7 +471,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Help") {
+                Section("Help & Resources") {
                     Link(destination: SettingsLinks.pairingFileGuide) {
                         Label("Pairing File Guide", systemImage: "questionmark.circle")
                     }
@@ -470,11 +480,10 @@ struct SettingsView: View {
                     }
                 }
 
-                Section {
-                    Text("TLocation \(appVersion) • iOS \(UIDevice.current.systemVersion)")
-                        .font(.footnote).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .listRowBackground(Color.clear)
+                Section("About") {
+                    LabeledContent("Version", value: appVersion)
+                    LabeledContent("Build", value: appBuild)
+                    LabeledContent("iOS", value: UIDevice.current.systemVersion)
                 }
             }
             .navigationTitle("Settings")
@@ -575,6 +584,48 @@ struct SettingsView: View {
         .modifier(TwoFactorPromptOverlayModifier())
     }
 
+    @ViewBuilder
+    private var appOverviewSection: some View {
+        Section {
+            HStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(.thinMaterial)
+                        .frame(width: 48, height: 48)
+
+                    Image(systemName: "location.fill")
+                        .font(.title2.weight(.semibold))
+                        .foregroundStyle(.tint)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Location Suite")
+                        .font(.headline)
+                    Text(appVersionDisplay)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+            }
+            .padding(.vertical, 3)
+
+            LabeledContent(
+                "Simulation",
+                value: simulationActive
+                    ? String(localized: "Active")
+                    : (simulationSessionOpen ? String(localized: "Ready") : String(localized: "Idle"))
+            )
+
+            LabeledContent(
+                "Developer Session",
+                value: maintenance.isSignedIn
+                    ? String(localized: "Signed In")
+                    : String(localized: "Not Signed In")
+            )
+        }
+    }
+
     private var connectionDiagnosticsText: String {
         let yes = String(localized: "Yes")
         let no = String(localized: "No")
@@ -582,6 +633,7 @@ struct SettingsView: View {
         var lines: [String] = [
             "Location Suite Connection Diagnostics",
             "App Version: \(appVersion)",
+            "App Build: \(appBuild)",
             "iOS Version: \(UIDevice.current.systemVersion)",
             "",
             "Underlying Network: \(tunnel.underlyingNetwork.rawValue)",
@@ -954,7 +1006,7 @@ struct SettingsView: View {
     /// would be worse than no control at all.
     @ViewBuilder
     private var languageSection: some View {
-        Section("Language") {
+        Section("General") {
             Picker("Language", selection: $selectedLanguage) {
                 ForEach(AppLanguage.allCases) { language in
                     if let endonym = language.endonym {
