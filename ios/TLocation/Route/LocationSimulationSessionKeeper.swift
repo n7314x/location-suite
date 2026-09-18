@@ -100,6 +100,7 @@ final class LocationSimulationSessionKeeper: ObservableObject {
 
     private var activeLease: LocationSimulationProducerLease?
     private var idleLease: LocationSimulationIdleLease?
+    private var preparationLease: LocationSimulationPreparationLease?
     private var timer: WarmLocationSimulationHeartbeatCancellation?
     private var ownsBackgroundActivity = false
     private var heartbeatInFlight = false
@@ -136,6 +137,7 @@ final class LocationSimulationSessionKeeper: ObservableObject {
         advanceLifecycle()
         activeLease = lease
         idleLease = nil
+        preparationLease = nil
         staleCleanupScheduled = false
         consecutiveHeartbeatFailures = 0
         state = lease.producer == .point ? .activePoint : .activeRoute
@@ -166,12 +168,62 @@ final class LocationSimulationSessionKeeper: ObservableObject {
         return true
     }
 
+    /// Holds the existing long-lived activity while a coordinate-free session
+    /// open is queued. Lifecycle state remains disconnected until a real DVT
+    /// handle exists; the preparation lease is the race guard during this gap.
+    func preparationWillBegin(_ lease: LocationSimulationPreparationLease) {
+        guard ownership.isCurrent(lease) else { return }
+        advanceLifecycle()
+        activeLease = nil
+        idleLease = nil
+        preparationLease = lease
+        staleCleanupScheduled = false
+        consecutiveHeartbeatFailures = 0
+        state = .disconnected
+        acquireBackgroundActivityIfNeeded()
+        log("Preparing an idle LocationSimulation session.")
+    }
+
+    /// Transfers a successful preparation directly into the existing idleWarm
+    /// lifecycle. No producer is invented and no coordinate becomes active.
+    @discardableResult
+    func preparationDidSucceed(
+        _ lease: LocationSimulationPreparationLease,
+        idleLease newIdleLease: LocationSimulationIdleLease
+    ) -> Bool {
+        guard preparationLease == lease,
+              ownership.isCurrent(newIdleLease),
+              status.isSessionOpen,
+              !status.isSimulationActive else { return false }
+        preparationLease = nil
+        advanceLifecycle()
+        startIdleKeeper(
+            lease: newIdleLease,
+            resumeLog: "Warm session keeper active for prepared LTE session."
+        )
+        return true
+    }
+
+    /// Balances the activity acquired before the command was queued. A stale
+    /// completion is ignored because its Point/Route/Disconnect successor now
+    /// owns that same activity lifecycle.
+    @discardableResult
+    func preparationDidFail(_ lease: LocationSimulationPreparationLease) -> Bool {
+        guard preparationLease == lease else { return false }
+        preparationLease = nil
+        advanceLifecycle()
+        stopLongLivedActivity(state: .disconnected)
+        log("LocationSimulation session preparation failed; idle keeper was not started.")
+        return true
+    }
+
     /// Stops idle work before the destructive FFI command is queued. The token
     /// prevents its late completion from stopping a producer claimed meanwhile.
     func sessionWillDisconnect() -> LocationSimulationDisconnectLease {
         advanceLifecycle()
         activeLease = nil
         idleLease = nil
+        preparationLease = nil
         staleCleanupScheduled = false
         consecutiveHeartbeatFailures = 0
         stopLongLivedActivity(state: .disconnected)
@@ -183,6 +235,7 @@ final class LocationSimulationSessionKeeper: ObservableObject {
         guard lease.generation == lifecycleGeneration else { return }
         activeLease = nil
         idleLease = nil
+        preparationLease = nil
         stopLongLivedActivity(state: .disconnected)
     }
 
@@ -192,6 +245,7 @@ final class LocationSimulationSessionKeeper: ObservableObject {
         advanceLifecycle()
         activeLease = nil
         idleLease = nil
+        preparationLease = nil
         staleCleanupScheduled = false
         consecutiveHeartbeatFailures = 0
         stopLongLivedActivity(state: .disconnected)
@@ -205,6 +259,16 @@ final class LocationSimulationSessionKeeper: ObservableObject {
             return
         }
 
+        startIdleKeeper(
+            lease: lease,
+            resumeLog: "Warm session keeper resumed after Return."
+        )
+    }
+
+    private func startIdleKeeper(
+        lease: LocationSimulationIdleLease,
+        resumeLog: String
+    ) {
         idleLease = lease
         state = .idleWarm
         heartbeatInFlight = false
@@ -219,7 +283,7 @@ final class LocationSimulationSessionKeeper: ObservableObject {
             hasStartedIdleKeeper = true
             log("Warm session keeper started.")
         }
-        log("Warm session keeper resumed after Return.")
+        log(resumeLog)
     }
 
     private func timerFired() {

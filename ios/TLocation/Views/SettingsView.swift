@@ -85,6 +85,7 @@ struct SettingsView: View {
     /// of an already-active simulation, never the initial "Simulate Location"
     /// call, the pin, or anything else shown on screen.
     @AppStorage("naturalGPSDrift") private var naturalGPSDrift = false
+    @AppStorage(UserDefaults.Keys.autoRefreshSigning) private var autoRefreshSigning = true
 
     /// Mirrors `LanguageSettings.selected`; the `onChange` below is what writes
     /// the matching `AppleLanguages` override.
@@ -139,13 +140,17 @@ struct SettingsView: View {
     /// change the user makes over in system Settings.
     @ObservedObject private var backgroundLocation = BackgroundLocationManager.shared
     @ObservedObject private var warmSessionKeeper = DeviceRoutePlaybackActivityManager.shared.sessionKeeper
+    @ObservedObject private var sessionPreparer = LocationSimulationSessionPreparer.shared
     @State private var simulationSessionOpen = LocationSimulationSession.isOpen
     @State private var simulationActive = LocationSimulationSession.isActive
     @State private var isDisconnectingSession = false
+    @State private var preparationMessage: (text: String, isError: Bool)?
+    @State private var diagnosticsCopied = false
 
     /// Watched, not owned. Holds the last signing expiry read from the device;
     /// this view shows it and asks for a refresh, and never reads the app bundle.
     @ObservedObject private var signing = SigningExpiryMonitor.shared
+    @ObservedObject private var maintenance = SelfMaintenanceService.shared
     @ObservedObject private var updates = UpdateService.shared
     @ObservedObject private var tunnel = TunnelManager.shared
     @ObservedObject private var mounting = MountingProgress.shared
@@ -156,12 +161,22 @@ struct SettingsView: View {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     }
 
+    private var appBuild: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+    }
+
+    private var appVersionDisplay: String {
+        "Version \(appVersion) (\(appBuild))"
+    }
+
     var body: some View {
         NavigationStack {
             Form {
+                appOverviewSection
+
                 languageSection
 
-                Section("Pairing File") {
+                Section("Device Pairing") {
                     if pairingFileExists {
                         Label("Pairing file imported", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
@@ -205,12 +220,22 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("Background Keep-Alive") {
+                Section("Simulation & Background") {
+                    Toggle(isOn: $naturalGPSDrift) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Natural GPS Drift")
+                            Text("Adds subtle movement so the simulated position behaves more like a real GPS fix.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
                     Toggle(isOn: $keepAliveLocation) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Background Location")
-                            Text("Uses low-accuracy location to stay alive while simulating or keeping a warm session.")
-                                .font(.caption).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Background Keep-Alive")
+                            Text("Keeps the simulation or warm session active when Location Suite is in the background.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                     .onChange(of: keepAliveLocation) { _, _ in
@@ -218,16 +243,6 @@ struct SettingsView: View {
                     }
 
                     alwaysAuthorizationWarning
-                }
-
-                Section("Simulation") {
-                    Toggle(isOn: $naturalGPSDrift) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Natural GPS Drift")
-                            Text("Adds a few metres of random movement so the simulated position looks like a real GPS fix.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
 
                     Button(role: .destructive) {
                         isDisconnectingSession = true
@@ -240,12 +255,12 @@ struct SettingsView: View {
                     }
                     .disabled(!simulationSessionOpen || isDisconnectingSession)
 
-                    Text("Disconnect Session returns to real GPS and closes the warm developer connection. Return on the map keeps it available for later LTE use.")
+                    Text("Disconnecting returns the phone to real GPS and closes the warm developer connection.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Bookmarks") {
+                Section("Saved Locations") {
                     Text(bookmarkCountText)
                         .foregroundStyle(bookmarks.isEmpty ? .secondary : .primary)
 
@@ -273,9 +288,11 @@ struct SettingsView: View {
 
                 bookmarkSyncSection
 
-                Section("Advanced") {
-                    signingExpiryRows
+                selfMaintenanceSection
 
+                updateSection
+
+                Section("Advanced Connection") {
                     HStack {
                         Text("Target Device IP")
                         Spacer()
@@ -303,9 +320,51 @@ struct SettingsView: View {
                     }
                 }
 
-                updateSection
-
                 Section("Connection Diagnostics") {
+                    Button {
+                        prepareLTESessionPressed()
+                    } label: {
+                        Label("Prepare LTE Session", systemImage: "antenna.radiowaves.left.and.right")
+                    }
+                    .disabled(!pairingFileExists || simulationActive || sessionPreparer.isPreparing)
+
+                    if sessionPreparer.isPreparing {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Opening RemotePairing and LocationSimulation without setting a coordinate…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if let preparationMessage {
+                        Label(
+                            preparationMessage.text,
+                            systemImage: preparationMessage.isError
+                                ? "exclamationmark.triangle.fill"
+                                : "checkmark.circle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(preparationMessage.isError ? .red : .green)
+                        .textSelection(.enabled)
+                    } else {
+                        Text("With LocalDevVPN connected, this opens and retains an idle developer session without selecting or sending a location. For cold cellular recovery, keep Wi-Fi off and turn on Airplane Mode before tapping; Location Suite does not change those settings itself.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Button {
+                        UIPasteboard.general.string = connectionDiagnosticsText
+                        diagnosticsCopied = true
+
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            diagnosticsCopied = false
+                        }
+                    } label: {
+                        Label(
+                            diagnosticsCopied ? "Copied Diagnostics" : "Copy Diagnostics",
+                            systemImage: diagnosticsCopied ? "checkmark.circle.fill" : "doc.on.doc"
+                        )
+                    }
+
                     diagnosticRow("Underlying Network", value: tunnel.underlyingNetwork.rawValue)
                     diagnosticRow(
                         "Fresh LocalDevVPN Endpoint Reachable",
@@ -313,7 +372,9 @@ struct SettingsView: View {
                     )
                     diagnosticRow(
                         "RemotePairing Transport",
-                        value: tunnel.isConnected ? String(localized: "Yes") : String(localized: "No")
+                        value: (tunnel.isConnected || simulationSessionOpen)
+                            ? String(localized: "Yes")
+                            : String(localized: "No")
                     )
                     diagnosticRow(
                         "DDI Ready",
@@ -353,6 +414,7 @@ struct SettingsView: View {
                     diagnosticRow("Target", value: "\(DeviceConnectionContext.targetIPAddress):49152")
 
                     if let trace = tunnel.lastColdBootstrap {
+                        diagnosticRow("Cold Bootstrap Operation", value: trace.operation.displayName)
                         diagnosticRow("Cold Bootstrap Stage", value: trace.finalStage.displayName)
                         diagnosticRow("Cold Bootstrap Result", value: trace.resultDescription)
                         diagnosticRow(
@@ -409,7 +471,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Help") {
+                Section("Help & Resources") {
                     Link(destination: SettingsLinks.pairingFileGuide) {
                         Label("Pairing File Guide", systemImage: "questionmark.circle")
                     }
@@ -418,11 +480,10 @@ struct SettingsView: View {
                     }
                 }
 
-                Section {
-                    Text("TLocation \(appVersion) • iOS \(UIDevice.current.systemVersion)")
-                        .font(.footnote).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .listRowBackground(Color.clear)
+                Section("About") {
+                    LabeledContent("Version", value: appVersion)
+                    LabeledContent("Build", value: appBuild)
+                    LabeledContent("iOS", value: UIDevice.current.systemVersion)
                 }
             }
             .navigationTitle("Settings")
@@ -520,6 +581,122 @@ struct SettingsView: View {
         } message: {
             Text("Existing DDI files will be removed before downloading fresh copies.")
         }
+        .modifier(TwoFactorPromptOverlayModifier())
+    }
+
+    @ViewBuilder
+    private var appOverviewSection: some View {
+        Section {
+            HStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(.thinMaterial)
+                        .frame(width: 48, height: 48)
+
+                    Image(systemName: "location.fill")
+                        .font(.title2.weight(.semibold))
+                        .foregroundStyle(.tint)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Location Suite")
+                        .font(.headline)
+                    Text(appVersionDisplay)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+            }
+            .padding(.vertical, 3)
+
+            LabeledContent(
+                "Simulation",
+                value: simulationActive
+                    ? String(localized: "Active")
+                    : (simulationSessionOpen ? String(localized: "Ready") : String(localized: "Idle"))
+            )
+
+            LabeledContent(
+                "Developer Session",
+                value: maintenance.isSignedIn
+                    ? String(localized: "Signed In")
+                    : String(localized: "Not Signed In")
+            )
+        }
+    }
+
+    private var connectionDiagnosticsText: String {
+        let yes = String(localized: "Yes")
+        let no = String(localized: "No")
+
+        var lines: [String] = [
+            "Location Suite Connection Diagnostics",
+            "App Version: \(appVersion)",
+            "App Build: \(appBuild)",
+            "iOS Version: \(UIDevice.current.systemVersion)",
+            "",
+            "Underlying Network: \(tunnel.underlyingNetwork.rawValue)",
+            "Fresh LocalDevVPN Endpoint Reachable: \(tunnel.endpointReachability.rawValue)",
+            "RemotePairing Transport: \((tunnel.isConnected || simulationSessionOpen) ? yes : no)",
+            "DDI Ready: \(mounting.coolisMounted ? yes : no)",
+            "Simulation Service Session: \(simulationSessionOpen ? yes : no)",
+            "Simulation Active: \(simulationActive ? yes : no)",
+            "Coordinate Producer: \(String(describing: LocationSimulationOwnership.shared.currentProducer).capitalized)",
+            "Warm Session Keeper: \(warmSessionKeeper.isIdleKeeperActive ? "Active" : "Inactive")",
+            "Last Warm Heartbeat: \(warmSessionKeeper.lastHeartbeat.map { syncTimestampFormatter.string(from: $0) } ?? "Never")",
+            "Warm Heartbeat Failures: \(warmSessionKeeper.heartbeatFailureCount)",
+            "Warm Session State: \(warmSessionKeeper.state.rawValue)",
+            "Target: \(DeviceConnectionContext.targetIPAddress):49152"
+        ]
+
+        if let trace = tunnel.lastColdBootstrap {
+            lines.append("")
+            lines.append("Cold Bootstrap Operation: \(trace.operation.displayName)")
+            lines.append("Cold Bootstrap Stage: \(trace.finalStage.displayName)")
+            lines.append("Cold Bootstrap Result: \(trace.resultDescription)")
+            lines.append(
+                "Last Cold Bootstrap Attempt: \(syncTimestampFormatter.string(from: trace.timestamp))"
+            )
+            lines.append(
+                "Last Cold Bootstrap Duration: \(String(format: "%.3f s", trace.totalElapsed))"
+            )
+            lines.append("Cold Bootstrap Retry Count: \(trace.retryCount)")
+
+            lines.append("Cold Bootstrap Stage Timings:")
+
+            for measurement in trace.measurements {
+                let elapsed = measurement.elapsed.map {
+                    String(format: "%.3fs", $0)
+                } ?? "combined"
+
+                lines.append(
+                    "  #\(measurement.attempt) \(measurement.stage.displayName): \(elapsed)"
+                )
+            }
+
+            if let failure = trace.failure {
+                lines.append("Last Socket Error: \(failure.detail)")
+                lines.append(
+                    "Last errno: \(failure.errno.map(String.init) ?? "Not available")"
+                )
+                lines.append("Failure Message: \(failure.userMessage)")
+            }
+        } else {
+            lines.append("")
+            lines.append("Cold Bootstrap Result: Not attempted")
+        }
+
+        if let category = tunnel.lastConnectionFailureCategory {
+            lines.append("")
+            lines.append("Last Connection Failure: \(category.rawValue)")
+
+            if let detail = tunnel.lastConnectionFailure {
+                lines.append("Failure Detail: \(detail)")
+            }
+        }
+
+        return lines.joined(separator: "\n")
     }
 
     private func diagnosticRow(_ title: LocalizedStringKey, value: String) -> some View {
@@ -533,7 +710,105 @@ struct SettingsView: View {
         }
     }
 
+    private func prepareLTESessionPressed() {
+        guard pairingFileExists, !sessionPreparer.isPreparing else { return }
+        preparationMessage = nil
+        Task { @MainActor in
+            let outcome = await sessionPreparer.prepare()
+            switch outcome {
+            case .ready(let reusedOpenSession):
+                preparationMessage = (
+                    reusedOpenSession
+                        ? String(localized: "LTE session is already ready and was retained. You can turn Airplane Mode off.")
+                        : String(localized: "LTE session ready. You can turn Airplane Mode off."),
+                    false
+                )
+            case .failed(let result):
+                if let failure = result.coldBootstrapTrace?.failure {
+                    let errnoLine = failure.errno.map { " • errno \($0)" } ?? ""
+                    preparationMessage = (
+                        "\(failure.userMessage) Stage: \(failure.stage.displayName) • Status \(failure.statusCode)\(errnoLine) • \(failure.detail)",
+                        true
+                    )
+                } else {
+                    preparationMessage = (
+                        String(localized: "Session preparation failed with status \(result.statusCode)."),
+                        true
+                    )
+                }
+            case .superseded:
+                preparationMessage = (
+                    String(localized: "Preparation was superseded by another Point, Route, or Disconnect Session action."),
+                    true
+                )
+            }
+        }
+    }
+
     // MARK: - Signing Expiry
+
+    @ViewBuilder
+    private var selfMaintenanceSection: some View {
+        Section("Self Maintenance") {
+            HStack {
+                Text("Apple Account")
+                Spacer()
+                Text(maintenance.isSignedIn ? "Signed In" : "Not Signed In")
+                    .foregroundStyle(.secondary)
+            }
+
+            signingExpiryRows
+
+            Toggle("Auto Refresh Signing", isOn: $autoRefreshSigning)
+                .onChange(of: autoRefreshSigning) { _, enabled in
+                    guard enabled else { return }
+                    Task {
+                        await SigningExpiryNotificationScheduler.shared.requestAuthorizationAndSchedule(
+                            expirationDate: signing.reading?.expirationDate
+                        )
+                    }
+                }
+
+            if let lastSuccess = maintenance.history.lastSuccess {
+                HStack {
+                    Text("Last Refresh")
+                    Spacer()
+                    Text(syncTimestampFormatter.string(from: lastSuccess))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Button {
+                Task { await maintenance.refreshSigningNow() }
+            } label: {
+                if maintenance.isWorking {
+                    Label("Refreshing…", systemImage: "arrow.triangle.2.circlepath")
+                } else {
+                    Label("Refresh Signing Now", systemImage: "arrow.triangle.2.circlepath")
+                }
+            }
+            .disabled(maintenance.isWorking || LocationSimulationSession.isActive)
+
+            if maintenance.lastError?.category == .localDevVPNUnavailable
+                || maintenance.lastError?.category == .deviceTransportUnavailable {
+                Link(destination: SettingsLinks.localDevVPN) {
+                    Label("Open LocalDevVPN", systemImage: "network")
+                }
+            }
+
+            NavigationLink {
+                SelfMaintenanceAccountView()
+            } label: {
+                Label("Account Settings", systemImage: "person.crop.circle")
+            }
+
+            if let message = maintenance.statusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(maintenance.lastError == nil ? Color.secondary : Color.orange)
+            }
+        }
+    }
 
     /// What the device last said about when this install's signature expires,
     /// and when it said it.
@@ -541,8 +816,8 @@ struct SettingsView: View {
     /// Three honest states, and no fourth:
     ///
     /// * never read — says so. It does **not** fall back to the date baked into
-    ///   the app bundle at install time, which stops moving the moment SideStore
-    ///   first refreshes the app and from then on reads as long expired.
+    ///   the app bundle at install time, which stops moving after the first
+    ///   profile-only refresh and from then on eventually reads as expired.
     /// * read, no profile for this app — says that too. An App Store or
     ///   TrollStore install has no expiry to report, which is not "expired".
     /// * read — the date, how long is left, and when it was checked.
@@ -563,14 +838,9 @@ struct SettingsView: View {
                 Text(syncTimestampFormatter.string(from: reading.checkedAt))
                     .foregroundStyle(.secondary)
             }
-            Text("Read from the provisioning profile on this device, so it follows a SideStore refresh.")
+            Text("Read from the active provisioning profile on this device. A refresh succeeds only when this value moves later.")
                 .font(.caption).foregroundStyle(.secondary)
             if signingSeverity != .normal, signingSeverity != .unknown {
-                Button("Open SideStore to Refresh") {
-                    UIApplication.shared.open(SettingsLinks.sideStore)
-                }
-                Text("Location Suite only reports the profile expiration. SideStore performs the refresh; return here afterward to verify that the expiration moved later.")
-                    .font(.caption).foregroundStyle(.secondary)
                 Text("If Apple's authentication service is temporarily unavailable, the current profile remains valid until the expiration shown above. Retry later; Location Suite never revokes or recreates certificates.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -736,7 +1006,7 @@ struct SettingsView: View {
     /// would be worse than no control at all.
     @ViewBuilder
     private var languageSection: some View {
-        Section("Language") {
+        Section("General") {
             Picker("Language", selection: $selectedLanguage) {
                 ForEach(AppLanguage.allCases) { language in
                     if let endonym = language.endonym {

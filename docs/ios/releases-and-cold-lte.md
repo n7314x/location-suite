@@ -1,9 +1,10 @@
 # Releases, free signing, and cold LTE diagnostics
 
-Implementation snapshot: 2026-09-10. This document covers only unsigned release
-delivery, SideStore handoff, signing-expiry guidance, and cold phone-local
-RemotePairing observability/recovery. It does not change route or saved-location
-features.
+Implementation snapshot: 2026-09-13, combining the Phase 1 self-maintenance
+addendum with coordinate-free LTE session preparation. This document covers
+unsigned release delivery, the legacy SideStore handoff, direct profile-renewal
+guidance, and cold phone-local RemotePairing observability/recovery. It does not
+change route or saved-location features.
 
 ## Release architecture
 
@@ -120,23 +121,27 @@ presented as:
 - at or below 24 hours: urgent warning and the existing foreground card;
 - elapsed: explicit expired status.
 
-The profile expiration includes date and time. Near expiry, **Open SideStore to
-Refresh** opens SideStore normally because no documented direct-refresh URL
-exists. A later device read—not the act of opening SideStore—is what proves a
-new expiration.
+The profile expiration includes date and time. PR #4's near-expiry action opened
+SideStore because no direct refresh existed in Location Suite. Phase 1 now adds
+an in-app profile-only attempt: it authenticates, requests a profile for the
+installed team/App ID, installs it through misagent, and accepts success only
+when a second device read reports a later expiry. Apple Account/developer-session
+Gate 1 is physically confirmed: the app reported `Apple developer session is
+ready.` Profile-renewal Gate 2 remains a separate physical-test candidate;
+[the Phase 1 document](self-maintenance-signing.md) is authoritative for its
+remaining gates. SideStore remains only the older release-install handoff, not
+a dependency of the new profile refresh.
 
-If Apple's GrandSlam/authentication service returns 503 or SideStore reports
-malformed data, Location Suite leaves the installed app, cached expiration,
-certificate, and profile untouched. The already-issued profile remains usable
-until its displayed expiration. Retry SideStore later; Location Suite never
-revokes or recreates certificates.
+If Apple GrandSlam returns 503 or anisette is unavailable, Location Suite leaves
+the installed app, cached expiration, certificate, and profile untouched. The
+already-issued profile remains usable until its displayed expiration. Retry
+later; Phase 1 exposes no certificate create/revoke API.
 
-With a free Apple Account, CI now automates tests, unsigned archive/package,
+With a free Apple Account, CI automates tests, unsigned archive/package,
 metadata/hash/feed creation, publication after hosting is configured, daily feed
-validation, in-app update detection, expiry detection, and SideStore handoff.
-The user/SideStore still must authenticate when needed, sign locally, install or
-update, and renew the seven-day profile. Background App Refresh is not assumed,
-so invisible unattended renewal is not promised.
+validation, update detection, expiry detection, and compilation of the direct
+profile-refresh candidate. Background App Refresh is not assumed, so invisible
+unattended renewal is not promised.
 
 ## Cold bootstrap state machine
 
@@ -155,6 +160,26 @@ LocalDevVPN route
   -> coordinate set
   -> Ready
 ```
+
+**Prepare LTE Session** uses the same handles and the same serialized bootstrap,
+but deliberately stops before any coordinate is sent:
+
+```text
+LocalDevVPN route
+  -> TCP connect
+  -> RemotePairing
+  -> RSD connect
+  -> DVT LocationSimulation
+  -> Ready
+```
+
+On success that coordinate-free service session becomes `idleWarm`: the service
+session is open, simulation is inactive, the coordinate producer is `None`, and
+the existing 12-second coordinate-free heartbeat retains the channel. A later
+Point or Route claims the normal producer lease and sets its first coordinate on
+that handle instead of opening another RemotePairing connection. Preparation of
+an already-open handle is a warm reuse and performs no handshake or service
+command.
 
 For each stage it retains attempt number and elapsed time when upstream exposes
 a boundary. `tunnel_create_rppairing` combines TCP connect and RemotePairing; on
@@ -212,11 +237,40 @@ commit `af3fd697803ada4ac2b8d518358f5ab0a534844c`. It logs only IPv4/TCP headers
 involving port 49152, direction, flags, path/interface, and tunnel lifecycle.
 See the adjacent README for build, collection, and SYN/RST interpretation.
 
-No physical packet trace was available during this implementation. Thus the
-current errno 61 remains **unproven** as either a listener-generated local RST or
-a LocalDevVPN reflection/lifecycle fault. The structured app trace proves the
-failure is at TCP connect; the instrumented VPN fork experiment is what decides
-which side generated it.
+The exact source of the refusal (listener-generated local RST versus a
+LocalDevVPN reflection/lifecycle detail) is still not claimed without a packet
+trace. The device result below does prove the product-level boundary: direct
+cold cellular startup is refused at TCP, while the same phone-local route can
+open RemotePairing with the underlying network unavailable in Airplane Mode.
+
+## Proven iPhone 15 Pro Max result
+
+Validated on **iPhone 15 Pro Max**, **iOS 27.0**, **Location Suite 1.5.0**.
+
+These are three distinct states:
+
+1. **Direct cold cellular startup:** with Wi-Fi off, LTE active, LocalDevVPN
+   connected, and no retained LocationSimulation session, a new connection
+   fails deterministically at `TCP connect`, status `3`, errno `61`
+   (`connectionRefused`). The bounded cellular retry remains `0, 150 ms`, then
+   stops.
+2. **Airplane Mode bootstrap (no Wi-Fi):** LTE starts on, LocalDevVPN is
+   connected, Airplane Mode is turned on, then Location Suite is launched. The
+   proven 1.5.0 run started a Point: the underlying network reported
+   `Unavailable`, the phone-local LocalDevVPN endpoint remained reachable,
+   RemotePairing and DVT LocationSimulation succeeded, and the session reached
+   `activePoint`. Airplane Mode was then turned off; LTE returned and the same
+   session remained usable for later Point updates. The new **Prepare LTE
+   Session** action deliberately exercises this proven bootstrap only through
+   DVT readiness and stops before the Point run's `coordinateSet`; the acceptance
+   sequence below is the physical validation for that new coordinate-free stop.
+3. **Already-warm LTE operation:** Point and Route updates continue over the
+   retained LocationSimulation session after LTE returns. This is proven working
+   behavior and is not a cold connection attempt.
+
+Airplane Mode is not described as Wi-Fi: Wi-Fi remains off throughout this
+procedure. Location Suite does not toggle Airplane Mode, Wi-Fi, or cellular; the
+user performs those system actions.
 
 ## Physical iPhone 15 Pro Max matrix
 
@@ -240,6 +294,31 @@ and LocalDevVPN `[TunnelProv]` header lines for every run.
 | L bad pairing | use deliberately invalid pairing file on known-good Wi-Fi | TCP acceptance followed by pairing-specific failure |
 | M DDI unavailable | remove/redownload DDI only after transport control succeeds | failure only at DVT/DDI stage |
 | N rapid transitions | repeatedly switch Wi-Fi/LTE while point, route, Return, and retry boundaries are exercised | no duplicate handshake race, crash, or ownership corruption |
+
+### Location Suite 1.5.0 no-Wi-Fi acceptance sequence
+
+1. Force-close Location Suite.
+2. Leave Wi-Fi off and cellular/LTE on.
+3. Connect LocalDevVPN.
+4. Turn Airplane Mode on; do not enable Wi-Fi.
+5. Launch Location Suite and choose **Prepare LTE Session** (or tap **Continue**
+   in the purpose-built cellular-refusal recovery prompt).
+6. Confirm diagnostics show endpoint reachable `Yes`, RemotePairing `Yes`, DDI
+   `Yes`, Simulation Service Session `Yes`, Simulation Active `No`, Coordinate
+   Producer `None`, Warm Session Keeper `Active`, Warm Session State `idleWarm`,
+   and the preparation stages ending at `DVT LocationSimulation -> Ready` with
+   no `Coordinate set` stage.
+7. Turn Airplane Mode off and wait for cellular/LTE to return; keep Wi-Fi off.
+8. Confirm the same idle-warm diagnostic state remains.
+9. Start a Point, then Return. Confirm `activePoint -> idleWarm` without a fresh
+   bootstrap.
+10. Start a Route, then Return. Confirm `activeRoute -> idleWarm` without a fresh
+    bootstrap.
+11. Tap **Disconnect Session** and confirm session `No`, active `No`, producer
+    `None`, keeper `Inactive`, state `disconnected`.
+12. Still on LTE with Wi-Fi off, attempt a new cold Point and confirm the bounded
+    TCP refusal remains stage `TCP connect`, status `3`, category
+    `connectionRefused`, errno `61`.
 
 Do not use private coordinates in screenshots or issue attachments. The final
 classification is:

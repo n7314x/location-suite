@@ -47,9 +47,10 @@ final class LogManager: ObservableObject {
     }
 
     func addLog(message: String, type: LogEntry.LogType) {
-        let clean = Self.redundantPrefixes
+        let normalized = Self.redundantPrefixes
             .first(where: { message.hasPrefix($0) })
             .map { String(message.dropFirst($0.count)) } ?? message
+        let clean = SensitiveDiagnosticRedactor.redact(normalized)
 
         DispatchQueue.main.async {
             self.logs.append(LogEntry(timestamp: Date(), type: type, message: clean))

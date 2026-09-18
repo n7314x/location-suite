@@ -15,68 +15,68 @@ in-process RemotePairing session cannot survive process termination.
 
 ### A.
 
-Wi-Fi on  
-LocalDevVPN on  
-simulate point  
+Wi-Fi on
+LocalDevVPN on
+simulate point
 confirm Session Yes / Active Yes / Producer Point
 
 ### B.
 
-Turn Wi-Fi off  
-LTE only  
-change fake point  
+Turn Wi-Fi off
+LTE only
+change fake point
 must work
 
 ### C.
 
-Press Return  
-confirm:  
-Session Yes  
-Active No  
-Producer None  
+Press Return
+confirm:
+Session Yes
+Active No
+Producer None
 Warm Session Keeper Active
 
 ### D.
 
-Lock phone / background Location Suite for at least 30 minutes.  
+Lock phone / background Location Suite for at least 30 minutes.
 Do not enable Wi-Fi.
 
 ### E.
 
-Unlock phone on LTE.  
-Open Location Suite.  
-confirm:  
-Session Yes  
-Active No  
-Producer None  
-Warm Session Keeper Active  
+Unlock phone on LTE.
+Open Location Suite.
+confirm:
+Session Yes
+Active No
+Producer None
+Warm Session Keeper Active
 RemotePairing Transport Yes
 
 ### F.
 
-Set a new fake point while still on LTE.  
+Set a new fake point while still on LTE.
 It must work without a fresh bootstrap.
 
 ### G.
 
-Press Return again.  
-Lock/background another 30 minutes.  
-Still on LTE, start a route.  
+Press Return again.
+Lock/background another 30 minutes.
+Still on LTE, start a route.
 It must work without a fresh bootstrap.
 
 ### H.
 
-Press Disconnect Session.  
-confirm:  
-Session No  
-Active No  
-Producer None  
+Press Disconnect Session.
+confirm:
+Session No
+Active No
+Producer None
 Warm Session Keeper Inactive
 
 ### I.
 
-Still on LTE, try to simulate again.  
-If it fails because the endpoint refuses a fresh connection, that is expected.  
+Still on LTE, try to simulate again.
+If it fails because the endpoint refuses a fresh connection, that is expected.
 This confirms the distinction between:
 
 - a reusable warm session

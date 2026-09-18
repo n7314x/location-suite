@@ -31,7 +31,7 @@ private enum MapInteractionMode {
 
 private enum PointCoordinateResult: Sendable {
     case succeeded
-    case failed(Int32, LocationBootstrapError?)
+    case failed(Int32, ColdBootstrapTrace?)
     case stale
 
     var code: Int32? {
@@ -293,6 +293,7 @@ private enum PendingAlert {
     case saveBookmark
     case saveRoute
     case locationPermissionDenied
+    case prepareLTESession
 
     /// Verbatim, because the `.message` payload arrives already localized from
     /// `String(localized:)` at the call site; the two fixed cases look their own
@@ -303,6 +304,7 @@ private enum PendingAlert {
         case .saveBookmark: return String(localized: "Save Bookmark")
         case .saveRoute: return String(localized: "Save Route")
         case .locationPermissionDenied: return String(localized: "Location Permission Needed")
+        case .prepareLTESession: return String(localized: "Prepare LTE Session")
         }
     }
 }
@@ -315,13 +317,15 @@ private enum PendingAlert {
 private enum PendingSheet: Identifiable {
     case bookmarks
     case savedRoutes
+    case routeSchedules
     case settings
 
     var id: Int {
         switch self {
         case .bookmarks: return 0
         case .savedRoutes: return 1
-        case .settings: return 2
+        case .routeSchedules: return 2
+        case .settings: return 3
         }
     }
 }
@@ -494,6 +498,8 @@ struct LocationSimulationView: View {
     @State private var directionsCoordinator = RouteDirectionsCoordinator()
     @StateObject private var routePlayback = RoutePlaybackController.deviceController()
     @StateObject private var savedRouteLibrary = SavedRouteLibrary.shared
+    @StateObject private var routeScheduleLibrary = RouteScheduleLibrary.shared
+    @StateObject private var routeScheduleRunner = RouteScheduleRunner()
 
     // Bookmarks
     @State private var bookmarks: [LocationBookmark] = []
@@ -1285,6 +1291,10 @@ struct LocationSimulationView: View {
                     }
                 }
                 Button("Cancel", role: .cancel) { }
+
+            case .prepareLTESession:
+                Button("Continue") { prepareLTESession() }
+                Button("Cancel", role: .cancel) { }
             }
         } message: { alert in
             switch alert {
@@ -1298,6 +1308,15 @@ struct LocationSimulationView: View {
                 Text("Saved geometry can be replayed later without resolving the route again.")
             case .locationPermissionDenied:
                 Text("TLocation needs location access to find your current position. Note: while a simulated location is active, iOS reports the simulated position.")
+            case .prepareLTESession:
+                Text("""
+                iOS is refusing a new RemotePairing connection while cellular is active. You can prepare the session without Wi-Fi.
+
+                1. Keep LocalDevVPN connected.
+                2. Turn on Airplane Mode.
+                3. Return to Location Suite and tap Continue.
+                4. After the session is ready, turn Airplane Mode off.
+                """)
             }
         }
         // The one and only sheet on this view, for the same reason — see
@@ -1335,6 +1354,14 @@ struct LocationSimulationView: View {
                 SavedRoutesView(library: savedRouteLibrary) { route in
                     loadSavedRoute(route)
                 }
+            case .routeSchedules:
+                RouteSchedulesView(
+                    library: routeScheduleLibrary,
+                    routes: savedRouteLibrary.routes,
+                    runner: routeScheduleRunner
+                ) { schedule in
+                    startSchedule(schedule)
+                }
             case .settings:
                 SettingsView()
             }
@@ -1363,14 +1390,21 @@ struct LocationSimulationView: View {
         }
         .onChange(of: routePlayback.state) { _, newState in
             guard case .error(let playbackError) = newState else { return }
-            presentAlert(.message(
-                title: String(localized: "Route Playback Stopped"),
-                body: playbackError.message
-            ))
+            if playbackError.reason == .lteSessionPreparationRequired {
+                presentAlert(.prepareLTESession)
+            } else {
+                presentAlert(.message(
+                    title: String(localized: "Route Playback Stopped"),
+                    body: playbackError.message
+                ))
+            }
         }
         .onAppear {
             loadBookmarks()
-            Task { await savedRouteLibrary.reload() }
+            Task {
+                await savedRouteLibrary.reload()
+                await routeScheduleLibrary.reload()
+            }
             routePlayback.setSpeedMultiplier(routeSpeedMultiplier, mode: routeMovementMode)
             // A live foreground location session for as long as the map is
             // visible. Without it the only Core Location session in the app is
@@ -1388,6 +1422,7 @@ struct LocationSimulationView: View {
             routePlayback.setSpeedMultiplier(clamped, mode: routeMovementMode)
         }
         .onDisappear {
+            routeScheduleRunner.cancel()
             // Balances the `startTracking()` above: no GPS runs while the map
             // is off screen.
             currentLocationProvider.stopTracking()
@@ -1593,6 +1628,12 @@ struct LocationSimulationView: View {
                 pendingSheet = .savedRoutes
             } label: {
                 Label("Saved Routes", systemImage: "tray.full")
+            }
+
+            Button {
+                pendingSheet = .routeSchedules
+            } label: {
+                Label("Route Schedules", systemImage: "calendar.badge.clock")
             }
 
             Button {
@@ -1883,6 +1924,7 @@ struct LocationSimulationView: View {
     }
 
     private func clearRoute() {
+        routeScheduleRunner.cancel()
         guard routePlayback.canEditRoute else { return }
         routeResolutionTask?.cancel()
         routeResolutionTask = nil
@@ -2137,7 +2179,52 @@ struct LocationSimulationView: View {
         showStatusMessage(String(localized: "Loaded \(document.name)"))
     }
 
+    private func startSchedule(_ schedule: RouteScheduleDocument) {
+        guard !routeScheduleRunner.isRunning else { return }
+        guard routePlayback.canEditRoute else {
+            presentAlert(.message(
+                title: String(localized: "Route Busy"),
+                body: String(localized: "Stop the current route before starting a schedule.")
+            ))
+            return
+        }
+
+        do {
+            let warnings = try RouteScheduleValidator.validate(
+                schedule,
+                routes: savedRouteLibrary.routes
+            )
+            if !warnings.isEmpty {
+                let detail = warnings.map {
+                    "\($0.fromRouteName) → \($0.toRouteName): \(Int($0.distance.rounded())) m"
+                }.joined(separator: "\n")
+                showStatusMessage(String(localized: "Schedule armed. Route jumps: \(detail)"))
+            } else if let startAt = schedule.startAt, startAt > Date() {
+                showStatusMessage(String(localized: "Schedule armed for \(startAt.formatted(date: .omitted, time: .shortened))"))
+            } else {
+                showStatusMessage(String(localized: "Schedule started"))
+            }
+        } catch {
+            presentAlert(.message(
+                title: String(localized: "Could Not Start Schedule"),
+                body: error.localizedDescription
+            ))
+            return
+        }
+
+        routeLoopMode = .off
+        routePlayback.setLoopMode(.off)
+        routeScheduleRunner.start(
+            schedule,
+            routes: savedRouteLibrary.routes,
+            playback: routePlayback
+        ) {
+            stopPointProducer()
+        }
+    }
+
     private func stopRoute() {
+        routeScheduleRunner.cancel()
         guard routePlayback.canStopRoute else { return }
         Task {
             let didHold = await routePlayback.stopRoute()
@@ -2202,19 +2289,53 @@ struct LocationSimulationView: View {
                 isBusy = false
                 guard LocationSimulationOwnership.shared.isCurrent(lease) else { return }
                 switch result {
-                case .failed(let code, let bootstrapError):
+                case .failed(let code, let trace):
+                    let bootstrapError = trace?.failure
                     stopPointProducer(reason: .failure(connectionUnavailable: false))
-                    pendingAlert = .message(
-                        title: bootstrapError?.userTitle ?? String(localized: "Simulation Failed"),
-                        body: bootstrapError.map {
-                            "\($0.userMessage)\n\nStage: \($0.stage.displayName)\nStatus: \($0.statusCode)\($0.errno.map { "\nerrno: \($0)" } ?? "")\n\($0.detail)"
-                        } ?? String(localized: "Could not simulate location (error \(code)).")
-                    )
+                    if LTEPreparationRecoveryPolicy.shouldOffer(
+                        trace: trace,
+                        warmSessionOpen: LocationSimulationSession.isOpen
+                    ) {
+                        pendingAlert = .prepareLTESession
+                    } else {
+                        pendingAlert = .message(
+                            title: bootstrapError?.userTitle ?? String(localized: "Simulation Failed"),
+                            body: bootstrapError.map {
+                                "\($0.userMessage)\n\nStage: \($0.stage.displayName)\nStatus: \($0.statusCode)\($0.errno.map { "\nerrno: \($0)" } ?? "")\n\($0.detail)"
+                            } ?? String(localized: "Could not simulate location (error \(code)).")
+                        )
+                    }
                 case .succeeded:
                     startResendLoop(with: coord, lease: lease)
                 case .stale:
                     break
                 }
+            }
+        }
+    }
+
+    private func prepareLTESession() {
+        guard !isBusy else { return }
+        isBusy = true
+        Task { @MainActor in
+            let outcome = await LocationSimulationSessionPreparer.shared.prepare()
+            isBusy = false
+            switch outcome {
+            case .ready:
+                presentAlert(.message(
+                    title: String(localized: "LTE Session Ready"),
+                    body: String(localized: "LTE session ready. You can turn Airplane Mode off.")
+                ))
+            case .failed(let result):
+                let failure = result.coldBootstrapTrace?.failure
+                presentAlert(.message(
+                    title: failure?.userTitle ?? String(localized: "Session Preparation Failed"),
+                    body: failure.map {
+                        "\($0.userMessage)\n\nStage: \($0.stage.displayName)\nStatus: \($0.statusCode)\($0.errno.map { "\nerrno: \($0)" } ?? "")\n\($0.detail)"
+                    } ?? String(localized: "Could not prepare the LTE session (status \(result.statusCode)).")
+                ))
+            case .superseded:
+                break
             }
         }
     }
@@ -2655,6 +2776,7 @@ struct LocationSimulationView: View {
     /// guaranteed to be running at the moment the camera is handed back to
     /// `.userLocation` below.
     private func returnToRealLocation() {
+        routeScheduleRunner.cancel()
         if routePlayback.canReturnToRealLocation {
             isReturningToRealLocation = true
             Task {
@@ -2746,7 +2868,7 @@ struct LocationSimulationView: View {
         )
         return result.statusCode == 0
             ? .succeeded
-            : .failed(result.statusCode, result.coldBootstrapTrace?.failure)
+            : .failed(result.statusCode, result.coldBootstrapTrace)
     }
 }
 

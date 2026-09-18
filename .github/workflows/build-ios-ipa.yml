@@ -40,6 +40,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Install Rust 1.98.1 and iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: aarch64-apple-ios
+          components: rustfmt, clippy
+
       - name: Record build environment
         run: |
           set -euo pipefail
@@ -55,6 +62,11 @@ jobs:
           test -f ios/TLocation/Info.plist
           test -f ios/TLocation/TLocation.entitlements
           test -f ios/TLocation/idevice/libidevice_ffi.a
+          test -f ios/SelfMaintenanceCore/Cargo.lock
+          test -f ios/TLocation/self_maintenance/location_self_maintenance.h
+          cargo fmt --manifest-path ios/SelfMaintenanceCore/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path ios/SelfMaintenanceCore/Cargo.toml -- -D warnings
+          cargo test --locked --manifest-path ios/SelfMaintenanceCore/Cargo.toml
           xcodebuild -project ios/TLocation.xcodeproj -list
 
       - name: Run deterministic Swift tests
@@ -83,7 +95,7 @@ jobs:
             echo "- Xcode: \`$(xcodebuild -version | tr '\n' ' ')\`"
             echo "- iOS SDK: \`$(xcrun --sdk iphoneos --show-sdk-version)\`"
             echo "- Version/build: \`$VERSION ($BUILD_VERSION)\`"
-            echo "- Signing: disabled; SideStore signs locally at install time"
+            echo "- Signing: disabled; intended for local on-device signing or recovery installation"
             echo "- IPA: \`LocationSuite.ipa\` ($IPA_SIZE bytes)"
             echo "- SHA-256: \`$IPA_SHA256\`"
             echo "- Payload app: \`Payload/TLocation.app\`"

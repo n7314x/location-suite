@@ -53,6 +53,31 @@ final class TunnelManager: ObservableObject {
         _ result: LocationSimulationAttemptResult,
         reusedOpenSession: Bool
     ) {
+        recordLocationAttempt(
+            result,
+            reusedOpenSession: reusedOpenSession,
+            confirmsRetainedTransport: false
+        )
+    }
+
+    /// Preparation proves that an open LocationSimulation handle has its full
+    /// RemotePairing/RSD/DVT parent stack, even when it reused that handle.
+    func recordPreparationResult(
+        _ result: LocationSimulationAttemptResult,
+        reusedOpenSession: Bool
+    ) {
+        recordLocationAttempt(
+            result,
+            reusedOpenSession: reusedOpenSession,
+            confirmsRetainedTransport: true
+        )
+    }
+
+    private func recordLocationAttempt(
+        _ result: LocationSimulationAttemptResult,
+        reusedOpenSession: Bool,
+        confirmsRetainedTransport: Bool
+    ) {
         runOnMain {
             if let trace = result.coldBootstrapTrace,
                ColdBootstrapTraceOrdering.shouldReplace(
@@ -69,8 +94,10 @@ final class TunnelManager: ObservableObject {
             }
 
             if result.statusCode == 0 {
-                if !reusedOpenSession {
+                if !reusedOpenSession || confirmsRetainedTransport {
                     self.isConnected = true
+                }
+                if !reusedOpenSession {
                     self.endpointReachability = .reachable
                 }
                 self.lastConnectionFailureCategory = nil
@@ -122,9 +149,10 @@ final class TunnelManager: ObservableObject {
             return
         }
 
-        guard !LocationSimulationSession.isOpen else {
+        guard !LocationSimulationSession.isOpen,
+              !LocationSimulationSession.isMaintained else {
             LogManager.shared.addInfoLog(
-                "Fresh tunnel start skipped: the warm location-simulation session is still open."
+                "Fresh tunnel start skipped: the location-simulation lifecycle owns the phone-local connection."
             )
             return
         }
@@ -218,6 +246,7 @@ final class TunnelManager: ObservableObject {
                         targetHost: target,
                         targetPort: 49152,
                         underlyingNetwork: underlyingNetwork,
+                        operation: .connectionReadiness,
                         measurements: measurements,
                         retryCount: retryCount,
                         totalElapsed: Date().timeIntervalSince(startedAt),
@@ -249,6 +278,13 @@ final class TunnelManager: ObservableObject {
             )
             mountDeveloperDiskImageIfNeeded()
         case .failure(let error):
+            guard !LocationSimulationSession.isOpen,
+                  !LocationSimulationSession.isMaintained else {
+                LogManager.shared.addInfoLog(
+                    "Ignored a stale fresh-tunnel failure because LocationSimulation now owns the phone-local connection."
+                )
+                return
+            }
             if let trace = outcome.trace,
                ColdBootstrapTraceOrdering.shouldReplace(
                    currentSequence: lastColdBootstrap?.sequence,
@@ -294,6 +330,13 @@ final class TunnelManager: ObservableObject {
         }
 
         if let failure = lastColdBootstrap?.failure {
+            if LTEPreparationRecoveryPolicy.shouldOffer(
+                trace: lastColdBootstrap,
+                warmSessionOpen: LocationSimulationSession.isOpen
+            ) {
+                showLTEPreparationRecovery()
+                return
+            }
             let errnoLine = failure.errno.map { "\nerrno: \($0)" } ?? ""
             showAlert(
                 title: failure.userTitle,
@@ -318,6 +361,54 @@ final class TunnelManager: ObservableObject {
             if shouldTryAgain {
                 startTunnelInBackground()
             }
+        }
+    }
+
+    private func showLTEPreparationRecovery() {
+        showAlert(
+            title: String(localized: "Prepare LTE Session"),
+            message: String(localized: """
+            iOS is refusing a new RemotePairing connection while cellular is active. You can prepare the session without Wi-Fi.
+
+            1. Keep LocalDevVPN connected.
+            2. Turn on Airplane Mode.
+            3. Return to Location Suite and tap Continue.
+            4. After the session is ready, turn Airplane Mode off.
+            """),
+            showOk: false,
+            showTryAgain: true,
+            primaryButtonText: String(localized: "Continue")
+        ) { shouldContinue in
+            guard shouldContinue else { return }
+            Task { @MainActor in
+                let outcome = await LocationSimulationSessionPreparer.shared.prepare()
+                Self.presentPreparationOutcome(outcome)
+            }
+        }
+    }
+
+    static func presentPreparationOutcome(_ outcome: LocationSimulationPreparationOutcome) {
+        switch outcome {
+        case .ready:
+            showAlert(
+                title: String(localized: "LTE Session Ready"),
+                message: String(localized: "LTE session ready. You can turn Airplane Mode off."),
+                showOk: true
+            )
+        case .failed(let result):
+            let failure = result.coldBootstrapTrace?.failure
+            let errnoLine = failure?.errno.map { "\nerrno: \($0)" } ?? ""
+            showAlert(
+                title: failure?.userTitle ?? String(localized: "Session Preparation Failed"),
+                message: failure.map {
+                    "\($0.userMessage)\n\nStage: \($0.stage.displayName)\nStatus: \($0.statusCode)\(errnoLine)\n\nTechnical details:\n\($0.detail)"
+                } ?? String(localized: "Location Suite could not prepare the LocationSimulation session (status \(result.statusCode))."),
+                showOk: true
+            )
+        case .superseded:
+            // A Point, Route, or Disconnect action is now authoritative. Its UI
+            // reports its own result; a stale preparation must stay silent.
+            break
         }
     }
 
@@ -416,14 +507,13 @@ func startTunnelInBackground(showErrorUI: Bool = true) {
 /// the tunnel is marked disconnected, which can happen with a resend loop still
 /// alive, so Retry is one tap away from exactly that.
 ///
-/// Deferred, never refused: the user must always be able to recover a dead
-/// tunnel, so unlike `attemptDeferredTunnelReconnect` this has no condition
-/// attached and nothing can drop it. Appending to the serial
-/// `LocationSimulationCommandQueue` is only a matter of waiting its turn — the
-/// hop cannot begin until any FFI call already running there has returned, and
-/// once it does begin the start is unconditional. Ticks queued ahead of it that
+/// Appending to the serial `LocationSimulationCommandQueue` waits for any FFI
+/// call already running there. The main-thread start then rechecks the shared
+/// open/maintained state: if Point, Route, preparation, or idleWarm claimed the
+/// lifecycle in that interval, its retained channel is authoritative and the
+/// redundant JIT handshake is skipped. Ticks queued ahead of this block that
 /// belong to a run that has ended return without calling anything (see
-/// `ResendGeneration`), so a concluded run leaves nothing real in the way.
+/// `ResendGeneration`).
 ///
 /// The start itself is bounced back to the main thread, which is where
 /// `TunnelManager.start(showErrorUI:)` requires to be called from; no FFI runs

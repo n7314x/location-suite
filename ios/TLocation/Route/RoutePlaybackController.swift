@@ -9,6 +9,7 @@ import Foundation
 enum RoutePlaybackFailureReason: Equatable, Sendable {
     case noPairingFile
     case tunnelUnavailable
+    case lteSessionPreparationRequired
     case developerDiskImageUnavailable
     case sessionFailed
     case interrupted
@@ -23,7 +24,9 @@ struct RoutePlaybackFailure: Error, Equatable, LocalizedError, Sendable {
     let message: String
 
     var errorDescription: String? { message }
-    var marksConnectionUnavailable: Bool { reason == .tunnelUnavailable }
+    var marksConnectionUnavailable: Bool {
+        reason == .tunnelUnavailable || reason == .lteSessionPreparationRequired
+    }
 }
 
 struct RoutePlaybackError: Equatable, Sendable {

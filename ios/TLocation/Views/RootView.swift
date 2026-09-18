@@ -10,15 +10,6 @@ import UIKit
 private enum RootViewLinks {
     static let localDevVPNAppStore = URL(string: "https://apps.apple.com/us/app/localdevvpn/id6755608044")!
 
-    /// Tried in order. SideStore renamed itself out of the AltStore lineage but both
-    /// schemes are still in the wild, so guess the current one first and let the
-    /// website catch anyone running neither.
-    static let sideStore: [URL] = [
-        URL(string: "sidestore://")!,
-        URL(string: "altstore://")!,
-        URL(string: "https://sidestore.io")!
-    ]
-
     static let localDevVPN: [URL] = [
         URL(string: "stosvpn://")!,
         localDevVPNAppStore
@@ -86,6 +77,7 @@ struct RootView: View {
     @ObservedObject private var tunnel = TunnelManager.shared
     @ObservedObject private var mounting = MountingProgress.shared
     @ObservedObject private var signing = SigningExpiryMonitor.shared
+    @ObservedObject private var maintenance = SelfMaintenanceService.shared
 
     @Environment(\.scenePhase) private var scenePhase
 
@@ -163,22 +155,40 @@ struct RootView: View {
             MountingProgress.shared.checkforMounted()
             signing.refreshIfPossible(reason: "launch")
             evaluateExpiryWarning()
+            Task {
+                    await maintenance.restoreRememberedSessionIfNeeded()
+                    await maintenance.handleForegroundActivation()
+                }
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 signing.refreshIfPossible(reason: "a return to the foreground")
                 evaluateExpiryWarning()
+                Task {
+                    await maintenance.restoreRememberedSessionIfNeeded()
+                    await maintenance.handleForegroundActivation()
+                }
             }
         }
         // The tunnel is almost never up at the instant `onAppear` runs, so this is
         // the edge that actually gets the first read of a cold launch taken.
         .onChange(of: tunnel.isConnected) { _, isConnected in
-            if isConnected { signing.refreshIfPossible(reason: "the tunnel connecting") }
+            if isConnected {
+                signing.refreshIfPossible(reason: "the tunnel connecting")
+                Task {
+                    await maintenance.restoreRememberedSessionIfNeeded()
+                    await maintenance.handleForegroundActivation()
+                }
+            }
         }
         // A reading landing seconds after launch is the normal case, so the
         // decision is retried whenever one does rather than only at `onAppear`.
         .onChange(of: signing.reading) { _, _ in
             evaluateExpiryWarning()
+            Task {
+                    await maintenance.restoreRememberedSessionIfNeeded()
+                    await maintenance.handleForegroundActivation()
+                }
         }
         .onReceive(statusTimer) { _ in
             // Cheap existence check only. `prepareURL()` does directory creation and a
@@ -214,6 +224,7 @@ struct RootView: View {
         } message: { action in
             Text(action.message)
         }
+        .modifier(TwoFactorPromptOverlayModifier())
     }
 
     // MARK: - Signing expiry warning
@@ -255,8 +266,8 @@ struct RootView: View {
 
         guard AppSigningInfo.isExpiringSoon(expiry) else { return }
 
-        // Suppression is keyed to this exact expiry date, so a SideStore refresh —
-        // new certificate, new expiry — starts warning again next week. Now that
+        // Suppression is keyed to this exact expiry date, so a profile refresh
+        // starts warning again next week. Now that
         // the date is read from the device it actually moves, which is what makes
         // the checkbox mean what it says.
         guard !ExpiryWarningSuppression.isSuppressed(expiry) else { return }
@@ -281,8 +292,8 @@ struct RootView: View {
 
     private var expiryBody: String {
         signatureHasExpired
-            ? String(localized: "The signing certificate for this install has lapsed, so TLocation will not launch again until it is re-signed. Open SideStore and refresh TLocation to fix it.")
-            : String(localized: "Open SideStore and refresh TLocation to re-sign it. If the signature fully expires the app will not launch and must be reinstalled.")
+            ? String(localized: "This installation has expired. Location Suite cannot repair itself after it stops launching; reinstall it with iLoader, then return here before the next expiry.")
+            : String(localized: "Open Self Maintenance to renew the provisioning profile on this iPhone. If the app fully expires, use iLoader for emergency recovery.")
     }
 
     /// Same visual language as the readiness overlay: full-screen material scrim
@@ -323,10 +334,10 @@ struct RootView: View {
 
             VStack(spacing: 10) {
                 Button {
-                    openSideStore()
+                    isShowingSettings = true
                     dismissExpiryWarning()
                 } label: {
-                    Label("Open SideStore", systemImage: "arrow.up.forward.app")
+                    Label("Open Self Maintenance", systemImage: "wrench.and.screwdriver")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
@@ -491,10 +502,6 @@ struct RootView: View {
 
     private func openLocalDevVPN() {
         openFirstResolving(RootViewLinks.localDevVPN)
-    }
-
-    private func openSideStore() {
-        openFirstResolving(RootViewLinks.sideStore)
     }
 
     /// The readiness overlay can be on screen with a simulation still running —
