@@ -128,7 +128,6 @@ final class SelfMaintenanceService: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               !appleID.isEmpty,
               let passwordData = try? secrets.data(for: SelfMaintenanceSecretAccount.applePassword),
-              let passwordData,
               let password = String(data: passwordData, encoding: .utf8),
               !password.isEmpty else {
             return
