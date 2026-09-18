@@ -159,38 +159,5 @@ struct SelfMaintenanceAccountView: View {
         .onChange(of: rememberPassword) { _, isEnabled in
             if !isEnabled { maintenance.forgetRememberedPassword() }
         }
- {
-            NavigationStack {
-                Form {
-                    Section {
-                        TextField("Six-digit code", text: $verificationCode)
-                            .keyboardType(.numberPad)
-                            .textContentType(.oneTimeCode)
-                        if let message = twoFactor.validationMessage {
-                            Text(message).font(.caption).foregroundStyle(.red)
-                        }
-                    } footer: {
-                        Text("Enter the code Apple sent to a trusted device or phone number. It is never stored or logged.")
-                    }
-                }
-                .navigationTitle("Apple Verification")
-                .navigationBarTitleDisplayMode(.inline)
-                .interactiveDismissDisabled()
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") {
-                            verificationCode = ""
-                            twoFactor.cancel()
-                        }
-                    }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Continue") {
-                            twoFactor.submit(verificationCode)
-                            verificationCode = ""
-                        }
-                    }
-                }
-            }
-        }
     }
 }
