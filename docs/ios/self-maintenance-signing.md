@@ -31,11 +31,39 @@ The last read is authoritative. A successful HTTP response or a profile blob
 is never recorded as success by itself. Failures update attempt/category data
 but do not overwrite the last verified expiry or last successful refresh.
 
+### Signing identity and external rewrites
+
+The repository's canonical unsigned bundle identifier is always
+`vn.truongkma.tlocation`. The physical installation currently reports
+`vn.truongkma.tlocation.XX5C7UH7HA`. That suffix is not produced by this
+repository: iLoader calls isideload's default install path, which rewrites the
+main bundle ID as `<unsigned bundle ID>.<selected team ID>` before App ID lookup
+and registration. For this installation, `XX5C7UH7HA` is the selected signing
+team identifier. iLoader exposes no bundle-ID/App-ID selection argument in that
+install call, so Location Suite cannot force it to use another existing App ID.
+
+Self Maintenance consequently keeps these values separate: canonical source
+bundle ID, installed `Bundle.main.bundleIdentifier`, full profile
+`application-identifier`, profile team ID, portal bundle ID (the application
+identifier with only its actual leading team prefix removed), and selected team
+ID. A final dot component is never guessed to be a signer suffix.
+
+An exact case-insensitive portal bundle-ID match is the only reusable match,
+because Apple specifies bundle IDs as case-insensitive. No prefix/suffix or
+similar-name fallback exists. A downloaded profile must preserve both the
+installed App ID and team before it can be installed. If the exact App ID is
+missing, the FFI returns `appIDMissing`; automatic refresh stops retrying and no
+App ID is registered. A profile-only operation cannot change the executable's
+signed application identifier. Waiting for capacity alone therefore does not
+repair the current installation: the app must be re-signed/reinstalled after
+the signer can register or reuse the exact ID.
+
 No certificate API is exposed by the Phase 1 Rust FFI. It cannot create,
 replace, or revoke a certificate. `downloadTeamProvisioningProfile` lets Apple
 bind the renewed profile to the team's existing usable development
 certificate(s). Certificate creation and `MaxCertsBehavior::Error` belong to
 the later full-signing milestone, after profile renewal is physically proven.
+The Rust FFI likewise exposes no App ID registration operation.
 
 ## Authentication and anisette
 

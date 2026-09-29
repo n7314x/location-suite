@@ -151,6 +151,7 @@ struct SettingsView: View {
     /// this view shows it and asks for a refresh, and never reads the app bundle.
     @ObservedObject private var signing = SigningExpiryMonitor.shared
     @ObservedObject private var maintenance = SelfMaintenanceService.shared
+    @State private var signingIdentityDiagnosticsExpanded = false
     @ObservedObject private var updates = UpdateService.shared
     @ObservedObject private var tunnel = TunnelManager.shared
     @ObservedObject private var mounting = MountingProgress.shared
@@ -802,11 +803,40 @@ struct SettingsView: View {
                 Label("Account Settings", systemImage: "person.crop.circle")
             }
 
+            DisclosureGroup(
+                "Signing Identity Details",
+                isExpanded: $signingIdentityDiagnosticsExpanded
+            ) {
+                signingIdentityDiagnostics
+            }
+
             if let message = maintenance.statusMessage {
                 Text(message)
                     .font(.caption)
                     .foregroundStyle(maintenance.lastError == nil ? Color.secondary : Color.orange)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var signingIdentityDiagnostics: some View {
+        let identity = maintenance.signingIdentity
+        Group {
+            LabeledContent("Canonical Bundle ID", value: identity.canonicalBundleIdentifier)
+            LabeledContent("Installed Bundle ID", value: identity.installedBundleIdentifier ?? "Unavailable")
+            LabeledContent("Profile App ID", value: identity.profileApplicationIdentifier ?? "Not read yet")
+            LabeledContent("Profile Team ID", value: identity.profileTeamIdentifier ?? "Not read yet")
+            LabeledContent("Portal Bundle ID", value: identity.portalBundleIdentifier ?? "Not read yet")
+            LabeledContent("Selected Team", value: identity.selectedDeveloperTeamIdentifier ?? "Not selected")
+            LabeledContent("Portal Match", value: identity.portalMatch.rawValue)
+        }
+        .font(.caption)
+        .textSelection(.enabled)
+
+        if identity.installedDiffersFromCanonical {
+            Text("The installed app identifier differs from the canonical unsigned IPA. The external signer changed it during signing. A profile-only refresh must continue using the installed App ID and cannot change it back.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

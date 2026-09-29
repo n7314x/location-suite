@@ -16,6 +16,28 @@ private final class FakeSecretStorage: SecretStorage, @unchecked Sendable {
 }
 
 struct SelfMaintenancePolicyTests {
+    @Test func appIDMissingCategoryDecodesWithoutBecomingATeamFailure() throws {
+        let payload = #"{"category":"appIDMissing","message":"No App ID was created."}"#
+        let error = try JSONDecoder().decode(SelfMaintenanceError.self, from: Data(payload.utf8))
+        #expect(error.category == .appIDMissing)
+        #expect(error.userFacingSummary == "The installed App ID is missing from the selected developer team.")
+    }
+
+    @Test func signingIdentityKeepsCanonicalAndSignerModifiedIDsSeparate() {
+        let identity = SigningIdentitySnapshot(
+            installedBundleIdentifier: "vn.truongkma.tlocation.XX5C7UH7HA",
+            profileApplicationIdentifier: "XX5C7UH7HA.vn.truongkma.tlocation.XX5C7UH7HA",
+            profileTeamIdentifier: "XX5C7UH7HA",
+            portalBundleIdentifier: "vn.truongkma.tlocation.XX5C7UH7HA",
+            selectedDeveloperTeamIdentifier: "XX5C7UH7HA",
+            portalMatch: .missing
+        )
+        #expect(identity.canonicalBundleIdentifier == "vn.truongkma.tlocation")
+        #expect(identity.installedBundleIdentifier == "vn.truongkma.tlocation.XX5C7UH7HA")
+        #expect(identity.installedDiffersFromCanonical)
+        #expect(identity.portalMatch == .missing)
+    }
+
     @Test func signingCorePanicCategoryDecodesWithoutCollapsingToUnknown() throws {
         let payload = #"{"category":"signingCorePanic","message":"Signing core panic during appleLogin."}"#
         let error = try JSONDecoder().decode(SelfMaintenanceError.self, from: Data(payload.utf8))
@@ -184,6 +206,38 @@ struct SelfMaintenancePolicyTests {
             history: history,
             now: now
         ) == .cooldown)
+    }
+
+    @Test func automaticRefreshDoesNotLoopOnMissingAppID() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let history = SigningRefreshHistory(
+            lastAttempt: now.addingTimeInterval(-30 * 24 * 60 * 60),
+            lastFailureCategory: .appIDMissing
+        )
+        #expect(SigningAutoRefreshPolicy.decision(
+            enabled: true,
+            expirationDate: now.addingTimeInterval(24 * 60 * 60),
+            checkedAt: now,
+            trustWindow: 6 * 60 * 60,
+            hasAccountSessionOrRememberedPassword: true,
+            hasSafeDeviceTransport: true,
+            simulationActive: false,
+            history: history,
+            now: now
+        ) == .blockedByAppIDMissing)
+    }
+
+    @Test func wrongTeamRemainsSeparateFromMissingAppID() {
+        let wrongTeam = SelfMaintenanceError(
+            category: .teamSelectionFailed,
+            message: "The selected team does not match the profile team."
+        )
+        let missing = SelfMaintenanceError(
+            category: .appIDMissing,
+            message: "The exact App ID is not registered."
+        )
+        #expect(wrongTeam.category != missing.category)
+        #expect(wrongTeam.userFacingSummary != missing.userFacingSummary)
     }
 
     @Test func onlyAnActualLaterDeviceExpiryPassesVerification() {

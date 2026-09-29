@@ -20,13 +20,25 @@ struct TLocationTests {
 /// CMS/PKCS#7 container with the XML plist buried in the middle. The bytes either
 /// side stand in for the signature blobs `AppSigningInfo.plist(fromProfile:)` has
 /// to skip past.
-private func makeProfile(applicationIdentifier: String?, expiry: Date?) throws -> Data {
+private func makeProfile(
+    applicationIdentifier: String?,
+    expiry: Date?,
+    entitlementTeamIdentifier: String? = nil,
+    profileTeamIdentifier: String? = nil
+) throws -> Data {
     var plist: [String: Any] = [:]
     if let applicationIdentifier {
-        plist["Entitlements"] = ["application-identifier": applicationIdentifier]
+        var entitlements = ["application-identifier": applicationIdentifier]
+        if let entitlementTeamIdentifier {
+            entitlements["com.apple.developer.team-identifier"] = entitlementTeamIdentifier
+        }
+        plist["Entitlements"] = entitlements
     }
     if let expiry {
         plist["ExpirationDate"] = expiry
+    }
+    if let profileTeamIdentifier {
+        plist["TeamIdentifier"] = [profileTeamIdentifier]
     }
 
     let body = try PropertyListSerialization.data(
@@ -56,6 +68,114 @@ struct AppSigningInfoTests {
         #expect(
             AppSigningInfo.expirationDate(forBundleIdentifier: bundleIdentifier, in: profiles) == mine
         )
+    }
+
+    @Test func teamPrefixParsingPreservesEveryPortalIdentifierSuffix() {
+        let components = AppSigningInfo.applicationIdentifierComponents(
+            "XX5C7UH7HA.vn.truongkma.tlocation.XX5C7UH7HA",
+            explicitTeamIdentifier: "XX5C7UH7HA"
+        )
+        #expect(components?.teamIdentifier == "XX5C7UH7HA")
+        #expect(components?.portalBundleIdentifier == "vn.truongkma.tlocation.XX5C7UH7HA")
+    }
+
+    @Test func parserStripsOnlyTheActualTeamPrefix() {
+        #expect(AppSigningInfo.applicationIdentifierComponents(
+            "TEAM123.com.example.app.legitimateSuffix",
+            explicitTeamIdentifier: "TEAM123"
+        )?.portalBundleIdentifier == "com.example.app.legitimateSuffix")
+        #expect(AppSigningInfo.applicationIdentifierComponents(
+            "OTHERTEAM.com.example.app.TEAM123",
+            explicitTeamIdentifier: "TEAM123"
+        ) == nil)
+    }
+
+    @Test func currentProfileReportsFullInstalledIdentity() throws {
+        let expiry = Date(timeIntervalSince1970: 1_800_000_000)
+        let profile = try makeProfile(
+            applicationIdentifier: "XX5C7UH7HA.vn.truongkma.tlocation.XX5C7UH7HA",
+            expiry: expiry,
+            entitlementTeamIdentifier: "XX5C7UH7HA",
+            profileTeamIdentifier: "XX5C7UH7HA"
+        )
+        let current = try #require(AppSigningInfo.currentProfile(
+            forBundleIdentifier: "vn.truongkma.tlocation.XX5C7UH7HA",
+            in: [profile]
+        ))
+        #expect(current.applicationIdentifier == "XX5C7UH7HA.vn.truongkma.tlocation.XX5C7UH7HA")
+        #expect(current.teamIdentifier == "XX5C7UH7HA")
+        #expect(current.portalBundleIdentifier == "vn.truongkma.tlocation.XX5C7UH7HA")
+    }
+
+    @Test func profileForDifferentAppIDIsNeverAcceptedAsAReplacement() {
+        let expiry = Date(timeIntervalSince1970: 1_800_000_000)
+        let current = AppSigningInfo.ProfileMetadata(
+            data: Data(),
+            expirationDate: expiry,
+            applicationIdentifier: "TEAM123.vn.truongkma.tlocation.XX5C7UH7HA",
+            portalBundleIdentifier: "vn.truongkma.tlocation.XX5C7UH7HA",
+            teamIdentifier: "TEAM123"
+        )
+        let unrelated = AppSigningInfo.ProfileMetadata(
+            data: Data(),
+            expirationDate: expiry.addingTimeInterval(60),
+            applicationIdentifier: "TEAM123.vn.truongkma.tlocation",
+            portalBundleIdentifier: "vn.truongkma.tlocation",
+            teamIdentifier: "TEAM123"
+        )
+        #expect(!AppSigningInfo.isValidReplacement(
+            unrelated,
+            for: current,
+            installedBundleIdentifier: "vn.truongkma.tlocation.XX5C7UH7HA"
+        ))
+    }
+
+    @Test func exactProfileReplacementUsesAppleCaseInsensitiveBundleSemantics() {
+        let expiry = Date(timeIntervalSince1970: 1_800_000_000)
+        let current = AppSigningInfo.ProfileMetadata(
+            data: Data(),
+            expirationDate: expiry,
+            applicationIdentifier: "TEAM123.vn.truongkma.tlocation.XX5C7UH7HA",
+            portalBundleIdentifier: "vn.truongkma.tlocation.XX5C7UH7HA",
+            teamIdentifier: "TEAM123"
+        )
+        let replacement = AppSigningInfo.ProfileMetadata(
+            data: Data(),
+            expirationDate: expiry.addingTimeInterval(60),
+            applicationIdentifier: "TEAM123.VN.TRUONGKMA.TLOCATION.XX5C7UH7HA",
+            portalBundleIdentifier: "VN.TRUONGKMA.TLOCATION.XX5C7UH7HA",
+            teamIdentifier: "TEAM123"
+        )
+        #expect(AppSigningInfo.isValidReplacement(
+            replacement,
+            for: current,
+            installedBundleIdentifier: "vn.truongkma.tlocation.XX5C7UH7HA"
+        ))
+    }
+
+    @Test func profileWithDifferentEntitlementsIsNeverAccepted() {
+        let expiry = Date(timeIntervalSince1970: 1_800_000_000)
+        let current = AppSigningInfo.ProfileMetadata(
+            data: Data(),
+            expirationDate: expiry,
+            applicationIdentifier: "TEAM123.vn.truongkma.tlocation",
+            portalBundleIdentifier: "vn.truongkma.tlocation",
+            teamIdentifier: "TEAM123",
+            entitlements: ["get-task-allow": true]
+        )
+        let differentCapabilities = AppSigningInfo.ProfileMetadata(
+            data: Data(),
+            expirationDate: expiry.addingTimeInterval(60),
+            applicationIdentifier: "TEAM123.vn.truongkma.tlocation",
+            portalBundleIdentifier: "vn.truongkma.tlocation",
+            teamIdentifier: "TEAM123",
+            entitlements: ["get-task-allow": false]
+        )
+        #expect(!AppSigningInfo.isValidReplacement(
+            differentCapabilities,
+            for: current,
+            installedBundleIdentifier: "vn.truongkma.tlocation"
+        ))
     }
 
     /// A device keeps superseded copies of its own profiles, so the newest one —

@@ -371,6 +371,26 @@ fn error_category(message: &str, fallback: &'static str) -> &'static str {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum AppIdReuseDecision {
+    Exact(usize),
+    Missing,
+}
+
+/// Apple documents bundle identifiers as case-insensitive. Reuse is otherwise
+/// deliberately exact: no suffix stripping, prefix matching, or registration
+/// fallback is permitted during profile-only maintenance.
+fn app_id_reuse_decision<'a>(
+    identifiers: impl IntoIterator<Item = &'a str>,
+    installed_identifier: &str,
+) -> AppIdReuseDecision {
+    identifiers
+        .into_iter()
+        .position(|identifier| identifier.eq_ignore_ascii_case(installed_identifier))
+        .map(AppIdReuseDecision::Exact)
+        .unwrap_or(AppIdReuseDecision::Missing)
+}
+
 fn sign_in_error_category(
     stage: SignInStage,
     message: &str,
@@ -878,16 +898,26 @@ pub unsafe extern "C" fn ls_refresh_profile(
                 .list_app_ids(&team, None)
                 .await
                 .map_err(|error| ("profileCreationFailed", error.to_string()))?;
+            let app_id_index = match app_id_reuse_decision(
+                app_ids.app_ids.iter().map(|app_id| app_id.identifier.as_str()),
+                &bundle_id,
+            ) {
+                AppIdReuseDecision::Exact(index) => index,
+                AppIdReuseDecision::Missing => {
+                    return Err((
+                        "appIDMissing",
+                        format!(
+                            "The installed app was signed using App ID {bundle_id}, but that App ID is not registered to selected team {}. A provisioning-profile-only refresh cannot change the installed app's App ID. Reinstall Location Suite with the same signing team after an App ID slot is available, or configure the signer to reuse an already-registered App ID. Waiting alone does not repair this installation. No App ID was created.",
+                            team.team_id
+                        ),
+                    ));
+                }
+            };
             let app_id = app_ids
                 .app_ids
                 .into_iter()
-                .find(|app_id| app_id.identifier.eq_ignore_ascii_case(&bundle_id))
-                .ok_or((
-                    "teamSelectionFailed",
-                    format!(
-                        "The selected team does not own the installed App ID {bundle_id}. No App ID was created."
-                    ),
-                ))?;
+                .nth(app_id_index)
+                .expect("the exact App ID index came from this response");
 
             let profile = session
                 .developer_session
@@ -980,9 +1010,10 @@ mod tests {
     use rootcause::prelude::*;
 
     use super::{
-        charge_service_time, error_category, error_payload_json, initialize_rustls_crypto_provider,
-        panic_summary, should_try_next_anisette, AkdRemoteV3AnisetteProvider, SignInFailure,
-        SignInStage, SignInStageTracker, SignInSummary, TeamSummary,
+        app_id_reuse_decision, charge_service_time, error_category, error_payload_json,
+        initialize_rustls_crypto_provider, panic_summary, should_try_next_anisette,
+        AkdRemoteV3AnisetteProvider, AppIdReuseDecision, SignInFailure, SignInStage,
+        SignInStageTracker, SignInSummary, TeamSummary,
     };
 
     fn report_failure(
@@ -1061,6 +1092,52 @@ mod tests {
         assert_eq!(
             error_category("team selection: request failed", "developerSessionFailed"),
             "teamSelectionFailed"
+        );
+    }
+
+    #[test]
+    fn exact_installed_app_id_is_reused_even_when_no_slots_are_available() {
+        // Availability is intentionally not an input to exact reuse. Refreshing
+        // an existing App ID does not consume a Personal Team slot.
+        let identifiers = ["com.example.other", "vn.truongkma.tlocation.XX5C7UH7HA"];
+        assert_eq!(
+            app_id_reuse_decision(identifiers, "vn.truongkma.tlocation.XX5C7UH7HA"),
+            AppIdReuseDecision::Exact(1)
+        );
+    }
+
+    #[test]
+    fn apple_bundle_identifier_matching_is_case_insensitive() {
+        assert_eq!(
+            app_id_reuse_decision(
+                ["VN.TRUONGKMA.TLOCATION.XX5C7UH7HA"],
+                "vn.truongkma.tlocation.xx5c7uh7ha",
+            ),
+            AppIdReuseDecision::Exact(0)
+        );
+    }
+
+    #[test]
+    fn missing_exact_app_id_never_selects_a_similar_or_canonical_id() {
+        let identifiers = [
+            "vn.truongkma.tlocation",
+            "vn.truongkma.tlocation.DIFFERENT",
+            "vn.truongkma.tlocation.XX5C7UH7HA.extension",
+        ];
+        assert_eq!(
+            app_id_reuse_decision(identifiers, "vn.truongkma.tlocation.XX5C7UH7HA"),
+            AppIdReuseDecision::Missing
+        );
+    }
+
+    #[test]
+    fn app_id_missing_category_survives_error_classification() {
+        assert_eq!(
+            error_category(
+                "The installed app App ID is not registered. No App ID was created.",
+                "appIDMissing",
+            ),
+            "appIDMissing"
         );
     }
 

@@ -29,10 +29,34 @@ enum AppSigningInfo {
     struct ProfileMetadata {
         let data: Data
         let expirationDate: Date
+        /// Full signed entitlement, including its team prefix.
+        let applicationIdentifier: String
         /// Developer-portal identifier without the team prefix from
         /// `application-identifier`.
         let portalBundleIdentifier: String
         let teamIdentifier: String?
+        let entitlements: [String: Any]
+
+        init(
+            data: Data,
+            expirationDate: Date,
+            applicationIdentifier: String,
+            portalBundleIdentifier: String,
+            teamIdentifier: String?,
+            entitlements: [String: Any] = [:]
+        ) {
+            self.data = data
+            self.expirationDate = expirationDate
+            self.applicationIdentifier = applicationIdentifier
+            self.portalBundleIdentifier = portalBundleIdentifier
+            self.teamIdentifier = teamIdentifier
+            self.entitlements = entitlements
+        }
+    }
+
+    struct ApplicationIdentifierComponents: Equatable {
+        let teamIdentifier: String
+        let portalBundleIdentifier: String
     }
 
     /// Remaining time at or below which the launch warning is shown.
@@ -80,40 +104,99 @@ enum AppSigningInfo {
     ) -> ProfileMetadata? {
         profiles.compactMap { profile -> ProfileMetadata? in
             guard let plist = plist(fromProfile: profile),
-                  covers(bundleIdentifier: bundleIdentifier, plist: plist),
                   let expirationDate = plist["ExpirationDate"] as? Date,
                   let entitlements = plist["Entitlements"] as? [String: Any],
                   let applicationIdentifier = entitlements["application-identifier"] as? String,
-                  let separator = applicationIdentifier.firstIndex(of: ".") else {
+                  let components = applicationIdentifierComponents(
+                    applicationIdentifier,
+                    explicitTeamIdentifier: profileTeamIdentifier(
+                        plist: plist,
+                        entitlements: entitlements
+                    )
+                  ),
+                  components.portalBundleIdentifier.caseInsensitiveCompare(bundleIdentifier)
+                    == .orderedSame else {
                 return nil
             }
-            let derivedTeam = String(applicationIdentifier[..<separator])
-            let portalIdentifier = String(applicationIdentifier[applicationIdentifier.index(after: separator)...])
-            guard !portalIdentifier.isEmpty else { return nil }
-            let explicitTeam = entitlements["com.apple.developer.team-identifier"] as? String
             return ProfileMetadata(
                 data: profile,
                 expirationDate: expirationDate,
-                portalBundleIdentifier: portalIdentifier,
-                teamIdentifier: explicitTeam ?? derivedTeam
+                applicationIdentifier: applicationIdentifier,
+                portalBundleIdentifier: components.portalBundleIdentifier,
+                teamIdentifier: components.teamIdentifier,
+                entitlements: entitlements
             )
         }.max { $0.expirationDate < $1.expirationDate }
     }
 
-    /// Whether a profile's entitlements name this app.
-    ///
-    /// `application-identifier` is the team-prefixed form —
-    /// `ABCDE12345.vn.truongkma.tlocation` — so the app's own identifier is
-    /// exactly the tail of it. The leading dot is part of the match on purpose:
-    /// without it a profile for `com.example.nottlocation` would be claimed by
-    /// `tlocation`.
-    private static func covers(bundleIdentifier: String, plist: [String: Any]) -> Bool {
-        guard !bundleIdentifier.isEmpty,
-              let entitlements = plist["Entitlements"] as? [String: Any],
-              let applicationIdentifier = entitlements["application-identifier"] as? String else {
-            return false
+    /// Splits `TEAMID.bundle.identifier` by removing only the known team prefix.
+    /// No trailing component is ever guessed to be signer-generated: a suffix
+    /// such as `.XX5C7UH7HA` remains part of the portal bundle identifier.
+    static func applicationIdentifierComponents(
+        _ applicationIdentifier: String,
+        explicitTeamIdentifier: String? = nil
+    ) -> ApplicationIdentifierComponents? {
+        let applicationIdentifier = applicationIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !applicationIdentifier.isEmpty else { return nil }
+
+        if let explicitTeamIdentifier = explicitTeamIdentifier?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicitTeamIdentifier.isEmpty {
+            let prefix = explicitTeamIdentifier + "."
+            guard applicationIdentifier.range(
+                of: prefix,
+                options: [.anchored, .caseInsensitive]
+            ) != nil else { return nil }
+            let portal = String(applicationIdentifier.dropFirst(prefix.count))
+            guard !portal.isEmpty else { return nil }
+            return ApplicationIdentifierComponents(
+                teamIdentifier: explicitTeamIdentifier,
+                portalBundleIdentifier: portal
+            )
         }
-        return applicationIdentifier.hasSuffix(".\(bundleIdentifier)")
+
+        guard let separator = applicationIdentifier.firstIndex(of: ".") else { return nil }
+        let team = String(applicationIdentifier[..<separator])
+        let portal = String(applicationIdentifier[applicationIdentifier.index(after: separator)...])
+        guard !team.isEmpty, !portal.isEmpty else { return nil }
+        return ApplicationIdentifierComponents(
+            teamIdentifier: team,
+            portalBundleIdentifier: portal
+        )
+    }
+
+    static func isValidReplacement(
+        _ candidate: ProfileMetadata,
+        for current: ProfileMetadata,
+        installedBundleIdentifier: String
+    ) -> Bool {
+        candidate.portalBundleIdentifier.caseInsensitiveCompare(installedBundleIdentifier) == .orderedSame
+            && candidate.portalBundleIdentifier.caseInsensitiveCompare(current.portalBundleIdentifier) == .orderedSame
+            && candidate.teamIdentifier == current.teamIdentifier
+            && candidate.applicationIdentifier.caseInsensitiveCompare(current.applicationIdentifier) == .orderedSame
+            && NSDictionary(dictionary: nonIdentityEntitlements(candidate.entitlements))
+                .isEqual(NSDictionary(dictionary: nonIdentityEntitlements(current.entitlements)))
+    }
+
+    /// Identity keys are validated above with the semantics Apple documents for
+    /// bundle IDs. Every other entitlement must remain exactly equal so a
+    /// profile for a different capability set is never installed.
+    private static func nonIdentityEntitlements(_ entitlements: [String: Any]) -> [String: Any] {
+        var result = entitlements
+        result.removeValue(forKey: "application-identifier")
+        result.removeValue(forKey: "com.apple.developer.team-identifier")
+        return result
+    }
+
+    private static func profileTeamIdentifier(
+        plist: [String: Any],
+        entitlements: [String: Any]
+    ) -> String? {
+        if let entitlementTeam = entitlements["com.apple.developer.team-identifier"] as? String,
+           !entitlementTeam.isEmpty {
+            return entitlementTeam
+        }
+        return (plist["TeamIdentifier"] as? [String])?.first(where: { !$0.isEmpty })
     }
 
     // MARK: - Profile parsing

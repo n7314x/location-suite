@@ -18,6 +18,7 @@ enum SelfMaintenanceFailureCategory: String, Codable, CaseIterable, Sendable {
     case developerSessionFailed
     case signingCorePanic
     case teamSelectionFailed
+    case appIDMissing
     case deviceRegistrationFailed
     case certificateUnavailable
     case certificateLimitReached
@@ -129,6 +130,8 @@ struct SelfMaintenanceError: Error, Codable, Equatable, LocalizedError, Sendable
             return "The signing core stopped unexpectedly."
         case .teamSelectionFailed:
             return "Could not list or select an Apple developer team."
+        case .appIDMissing:
+            return "The installed App ID is missing from the selected developer team."
         default:
             return "The self-maintenance operation failed."
         }
@@ -157,6 +160,52 @@ struct DeveloperTeamSummary: Codable, Equatable, Identifiable, Sendable {
 struct AccountSignInSummary: Codable, Equatable, Sendable {
     let anisetteEndpoint: String
     let teams: [DeveloperTeamSummary]
+}
+
+enum PortalAppIDMatch: String, Codable, Equatable, Sendable {
+    case unknown = "Not Checked"
+    case exact = "Exact"
+    case missing = "Missing"
+    case wrongTeam = "Wrong Team"
+}
+
+/// Non-secret identity facts that keep source, installed, profile, and portal
+/// identifiers distinct. The canonical identifier describes the unsigned IPA;
+/// it must never be substituted for the installed signed identity during a
+/// profile-only refresh.
+struct SigningIdentitySnapshot: Equatable, Sendable {
+    static let canonicalBundleIdentifier = "vn.truongkma.tlocation"
+
+    let canonicalBundleIdentifier: String
+    let installedBundleIdentifier: String?
+    let profileApplicationIdentifier: String?
+    let profileTeamIdentifier: String?
+    let portalBundleIdentifier: String?
+    let selectedDeveloperTeamIdentifier: String?
+    let portalMatch: PortalAppIDMatch
+
+    init(
+        canonicalBundleIdentifier: String = Self.canonicalBundleIdentifier,
+        installedBundleIdentifier: String?,
+        profileApplicationIdentifier: String? = nil,
+        profileTeamIdentifier: String? = nil,
+        portalBundleIdentifier: String? = nil,
+        selectedDeveloperTeamIdentifier: String? = nil,
+        portalMatch: PortalAppIDMatch = .unknown
+    ) {
+        self.canonicalBundleIdentifier = canonicalBundleIdentifier
+        self.installedBundleIdentifier = installedBundleIdentifier
+        self.profileApplicationIdentifier = profileApplicationIdentifier
+        self.profileTeamIdentifier = profileTeamIdentifier
+        self.portalBundleIdentifier = portalBundleIdentifier
+        self.selectedDeveloperTeamIdentifier = selectedDeveloperTeamIdentifier
+        self.portalMatch = portalMatch
+    }
+
+    var installedDiffersFromCanonical: Bool {
+        guard let installedBundleIdentifier else { return false }
+        return installedBundleIdentifier.caseInsensitiveCompare(canonicalBundleIdentifier) != .orderedSame
+    }
 }
 
 enum TeamSelectionPolicy {
@@ -251,6 +300,7 @@ enum SigningAutoRefreshDecision: Equatable, Sendable {
     case noTrustedExpiry
     case notDue
     case cooldown
+    case blockedByAppIDMissing
     case needsAccount
     case blockedBySimulation
     case needsDeviceTransport
@@ -279,6 +329,10 @@ enum SigningAutoRefreshPolicy {
             return .noTrustedExpiry
         }
         guard expirationDate.timeIntervalSince(now) <= threshold else { return .notDue }
+        // A profile-only retry cannot heal a missing portal App ID. Keep the
+        // actionable state stable until the user explicitly retries after
+        // reinstalling or changing portal state.
+        if history.lastFailureCategory == .appIDMissing { return .blockedByAppIDMissing }
         if let lastAttempt = history.lastAttempt {
             let cooldown = history.lastFailureCategory == nil ? successCooldown : failureCooldown
             if now.timeIntervalSince(lastAttempt) < cooldown { return .cooldown }

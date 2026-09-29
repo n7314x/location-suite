@@ -27,6 +27,7 @@ final class SelfMaintenanceService: ObservableObject {
     @Published private(set) var statusMessage: String?
     @Published private(set) var lastError: SelfMaintenanceError?
     @Published private(set) var history: SigningRefreshHistory
+    @Published private(set) var signingIdentity: SigningIdentitySnapshot
 
     private let defaults: UserDefaults
     private let secrets: SecretStorage
@@ -45,6 +46,12 @@ final class SelfMaintenanceService: ObservableObject {
         self.defaults = defaults
         self.secrets = secrets
         self.history = Self.loadHistory(from: defaults)
+        self.signingIdentity = SigningIdentitySnapshot(
+            installedBundleIdentifier: Bundle.main.bundleIdentifier,
+            selectedDeveloperTeamIdentifier: defaults.string(
+                forKey: UserDefaults.Keys.selectedDeveloperTeam
+            )
+        )
         defaults.register(defaults: [
             UserDefaults.Keys.autoRefreshSigning: true,
             UserDefaults.Keys.rememberApplePassword: false,
@@ -169,6 +176,7 @@ final class SelfMaintenanceService: ObservableObject {
             }
             selectedTeamIdentifier = identifier
             defaults.set(identifier, forKey: UserDefaults.Keys.selectedDeveloperTeam)
+            updateSelectedTeamInSigningIdentity(identifier)
             let team = availableTeams.first { $0.identifier == identifier }
             accountState = .signedIn(teamName: team?.displayName ?? identifier)
             statusMessage = "Apple developer session is ready."
@@ -242,6 +250,7 @@ final class SelfMaintenanceService: ObservableObject {
                 )
             }
             observedBefore = currentProfile.expirationDate
+            updateSigningIdentity(profile: currentProfile, portalMatch: .unknown)
 
             if session == nil {
                 let appleID = defaults.string(forKey: UserDefaults.Keys.appleAccountEmail) ?? ""
@@ -265,33 +274,41 @@ final class SelfMaintenanceService: ObservableObject {
                     preferredTeam: currentProfile.teamIdentifier
                 )
                 apply(prepared)
+                updateSigningIdentity(profile: currentProfile, portalMatch: .unknown)
             }
 
             guard let session else {
                 throw SelfMaintenanceError(category: .developerSessionFailed, message: "The Apple developer session is unavailable.")
             }
             guard selectedTeamIdentifier == currentProfile.teamIdentifier || currentProfile.teamIdentifier == nil else {
+                updateSigningIdentity(profile: currentProfile, portalMatch: .wrongTeam)
                 throw SelfMaintenanceError(
                     category: .teamSelectionFailed,
-                    message: "Select the personal team that signed the current Location Suite profile."
+                    message: "The selected developer team does not match the team in the installed Location Suite profile. Select team \(currentProfile.teamIdentifier ?? "shown in the profile") and retry."
                 )
             }
 
             statusMessage = "Requesting a renewed profile from Apple…"
+            let portalBundleIdentifier = currentProfile.portalBundleIdentifier
             let renewedProfile = try await onAccountQueue {
                 try AppleDeveloperBridge.refreshProfile(
                     session: session,
                     device: deviceSnapshot.identity,
-                    portalBundleIdentifier: currentProfile.portalBundleIdentifier
+                    portalBundleIdentifier: portalBundleIdentifier
                 )
             }
+            updateSigningIdentity(profile: currentProfile, portalMatch: .exact)
             guard let proposed = AppSigningInfo.currentProfile(
                 forBundleIdentifier: bundleIdentifier,
                 in: [renewedProfile]
+            ), AppSigningInfo.isValidReplacement(
+                proposed,
+                for: currentProfile,
+                installedBundleIdentifier: bundleIdentifier
             ), proposed.expirationDate > currentProfile.expirationDate else {
                 throw SelfMaintenanceError(
                     category: .profileDidNotExtendExpiry,
-                    message: "Apple returned a profile, but its expiration was not later than the installed profile. Nothing was installed."
+                    message: "Apple returned a profile, but it did not preserve the installed signed App ID and team or its expiration was not later. Nothing was installed."
                 )
             }
 
@@ -334,6 +351,17 @@ final class SelfMaintenanceService: ObservableObject {
             }
         } catch {
             let normalized = normalize(error)
+            if normalized.category == .appIDMissing {
+                signingIdentity = SigningIdentitySnapshot(
+                    canonicalBundleIdentifier: signingIdentity.canonicalBundleIdentifier,
+                    installedBundleIdentifier: signingIdentity.installedBundleIdentifier,
+                    profileApplicationIdentifier: signingIdentity.profileApplicationIdentifier,
+                    profileTeamIdentifier: signingIdentity.profileTeamIdentifier,
+                    portalBundleIdentifier: signingIdentity.portalBundleIdentifier,
+                    selectedDeveloperTeamIdentifier: signingIdentity.selectedDeveloperTeamIdentifier,
+                    portalMatch: .missing
+                )
+            }
             history = SigningRefreshHistoryReducer.failure(
                 previous: history,
                 attemptedAt: attemptedAt,
@@ -414,6 +442,7 @@ final class SelfMaintenanceService: ObservableObject {
         activeAnisetteEndpoint = result.summary.anisetteEndpoint
         let selection = prepared.selectedTeamIdentifier
         selectedTeamIdentifier = selection
+        updateSelectedTeamInSigningIdentity(selection)
         if let selection {
             defaults.set(selection, forKey: UserDefaults.Keys.selectedDeveloperTeam)
             let team = result.summary.teams.first { $0.identifier == selection }
@@ -454,6 +483,40 @@ final class SelfMaintenanceService: ObservableObject {
     private func storeHistory() {
         guard let data = try? JSONEncoder().encode(history) else { return }
         defaults.set(data, forKey: UserDefaults.Keys.signingRefreshHistory)
+    }
+
+    private func updateSigningIdentity(
+        profile: AppSigningInfo.ProfileMetadata,
+        portalMatch: PortalAppIDMatch
+    ) {
+        signingIdentity = SigningIdentitySnapshot(
+            installedBundleIdentifier: Bundle.main.bundleIdentifier,
+            profileApplicationIdentifier: profile.applicationIdentifier,
+            profileTeamIdentifier: profile.teamIdentifier,
+            portalBundleIdentifier: profile.portalBundleIdentifier,
+            selectedDeveloperTeamIdentifier: selectedTeamIdentifier,
+            portalMatch: portalMatch
+        )
+    }
+
+    private func updateSelectedTeamInSigningIdentity(_ identifier: String?) {
+        let match: PortalAppIDMatch
+        if let profileTeamIdentifier = signingIdentity.profileTeamIdentifier,
+           let identifier,
+           profileTeamIdentifier != identifier {
+            match = .wrongTeam
+        } else {
+            match = .unknown
+        }
+        signingIdentity = SigningIdentitySnapshot(
+            canonicalBundleIdentifier: signingIdentity.canonicalBundleIdentifier,
+            installedBundleIdentifier: signingIdentity.installedBundleIdentifier,
+            profileApplicationIdentifier: signingIdentity.profileApplicationIdentifier,
+            profileTeamIdentifier: signingIdentity.profileTeamIdentifier,
+            portalBundleIdentifier: signingIdentity.portalBundleIdentifier,
+            selectedDeveloperTeamIdentifier: identifier,
+            portalMatch: match
+        )
     }
 
     private static func loadHistory(from defaults: UserDefaults) -> SigningRefreshHistory {
