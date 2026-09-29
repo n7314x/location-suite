@@ -99,6 +99,8 @@ jobs:
             echo "- IPA: \`LocationSuite.ipa\` ($IPA_SIZE bytes)"
             echo "- SHA-256: \`$IPA_SHA256\`"
             echo "- Payload app: \`Payload/TLocation.app\`"
+            echo "- Canonical bundle ID: \`vn.truongkma.tlocation\`"
+            echo "- Nested signable bundles/extensions: none"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload LocationSuite.ipa and metadata

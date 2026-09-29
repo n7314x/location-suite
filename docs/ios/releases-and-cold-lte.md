@@ -23,8 +23,12 @@ private location-suite source
 Both pull-request CI and the `v*` tag workflow invoke
 `scripts/build_unsigned_ipa.sh`. The script archives once, requires an arm64
 executable and `vn.truongkma.tlocation`, rejects a signature or embedded profile,
-and packages exactly one `Payload/TLocation.app`. It derives version, build, and
-minimum OS from the built app—not from duplicated workflow constants.
+and packages exactly one `Payload/TLocation.app`. It also inventories every
+signable `.app`/`.appex` Info.plist. The canonical allowlist currently contains
+only `Payload/TLocation.app = vn.truongkma.tlocation`; adding a nested signable
+bundle fails CI until its deterministic identifier is explicitly reviewed. The
+inventory is recorded in `build-metadata.json`. The script derives version,
+build, and minimum OS from the built app—not from duplicated workflow constants.
 
 The checked-in target is prepared for `v1.5.0`: `MARKETING_VERSION=1.5.0` and
 `CURRENT_PROJECT_VERSION=2`. Every later stable release must increment the build
