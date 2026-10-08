@@ -19,6 +19,7 @@ from release_feed import (  # noqa: E402
     generate,
     promote,
     read_json,
+    read_ipa_metadata,
     validate_source_shape,
 )
 from verify_release import verify_files  # noqa: E402
@@ -119,6 +120,30 @@ class ReleaseToolTests(unittest.TestCase):
     def test_wrong_bundle_identifier_fails(self) -> None:
         with self.assertRaisesRegex(ReleaseError, "Wrong built bundle identifier"):
             self.generate_release(self.make_ipa(bundle_id="example.wrong"))
+
+    def test_unexpected_nested_signable_bundle_fails_canonical_assertion(self) -> None:
+        ipa = self.make_ipa()
+        extension_info = {
+            "CFBundleIdentifier": f"{BUNDLE_ID}.unexpected",
+            "CFBundleShortVersionString": "1.5.0",
+            "CFBundleVersion": "15",
+            "MinimumOSVersion": "17.4",
+        }
+        with zipfile.ZipFile(ipa, "a") as archive:
+            archive.writestr(
+                "Payload/TLocation.app/PlugIns/Unexpected.appex/Info.plist",
+                plistlib.dumps(extension_info),
+            )
+        with self.assertRaisesRegex(ReleaseError, "signable bundle inventory changed"):
+            self.generate_release(ipa)
+
+    def test_canonical_ipa_reports_exact_signable_bundle_inventory(self) -> None:
+        ipa = self.make_ipa()
+        metadata = read_ipa_metadata(ipa)
+        self.assertEqual(
+            metadata.bundle_identifiers,
+            {"Payload/TLocation.app": BUNDLE_ID},
+        )
 
     def test_wrong_version_fails(self) -> None:
         ipa = self.make_ipa()

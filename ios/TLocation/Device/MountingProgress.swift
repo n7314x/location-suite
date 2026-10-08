@@ -15,6 +15,16 @@ final class MountingProgress: ObservableObject {
 
     private init() {}
 
+    /// Opening DVT LocationSimulation is authoritative evidence that the
+    /// developer services are available for this session.
+    func recordDeveloperServiceReady() {
+        if Thread.isMainThread {
+            coolisMounted = true
+        } else {
+            DispatchQueue.main.async { self.coolisMounted = true }
+        }
+    }
+
     func checkforMounted() {
         DispatchQueue.global(qos: .utility).async {
             let mounted = isMounted()

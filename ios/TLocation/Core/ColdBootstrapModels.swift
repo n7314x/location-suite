@@ -22,6 +22,20 @@ enum ColdBootstrapStage: String, Codable, CaseIterable, Equatable, Sendable {
     }
 }
 
+enum ColdBootstrapOperation: String, Codable, Equatable, Sendable {
+    case connectionReadiness
+    case sessionPreparation
+    case coordinateSimulation
+
+    var displayName: String {
+        switch self {
+        case .connectionReadiness: return "Connection readiness"
+        case .sessionPreparation: return "Session preparation"
+        case .coordinateSimulation: return "Coordinate simulation"
+        }
+    }
+}
+
 enum ColdBootstrapFailureCategory: String, Codable, CaseIterable, Equatable, Sendable {
     case localVPNUnavailable
     case noRoute
@@ -118,6 +132,7 @@ struct ColdBootstrapTrace: Codable, Equatable, Sendable {
     let targetHost: String
     let targetPort: UInt16
     let underlyingNetwork: String
+    let operation: ColdBootstrapOperation
     let measurements: [ColdBootstrapStageMeasurement]
     let retryCount: Int
     let totalElapsed: TimeInterval
@@ -303,7 +318,16 @@ enum ColdBootstrapTraceOrdering {
 }
 
 enum ColdBootstrapStageSequence {
-    static let successful: [ColdBootstrapStage] = [
+    static let preparationSuccessful: [ColdBootstrapStage] = [
+        .waitingForTunnel,
+        .tcpConnect,
+        .remotePairing,
+        .rsdConnect,
+        .locationSimulationChannel,
+        .ready,
+    ]
+
+    static let coordinateSimulationSuccessful: [ColdBootstrapStage] = [
         .waitingForTunnel,
         .tcpConnect,
         .remotePairing,
@@ -313,9 +337,44 @@ enum ColdBootstrapStageSequence {
         .ready,
     ]
 
-    static func isSuccessful(_ measurements: [ColdBootstrapStageMeasurement]) -> Bool {
+    /// Kept as the coordinate path for source compatibility with existing tests
+    /// and diagnostics consumers.
+    static let successful = coordinateSimulationSuccessful
+
+    static func successful(for operation: ColdBootstrapOperation) -> [ColdBootstrapStage] {
+        switch operation {
+        case .sessionPreparation:
+            return preparationSuccessful
+        case .coordinateSimulation:
+            return coordinateSimulationSuccessful
+        case .connectionReadiness:
+            return []
+        }
+    }
+
+    static func isSuccessful(
+        _ measurements: [ColdBootstrapStageMeasurement],
+        operation: ColdBootstrapOperation = .coordinateSimulation
+    ) -> Bool {
         guard let attempt = measurements.last?.attempt else { return false }
-        return measurements.filter { $0.attempt == attempt }.map(\.stage) == successful
+        return measurements.filter { $0.attempt == attempt }.map(\.stage) == successful(for: operation)
+    }
+}
+
+enum LTEPreparationRecoveryPolicy {
+    /// The Airplane Mode preparation flow is evidence-based and intentionally
+    /// narrow. Other failures keep their existing diagnostics and recovery.
+    static func shouldOffer(
+        trace: ColdBootstrapTrace?,
+        warmSessionOpen: Bool
+    ) -> Bool {
+        guard !warmSessionOpen,
+              let trace,
+              trace.underlyingNetwork.caseInsensitiveCompare("Cellular") == .orderedSame,
+              let failure = trace.failure else { return false }
+        return failure.stage == .tcpConnect
+            && failure.category == .connectionRefused
+            && failure.errno == 61
     }
 }
 

@@ -64,3 +64,8 @@ physical-device experiments are documented in
 feed publication remains disabled until the documented artifact-only host
 variables are configured; private GitHub Release URLs are never used as a
 SideStore feed.
+
+The first self-maintenance milestone—Apple sign-in/2FA and direct profile-only
+renewal over an already-open phone-local RSD session—is documented in
+[Self-maintenance signing](docs/ios/self-maintenance-signing.md). It remains a
+physical-test candidate until the iPhone's authoritative expiry moves later.

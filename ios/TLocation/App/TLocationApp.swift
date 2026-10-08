@@ -92,7 +92,8 @@ struct TLocationApp: App {
     /// Both the "in the way" checks matter, and neither is redundant:
     /// `isOpen` covers a live session (including one a Shortcut opened while no
     /// map was on screen), `isMaintained` covers the process-wide lifecycle
-    /// while a producer is building that session. Reconnecting into either is
+    /// while a producer or coordinate-free LTE preparation is building that
+    /// session. Reconnecting into either is
     /// the second concurrent RemotePairing handshake against single-occupancy
     /// `<targetIP>:49152` that this deferral exists to avoid.
     ///

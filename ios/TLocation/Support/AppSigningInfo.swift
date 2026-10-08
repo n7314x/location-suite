@@ -8,9 +8,9 @@ import Foundation
 /// Turns provisioning-profile bytes into an expiry date, and an expiry date into
 /// the words the UI shows.
 ///
-/// TLocation is normally sideloaded through SideStore. With a free Apple ID the
-/// signing certificate only lasts 7 days, and once it lapses the app refuses to
-/// launch and has to be reinstalled — so the app warns before that happens.
+/// With a free Apple Account the provisioning profile normally lasts seven
+/// days. Once it lapses the app refuses to launch and cannot repair itself, so
+/// the app warns before that happens.
 ///
 /// This type is deliberately pure: bytes and dates in, dates and strings out. It
 /// never decides *when* to look, and never touches the device. Where the profiles
@@ -18,15 +18,47 @@ import Foundation
 /// that type's business.
 ///
 /// The bundle's own `embedded.mobileprovision` is **not** read here, and must not
-/// be. That file is written at install time and is never rewritten when SideStore
-/// refreshes the app: a refresh renews the profile at the system level only
-/// (SideStore PR #846 removed the install step from refresh). Reading it reports
-/// the expiry of whichever certificate was current when the app was last
-/// *installed*, which after the first weekly refresh is always in the past — a
+/// be. That file is written at install time and is not rewritten by a
+/// profile-only refresh. Reading it reports the profile expiry from the last
+/// full installation, which after the first weekly refresh eventually lies in
+/// the past — a
 /// red "expired" row and a warning card on every launch, on a perfectly healthy
 /// signature. `misagent` reports the profiles iOS actually validates against, so
 /// it moves when a refresh moves it, and it is the only source used.
 enum AppSigningInfo {
+    struct ProfileMetadata {
+        let data: Data
+        let expirationDate: Date
+        /// Full signed entitlement, including its team prefix.
+        let applicationIdentifier: String
+        /// Developer-portal identifier without the team prefix from
+        /// `application-identifier`.
+        let portalBundleIdentifier: String
+        let teamIdentifier: String?
+        let entitlements: [String: Any]
+
+        init(
+            data: Data,
+            expirationDate: Date,
+            applicationIdentifier: String,
+            portalBundleIdentifier: String,
+            teamIdentifier: String?,
+            entitlements: [String: Any] = [:]
+        ) {
+            self.data = data
+            self.expirationDate = expirationDate
+            self.applicationIdentifier = applicationIdentifier
+            self.portalBundleIdentifier = portalBundleIdentifier
+            self.teamIdentifier = teamIdentifier
+            self.entitlements = entitlements
+        }
+    }
+
+    struct ApplicationIdentifierComponents: Equatable {
+        let teamIdentifier: String
+        let portalBundleIdentifier: String
+    }
+
     /// Remaining time at or below which the launch warning is shown.
     static let warningThreshold: TimeInterval = 24 * 60 * 60
 
@@ -58,29 +90,113 @@ enum AppSigningInfo {
     /// TrollStore install looks like — no profile names this app — and the
     /// caller must never turn it into a warning.
     static func expirationDate(forBundleIdentifier bundleIdentifier: String, in profiles: [Data]) -> Date? {
-        profiles.compactMap { profile -> Date? in
-            guard let plist = plist(fromProfile: profile),
-                  covers(bundleIdentifier: bundleIdentifier, plist: plist) else {
-                return nil
-            }
-            return plist["ExpirationDate"] as? Date
-        }.max()
+        currentProfile(forBundleIdentifier: bundleIdentifier, in: profiles)?.expirationDate
     }
 
-    /// Whether a profile's entitlements name this app.
-    ///
-    /// `application-identifier` is the team-prefixed form —
-    /// `ABCDE12345.vn.truongkma.tlocation` — so the app's own identifier is
-    /// exactly the tail of it. The leading dot is part of the match on purpose:
-    /// without it a profile for `com.example.nottlocation` would be claimed by
-    /// `tlocation`.
-    private static func covers(bundleIdentifier: String, plist: [String: Any]) -> Bool {
-        guard !bundleIdentifier.isEmpty,
-              let entitlements = plist["Entitlements"] as? [String: Any],
-              let applicationIdentifier = entitlements["application-identifier"] as? String else {
-            return false
+    /// The newest installed profile that actually covers this app. Besides the
+    /// expiry, this supplies the exact developer-portal App ID and team prefix
+    /// used by the current working installation. Profile renewal must use these
+    /// values; guessing from an account's first team could consume a free App ID
+    /// slot and still produce a profile that cannot validate the executable.
+    static func currentProfile(
+        forBundleIdentifier bundleIdentifier: String,
+        in profiles: [Data]
+    ) -> ProfileMetadata? {
+        profiles.compactMap { profile -> ProfileMetadata? in
+            guard let plist = plist(fromProfile: profile),
+                  let expirationDate = plist["ExpirationDate"] as? Date,
+                  let entitlements = plist["Entitlements"] as? [String: Any],
+                  let applicationIdentifier = entitlements["application-identifier"] as? String,
+                  let components = applicationIdentifierComponents(
+                    applicationIdentifier,
+                    explicitTeamIdentifier: profileTeamIdentifier(
+                        plist: plist,
+                        entitlements: entitlements
+                    )
+                  ),
+                  components.portalBundleIdentifier.caseInsensitiveCompare(bundleIdentifier)
+                    == .orderedSame else {
+                return nil
+            }
+            return ProfileMetadata(
+                data: profile,
+                expirationDate: expirationDate,
+                applicationIdentifier: applicationIdentifier,
+                portalBundleIdentifier: components.portalBundleIdentifier,
+                teamIdentifier: components.teamIdentifier,
+                entitlements: entitlements
+            )
+        }.max { $0.expirationDate < $1.expirationDate }
+    }
+
+    /// Splits `TEAMID.bundle.identifier` by removing only the known team prefix.
+    /// No trailing component is ever guessed to be signer-generated: a suffix
+    /// such as `.XX5C7UH7HA` remains part of the portal bundle identifier.
+    static func applicationIdentifierComponents(
+        _ applicationIdentifier: String,
+        explicitTeamIdentifier: String? = nil
+    ) -> ApplicationIdentifierComponents? {
+        let applicationIdentifier = applicationIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !applicationIdentifier.isEmpty else { return nil }
+
+        if let explicitTeamIdentifier = explicitTeamIdentifier?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicitTeamIdentifier.isEmpty {
+            let prefix = explicitTeamIdentifier + "."
+            guard applicationIdentifier.range(
+                of: prefix,
+                options: [.anchored, .caseInsensitive]
+            ) != nil else { return nil }
+            let portal = String(applicationIdentifier.dropFirst(prefix.count))
+            guard !portal.isEmpty else { return nil }
+            return ApplicationIdentifierComponents(
+                teamIdentifier: explicitTeamIdentifier,
+                portalBundleIdentifier: portal
+            )
         }
-        return applicationIdentifier.hasSuffix(".\(bundleIdentifier)")
+
+        guard let separator = applicationIdentifier.firstIndex(of: ".") else { return nil }
+        let team = String(applicationIdentifier[..<separator])
+        let portal = String(applicationIdentifier[applicationIdentifier.index(after: separator)...])
+        guard !team.isEmpty, !portal.isEmpty else { return nil }
+        return ApplicationIdentifierComponents(
+            teamIdentifier: team,
+            portalBundleIdentifier: portal
+        )
+    }
+
+    static func isValidReplacement(
+        _ candidate: ProfileMetadata,
+        for current: ProfileMetadata,
+        installedBundleIdentifier: String
+    ) -> Bool {
+        candidate.portalBundleIdentifier.caseInsensitiveCompare(installedBundleIdentifier) == .orderedSame
+            && candidate.portalBundleIdentifier.caseInsensitiveCompare(current.portalBundleIdentifier) == .orderedSame
+            && candidate.teamIdentifier == current.teamIdentifier
+            && candidate.applicationIdentifier.caseInsensitiveCompare(current.applicationIdentifier) == .orderedSame
+            && NSDictionary(dictionary: nonIdentityEntitlements(candidate.entitlements))
+                .isEqual(NSDictionary(dictionary: nonIdentityEntitlements(current.entitlements)))
+    }
+
+    /// Identity keys are validated above with the semantics Apple documents for
+    /// bundle IDs. Every other entitlement must remain exactly equal so a
+    /// profile for a different capability set is never installed.
+    private static func nonIdentityEntitlements(_ entitlements: [String: Any]) -> [String: Any] {
+        var result = entitlements
+        result.removeValue(forKey: "application-identifier")
+        result.removeValue(forKey: "com.apple.developer.team-identifier")
+        return result
+    }
+
+    private static func profileTeamIdentifier(
+        plist: [String: Any],
+        entitlements: [String: Any]
+    ) -> String? {
+        if let entitlementTeam = entitlements["com.apple.developer.team-identifier"] as? String,
+           !entitlementTeam.isEmpty {
+            return entitlementTeam
+        }
+        return (plist["TeamIdentifier"] as? [String])?.first(where: { !$0.isEmpty })
     }
 
     // MARK: - Profile parsing
@@ -160,8 +276,8 @@ enum AppSigningInfo {
 /// The "don't show again for this expiry" checkbox on the launch warning.
 ///
 /// Keyed to the expiry date itself rather than stored as a plain flag, so that
-/// refreshing in SideStore — which mints a new certificate and a new expiry —
-/// brings the warning back next week instead of silencing it forever.
+/// renewing the device profile — which produces a later expiry — brings the
+/// warning back next week instead of silencing it forever.
 ///
 /// That was the intent from the start and it never worked, because the expiry it
 /// was keyed to came from the app bundle and so never changed: ticking the box

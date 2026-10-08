@@ -19,7 +19,7 @@ case "$output_dir" in
     ;;
 esac
 
-for tool in xcodebuild xcrun ditto zip unzip plutil lipo shasum; do
+for tool in cargo xcodebuild xcrun ditto zip unzip plutil lipo shasum; do
   command -v "$tool" >/dev/null || {
     echo "Required Apple build tool is unavailable: $tool" >&2
     exit 2
@@ -30,6 +30,12 @@ test -f "$project_path/project.pbxproj"
 test -f ios/TLocation/Info.plist
 test -f ios/TLocation/TLocation.entitlements
 test -f ios/TLocation/idevice/libidevice_ffi.a
+
+# The Apple/developer API boundary is source-built at its reviewed, locked
+# isideload revision. It remains a separate Rust static library from the
+# overnight-proven idevice FFI so rebuilding signing cannot change simulation.
+scripts/build_self_maintenance_rust.sh
+test -f ios/TLocation/self_maintenance/liblocation_self_maintenance.a
 
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
@@ -128,6 +134,21 @@ app_count="$(find "$verification_path/Payload" -mindepth 1 -maxdepth 1 -type d -
 test "$app_count" = "1"
 test -f "$verification_path/Payload/TLocation.app/Info.plist"
 
+# Any nested app or extension needs its own explicit, reviewed App ID. The
+# current project has none, so an unexpected signable bundle is a CI failure
+# instead of silently consuming another Personal Team slot after signing.
+bundle_identifiers_json="$(PYTHONPATH=scripts python3 - "$ipa_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from release_feed import read_ipa_metadata
+
+metadata = read_ipa_metadata(Path(sys.argv[1]))
+print(json.dumps(metadata.bundle_identifiers, sort_keys=True))
+PY
+)"
+
 ipa_size="$(stat -f '%z' "$ipa_path")"
 ipa_sha256="$(shasum -a 256 "$ipa_path" | awk '{print $1}')"
 commit_sha="${GITHUB_SHA:-$(git rev-parse HEAD)}"
@@ -150,6 +171,7 @@ export LS_RELEASE_TIMESTAMP="$release_timestamp"
 export LS_XCODE_VERSION="$xcode_version"
 export LS_IOS_SDK_VERSION="$ios_sdk_version"
 export LS_EXECUTABLE_ARCHITECTURES="$executable_architectures"
+export LS_BUNDLE_IDENTIFIERS_JSON="$bundle_identifiers_json"
 python3 - <<'PY'
 import json
 import os
@@ -158,6 +180,7 @@ from pathlib import Path
 metadata = {
     "schemaVersion": 1,
     "bundleIdentifier": os.environ["LS_BUNDLE_IDENTIFIER"],
+    "bundleIdentifiers": json.loads(os.environ["LS_BUNDLE_IDENTIFIERS_JSON"]),
     "displayName": os.environ["LS_DISPLAY_NAME"],
     "version": os.environ["LS_VERSION"],
     "buildVersion": os.environ["LS_BUILD_VERSION"],
@@ -179,6 +202,7 @@ Path(os.environ["LS_BUILD_METADATA_PATH"]).write_text(
 PY
 
 echo "Unsigned IPA: $ipa_path"
+echo "Bundle identifiers: $bundle_identifiers_json"
 echo "Version/build: $version ($build_version)"
 echo "IPA size: $ipa_size bytes"
 echo "IPA SHA-256: $ipa_sha256"

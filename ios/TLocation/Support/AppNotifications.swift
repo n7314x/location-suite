@@ -15,6 +15,9 @@ extension Notification.Name {
     /// Ask the root view to present the pairing-file importer.
     static let showPairingFilePicker = Notification.Name("vn.truongkma.tlocation.showPairingFilePicker")
 
+    /// Ask the map to enter route editing after guided setup completes.
+    static let openRouteComposerRequested = Notification.Name("vn.truongkma.tlocation.openRouteComposerRequested")
+
     /// Ask the map to start simulating a coordinate (see `LocationSimulationRequest`).
     static let simulateLocationRequested = Notification.Name("vn.truongkma.tlocation.simulateLocationRequested")
 

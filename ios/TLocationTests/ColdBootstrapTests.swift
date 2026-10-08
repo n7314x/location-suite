@@ -21,6 +21,28 @@ private func classified(
     )
 }
 
+private func bootstrapTrace(
+    operation: ColdBootstrapOperation = .coordinateSimulation,
+    network: String = "Cellular",
+    failure: LocationBootstrapError? = nil,
+    stages: [ColdBootstrapStage] = []
+) -> ColdBootstrapTrace {
+    ColdBootstrapTrace(
+        sequence: 1,
+        timestamp: Date(timeIntervalSince1970: 1_800_000_000),
+        targetHost: "10.7.0.1",
+        targetPort: 49152,
+        underlyingNetwork: network,
+        operation: operation,
+        measurements: stages.map {
+            ColdBootstrapStageMeasurement(attempt: 1, stage: $0, elapsed: nil)
+        },
+        retryCount: 0,
+        totalElapsed: 0.1,
+        failure: failure
+    )
+}
+
 struct ColdBootstrapClassificationTests {
     @Test func refusalClassificationPreservesErrno() {
         let error = classified(.tcpConnect, "connect: Connection refused (os error 61)")
@@ -67,6 +89,64 @@ struct ColdBootstrapClassificationTests {
         }
         #expect(ColdBootstrapStageSequence.isSuccessful(measurements))
     }
+
+    @Test func preparationStageSequenceReachesReadyWithoutCoordinateSet() {
+        let stages = ColdBootstrapStageSequence.preparationSuccessful
+        let measurements = stages.map {
+            ColdBootstrapStageMeasurement(attempt: 1, stage: $0, elapsed: nil)
+        }
+
+        #expect(!stages.contains(.coordinateSet))
+        #expect(ColdBootstrapStageSequence.isSuccessful(
+            measurements,
+            operation: .sessionPreparation
+        ))
+        #expect(!ColdBootstrapStageSequence.isSuccessful(
+            measurements,
+            operation: .coordinateSimulation
+        ))
+    }
+
+    @Test func coordinateSimulationStillRequiresCoordinateSetBeforeReady() {
+        let stages = ColdBootstrapStageSequence.coordinateSimulationSuccessful
+        #expect(Array(stages.suffix(2)) == [.coordinateSet, .ready])
+        let measurements = stages.map {
+            ColdBootstrapStageMeasurement(attempt: 1, stage: $0, elapsed: nil)
+        }
+        #expect(ColdBootstrapStageSequence.isSuccessful(
+            measurements,
+            operation: .coordinateSimulation
+        ))
+    }
+}
+
+struct SetupRecoveryTests {
+    @Test func refusedCellularEndpointPreparesSessionFirst() {
+        let failure = classified(.tcpConnect, "Connection refused (os error 61)")
+        let trace = bootstrapTrace(network: "Cellular", failure: failure)
+        #expect(SetupRecovery.recommendation(trace: trace, warmSessionOpen: false)?.action == .prepareLTESession)
+        #expect(SetupRecovery.recommendation(trace: trace, warmSessionOpen: true)?.action == .openLocalDevVPN)
+        #expect(SetupRecovery.recommendation(
+            trace: bootstrapTrace(network: "Wi-Fi", failure: failure), warmSessionOpen: false
+        )?.action == .openLocalDevVPN)
+        #expect(SetupRecovery.recommendation(
+            trace: bootstrapTrace(network: "Wi-Fi", failure: failure), warmSessionOpen: false
+        )?.title == "RemotePairing refused the connection")
+    }
+
+    @Test func recoveryActionsFollowFailureLayer() {
+        let examples: [(ColdBootstrapStage, String, SetupRecoveryAction)] = [
+            (.waitingForTunnel, "vpn network unavailable", .openLocalDevVPN),
+            (.remotePairing, "pair verification rejected", .importPairingFile),
+            (.locationSimulationChannel, "developer disk image not mounted", .openDeveloperSettings),
+            (.rsdConnect, "channel closed", .retryConnection),
+        ]
+        for (stage, detail, action) in examples {
+            let trace = bootstrapTrace(failure: classified(stage, detail))
+            #expect(SetupRecovery.recommendation(trace: trace, warmSessionOpen: false)?.action == action)
+        }
+        #expect(SetupRecovery.recommendation(trace: nil, warmSessionOpen: false) == nil)
+    }
 }
 
 struct ColdBootstrapRecoveryTests {
@@ -81,6 +161,35 @@ struct ColdBootstrapRecoveryTests {
             for: .connectionRefused,
             underlyingNetwork: "Cellular"
         ) == [0.150])
+    }
+
+    @Test func exactCellularErrno61OffersSessionPreparationOnlyWhenCold() {
+        let failure = classified(.tcpConnect, "connect: Connection refused (os error 61)")
+        let trace = bootstrapTrace(
+            operation: .coordinateSimulation,
+            network: "Cellular",
+            failure: failure,
+            stages: [.waitingForTunnel, .tcpConnect]
+        )
+
+        #expect(LTEPreparationRecoveryPolicy.shouldOffer(
+            trace: trace,
+            warmSessionOpen: false
+        ))
+        #expect(!LTEPreparationRecoveryPolicy.shouldOffer(
+            trace: trace,
+            warmSessionOpen: true
+        ))
+        #expect(!LTEPreparationRecoveryPolicy.shouldOffer(
+            trace: bootstrapTrace(network: "Wi-Fi", failure: failure),
+            warmSessionOpen: false
+        ))
+        #expect(!LTEPreparationRecoveryPolicy.shouldOffer(
+            trace: bootstrapTrace(
+                failure: classified(.tcpConnect, "operation timed out (os error 60)")
+            ),
+            warmSessionOpen: false
+        ))
     }
 
     @Test func pathChangeAndUserActionPermitRetryAgain() {

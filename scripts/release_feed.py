@@ -31,6 +31,7 @@ class ReleaseError(ValueError):
 @dataclass(frozen=True)
 class IPAMetadata:
     bundle_identifier: str
+    bundle_identifiers: dict[str, str]
     version: str
     build_version: str
     minimum_os_version: str
@@ -83,6 +84,24 @@ def read_ipa_metadata(ipa_path: Path) -> IPAMetadata:
             if info_name not in names:
                 raise ReleaseError("IPA is missing Payload/TLocation.app/Info.plist")
             info = plistlib.loads(archive.read(info_name))
+            signable_info_names = {
+                name
+                for name in names
+                if name.endswith("/Info.plist")
+                and Path(name).parent.suffix in {".app", ".appex"}
+            }
+            if signable_info_names != {info_name}:
+                raise ReleaseError(
+                    "IPA signable bundle inventory changed; update the canonical identifier "
+                    f"allowlist explicitly. Found {sorted(signable_info_names)}"
+                )
+            bundle_identifiers: dict[str, str] = {}
+            for signable_info_name in sorted(signable_info_names):
+                signable_info = plistlib.loads(archive.read(signable_info_name))
+                identifier = signable_info.get("CFBundleIdentifier")
+                if not isinstance(identifier, str) or not identifier:
+                    raise ReleaseError(f"{signable_info_name} has no valid CFBundleIdentifier")
+                bundle_identifiers[str(Path(signable_info_name).parent)] = identifier
     except (OSError, zipfile.BadZipFile, plistlib.InvalidFileException) as error:
         raise ReleaseError(f"Invalid IPA {ipa_path}: {error}") from error
 
@@ -99,6 +118,7 @@ def read_ipa_metadata(ipa_path: Path) -> IPAMetadata:
     digest = hashlib.sha256(ipa_path.read_bytes()).hexdigest()
     return IPAMetadata(
         bundle_identifier=info["CFBundleIdentifier"],
+        bundle_identifiers=bundle_identifiers,
         version=info["CFBundleShortVersionString"],
         build_version=info["CFBundleVersion"],
         minimum_os_version=info["MinimumOSVersion"],

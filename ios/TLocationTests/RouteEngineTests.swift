@@ -929,6 +929,25 @@ struct LocationSimulationSessionKeeperTests {
         harness.keeper.producerDidEnd(lease, reason: .returnedToRealGPS)
     }
 
+    @discardableResult
+    private func prepareIdleSession(
+        in harness: Harness
+    ) -> LocationSimulationIdleLease {
+        harness.status.set(open: false, active: false)
+        guard let preparation = harness.ownership.beginPreparation() else {
+            fatalError("Expected preparation lease")
+        }
+        harness.keeper.preparationWillBegin(preparation)
+        harness.status.set(open: true, active: false)
+        guard let idle = harness.ownership.finishPreparation(preparation) else {
+            fatalError("Expected idle lease")
+        }
+        guard harness.keeper.preparationDidSucceed(preparation, idleLease: idle) else {
+            fatalError("Expected preparation lifecycle transfer")
+        }
+        return idle
+    }
+
     private func settle() async {
         await Task.yield()
         await Task.yield()
@@ -947,6 +966,191 @@ struct LocationSimulationSessionKeeperTests {
         #expect(harness.keeper.isIdleKeeperActive)
         #expect(harness.scheduler.scheduleCount == 1)
         #expect(harness.activity.balance == 1)
+    }
+
+    @Test func successfulPreparationCreatesCoordinateFreeIdleWarmSession() {
+        let harness = makeHarness()
+
+        prepareIdleSession(in: harness)
+
+        #expect(harness.status.isSessionOpen)
+        #expect(!harness.status.isSimulationActive)
+        #expect(harness.ownership.currentProducer == .none)
+        #expect(harness.keeper.state == .idleWarm)
+        #expect(harness.keeper.isIdleKeeperActive)
+        #expect(harness.scheduler.scheduleCount == 1)
+        #expect(harness.activity.balance == 1)
+        #expect(harness.driver.performCount == 0)
+    }
+
+    @Test func preparationOfExistingOpenSessionRetainsItWithoutProducer() {
+        let harness = makeHarness()
+        prepareIdleSession(in: harness)
+        guard let preparation = harness.ownership.beginPreparation() else {
+            Issue.record("Expected reuse preparation lease")
+            return
+        }
+        harness.keeper.preparationWillBegin(preparation)
+        guard let idle = harness.ownership.finishPreparation(preparation) else {
+            Issue.record("Expected reused idle lease")
+            return
+        }
+
+        #expect(harness.keeper.preparationDidSucceed(preparation, idleLease: idle))
+
+        #expect(harness.status.isSessionOpen)
+        #expect(!harness.status.isSimulationActive)
+        #expect(harness.ownership.currentProducer == .none)
+        #expect(harness.keeper.state == .idleWarm)
+        #expect(harness.scheduler.scheduleCount == 2)
+        #expect(harness.scheduler.cancellationCount == 1)
+        #expect(harness.activity.startCount == 1)
+    }
+
+    @Test func pointAfterPreparationReusesOpenSessionAndInvalidatesIdleLease() {
+        let harness = makeHarness()
+        let idle = prepareIdleSession(in: harness)
+
+        let point = harness.ownership.claim(.point)
+        harness.status.set(active: true)
+        harness.keeper.producerDidTakeOwnership(point)
+
+        #expect(harness.status.isSessionOpen)
+        #expect(harness.keeper.state == .activePoint)
+        #expect(harness.ownership.isCurrent(point))
+        #expect(!harness.ownership.isCurrent(idle))
+        #expect(harness.scheduler.cancellationCount == 1)
+        #expect(harness.activity.startCount == 1)
+    }
+
+    @Test func routeAfterPreparationReusesOpenSessionAndInvalidatesIdleLease() {
+        let harness = makeHarness()
+        let idle = prepareIdleSession(in: harness)
+
+        let route = harness.ownership.claim(.route)
+        harness.status.set(active: true)
+        harness.keeper.producerDidTakeOwnership(route)
+
+        #expect(harness.status.isSessionOpen)
+        #expect(harness.keeper.state == .activeRoute)
+        #expect(harness.ownership.isCurrent(route))
+        #expect(!harness.ownership.isCurrent(idle))
+        #expect(harness.scheduler.cancellationCount == 1)
+        #expect(harness.activity.startCount == 1)
+    }
+
+    @Test func disconnectDestroysPreparedIdleSession() {
+        let harness = makeHarness()
+        prepareIdleSession(in: harness)
+
+        let disconnect = harness.keeper.sessionWillDisconnect()
+        harness.ownership.invalidateAll()
+        harness.status.set(open: false, active: false)
+        harness.keeper.sessionDidDisconnect(disconnect)
+
+        #expect(!harness.status.isSessionOpen)
+        #expect(!harness.status.isSimulationActive)
+        #expect(harness.ownership.currentProducer == .none)
+        #expect(harness.keeper.state == .disconnected)
+        #expect(!harness.keeper.isIdleKeeperActive)
+        #expect(harness.activity.balance == 0)
+    }
+
+    @Test func failedPreparationLeavesNoSessionOrIdleKeeper() {
+        let harness = makeHarness()
+        guard let preparation = harness.ownership.beginPreparation() else {
+            Issue.record("Expected preparation lease")
+            return
+        }
+        harness.keeper.preparationWillBegin(preparation)
+
+        #expect(harness.ownership.cancelPreparation(preparation))
+        #expect(harness.keeper.preparationDidFail(preparation))
+
+        #expect(!harness.status.isSessionOpen)
+        #expect(!harness.status.isSimulationActive)
+        #expect(harness.ownership.currentProducer == .none)
+        #expect(harness.keeper.state == .disconnected)
+        #expect(!harness.keeper.isIdleKeeperActive)
+        #expect(harness.scheduler.scheduleCount == 0)
+        #expect(harness.activity.balance == 0)
+    }
+
+    @Test func preparedHeartbeatCompletionCannotOutlivePointTakeover() async {
+        let harness = makeHarness()
+        prepareIdleSession(in: harness)
+        harness.scheduler.fire()
+
+        let point = harness.ownership.claim(.point)
+        harness.status.set(active: true)
+        harness.keeper.producerDidTakeOwnership(point)
+        harness.driver.completeNext(.failed("late prepared-session heartbeat"))
+        await settle()
+
+        #expect(harness.status.isSessionOpen)
+        #expect(harness.keeper.state == .activePoint)
+        #expect(harness.ownership.isCurrent(point))
+        #expect(harness.driver.cleanupCount == 0)
+        #expect(harness.keeper.heartbeatFailureCount == 0)
+    }
+
+    @Test func pointOrRouteClaimSupersedesInFlightPreparationLease() {
+        for producer in [LocationSimulationProducer.point, .route] {
+            let harness = makeHarness()
+            guard let preparation = harness.ownership.beginPreparation() else {
+                Issue.record("Expected preparation lease")
+                continue
+            }
+            harness.keeper.preparationWillBegin(preparation)
+
+            let producerLease = harness.ownership.claim(producer)
+            harness.status.set(open: true, active: true)
+            harness.keeper.producerDidTakeOwnership(producerLease)
+
+            #expect(!harness.ownership.isCurrent(preparation))
+            #expect(!harness.ownership.cancelPreparation(preparation))
+            #expect(!harness.keeper.preparationDidFail(preparation))
+            #expect(harness.ownership.isCurrent(producerLease))
+            #expect(
+                harness.keeper.state == (producer == .point ? .activePoint : .activeRoute)
+            )
+            #expect(harness.activity.balance == 1)
+        }
+    }
+
+    @Test func disconnectSupersedesInFlightPreparationLease() {
+        let harness = makeHarness()
+        guard let preparation = harness.ownership.beginPreparation() else {
+            Issue.record("Expected preparation lease")
+            return
+        }
+        harness.keeper.preparationWillBegin(preparation)
+
+        let disconnect = harness.keeper.sessionWillDisconnect()
+        harness.ownership.invalidateAll()
+        harness.status.set(open: false, active: false)
+        harness.keeper.sessionDidDisconnect(disconnect)
+
+        #expect(!harness.ownership.isCurrent(preparation))
+        #expect(!harness.keeper.preparationDidFail(preparation))
+        #expect(harness.keeper.state == .disconnected)
+        #expect(harness.activity.balance == 0)
+    }
+
+    @Test func returnInvalidationReleasesSupersededPreparationActivity() {
+        let harness = makeHarness()
+        guard let preparation = harness.ownership.beginPreparation() else {
+            Issue.record("Expected preparation lease")
+            return
+        }
+        harness.keeper.preparationWillBegin(preparation)
+
+        harness.ownership.invalidateAll()
+
+        #expect(!harness.ownership.isCurrent(preparation))
+        #expect(harness.keeper.preparationDidFail(preparation))
+        #expect(harness.keeper.state == .disconnected)
+        #expect(harness.activity.balance == 0)
     }
 
     @Test func pointAcquisitionPausesIdleHeartbeat() {
@@ -1614,5 +1818,76 @@ struct RoutePlaybackControllerTests {
         #expect(activity.ends == 1)
         let disconnectCount = await sink.disconnectCount
         #expect(disconnectCount == 1)
+    }
+}
+
+
+struct RouteScheduleTests {
+    @Test func scheduleRejectsEmptyStepsAndInvalidPause() throws {
+        #expect(throws: RouteScheduleValidationError.emptySchedule) {
+            try RouteScheduleDocument(name: "Empty", steps: [])
+        }
+        #expect(throws: RouteScheduleValidationError.invalidPause) {
+            _ = try RouteScheduleStep(routeID: "route_a", pauseAfter: -1)
+        }
+    }
+
+    @Test func scheduleValidationDetectsMissingAndUnresolvedRoutes() throws {
+        let step = try RouteScheduleStep(routeID: "route_missing")
+        let schedule = try RouteScheduleDocument(name: "Missing", steps: [step])
+        #expect(throws: RouteScheduleValidationError.missingRoute("route_missing")) {
+            try RouteScheduleValidator.validate(schedule, routes: [])
+        }
+
+        let a = try point(0, 0)
+        let b = try point(0, 0.001)
+        let unresolved = try LocationRouteDocument(
+            id: "route_unresolved",
+            name: "Unresolved",
+            anchors: [a, b]
+        )
+        let unresolvedSchedule = try RouteScheduleDocument(
+            name: "Unresolved",
+            steps: [try RouteScheduleStep(routeID: unresolved.id)]
+        )
+        #expect(throws: RouteScheduleValidationError.unresolvedRoute("Unresolved")) {
+            try RouteScheduleValidator.validate(unresolvedSchedule, routes: [unresolved])
+        }
+    }
+
+    @Test func scheduleWarnsAboutLargeRouteJump() throws {
+        let a0 = try point(0, 0)
+        let a1 = try point(0, 0.001)
+        let b0 = try point(1, 1)
+        let b1 = try point(1, 1.001)
+
+        let first = try LocationRouteDocument(
+            id: "route_schedule_a",
+            name: "A",
+            anchors: [a0, a1],
+            resolvedGeometry: try ResolvedRouteGeometry(points: [a0, a1])
+        )
+        let second = try LocationRouteDocument(
+            id: "route_schedule_b",
+            name: "B",
+            anchors: [b0, b1],
+            resolvedGeometry: try ResolvedRouteGeometry(points: [b0, b1])
+        )
+        let schedule = try RouteScheduleDocument(
+            name: "Jump",
+            steps: [
+                try RouteScheduleStep(routeID: first.id, pauseAfter: 60),
+                try RouteScheduleStep(routeID: second.id)
+            ]
+        )
+
+        let warnings = try RouteScheduleValidator.validate(
+            schedule,
+            routes: [first, second]
+        )
+        #expect(warnings.count == 1)
+        #expect(warnings[0].fromRouteName == "A")
+        #expect(warnings[0].toRouteName == "B")
+        #expect(warnings[0].distance > RouteScheduleValidator.jumpWarningDistance)
     }
 }
