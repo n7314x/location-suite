@@ -120,6 +120,35 @@ struct ColdBootstrapClassificationTests {
     }
 }
 
+struct SetupRecoveryTests {
+    @Test func refusedCellularEndpointPreparesSessionFirst() {
+        let failure = classified(.tcpConnect, "Connection refused (os error 61)")
+        let trace = bootstrapTrace(network: "Cellular", failure: failure)
+        #expect(SetupRecovery.recommendation(trace: trace, warmSessionOpen: false)?.action == .prepareLTESession)
+        #expect(SetupRecovery.recommendation(trace: trace, warmSessionOpen: true)?.action == .openLocalDevVPN)
+        #expect(SetupRecovery.recommendation(
+            trace: bootstrapTrace(network: "Wi-Fi", failure: failure), warmSessionOpen: false
+        )?.action == .openLocalDevVPN)
+        #expect(SetupRecovery.recommendation(
+            trace: bootstrapTrace(network: "Wi-Fi", failure: failure), warmSessionOpen: false
+        )?.title == "RemotePairing refused the connection")
+    }
+
+    @Test func recoveryActionsFollowFailureLayer() {
+        let examples: [(ColdBootstrapStage, String, SetupRecoveryAction)] = [
+            (.waitingForTunnel, "vpn network unavailable", .openLocalDevVPN),
+            (.remotePairing, "pair verification rejected", .importPairingFile),
+            (.locationSimulationChannel, "developer disk image not mounted", .openDeveloperSettings),
+            (.rsdConnect, "channel closed", .retryConnection),
+        ]
+        for (stage, detail, action) in examples {
+            let trace = bootstrapTrace(failure: classified(stage, detail))
+            #expect(SetupRecovery.recommendation(trace: trace, warmSessionOpen: false)?.action == action)
+        }
+        #expect(SetupRecovery.recommendation(trace: nil, warmSessionOpen: false) == nil)
+    }
+}
+
 struct ColdBootstrapRecoveryTests {
     @Test func noRouteAndTimeoutUseTheFullBoundedSchedule() {
         let expected = [0.150, 0.300, 0.600, 1.200]

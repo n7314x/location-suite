@@ -74,6 +74,7 @@ private enum ExternalLocationAction: Identifiable {
 }
 
 struct RootView: View {
+    @AppStorage("locationSuite.setupCompleted") private var setupCompleted = false
     @ObservedObject private var tunnel = TunnelManager.shared
     @ObservedObject private var mounting = MountingProgress.shared
     @ObservedObject private var signing = SigningExpiryMonitor.shared
@@ -83,6 +84,8 @@ struct RootView: View {
 
     @State private var isShowingPairingFilePicker = false
     @State private var isShowingSettings = false
+    @State private var pairingImportError: String?
+    @State private var checkedExistingSetup = false
     @State private var pendingLocationAction: ExternalLocationAction?
     @State private var pairingExists = FileManager.default.fileExists(
         atPath: PairingFileStore.prepareURL().path
@@ -114,28 +117,29 @@ struct RootView: View {
 
     var body: some View {
         NavigationStack {
-            // Until pairing + tunnel + DDI are all up, every control on the map is
-            // disabled anyway. Rather than leave a normal-looking but silently dead
-            // map, cover it with a blocking readiness overlay that says exactly what
-            // is missing. The overlay is the last child of the ZStack (drawn on top)
-            // and the map explicitly stops hit-testing beneath it, so nothing can be
-            // tapped through — no accidental pin drops. A safe-area inset banner was
-            // used here before and did not render on device, because the map below
-            // discards the safe area.
+            // The setup experience owns the screen until this device is ready.
+            // Keep the map alive for session notifications but block map input.
             ZStack {
                 LocationSimulationView()
-                    .allowsHitTesting(isReady && !isShowingExpiryWarning)
+                    .allowsHitTesting(isReady && setupCompleted && !isShowingExpiryWarning)
 
                 // Strictly one card at a time — `else if`, not two independent
                 // `if`s, so the two can never stack on top of each other. The
-                // expiry warning wins: an unreadable map is recoverable in
-                // seconds, a lapsed signature means a reinstall. Dismissing it
-                // reveals the readiness overlay underneath, whose blocking
-                // behaviour is unchanged (the map stops hit-testing for either).
+                // expiry warning wins. Dismissing it reveals setup underneath.
                 if isShowingExpiryWarning {
                     expiryOverlay
-                } else if !isReady {
-                    readinessOverlay
+                } else if !isReady || !setupCompleted {
+                    SetupExperienceView(
+                        pairingExists: pairingExists,
+                        isReady: isReady,
+                        pairingImportError: pairingImportError,
+                        startsAtConnection: setupCompleted || pairingExists,
+                        onImportPairing: { isShowingPairingFilePicker = true },
+                        onRetryConnection: retryConnection,
+                        onOpenLocalDevVPN: openLocalDevVPN,
+                        onOpenSettings: { isShowingSettings = true },
+                        onFinish: finishSetup
+                    )
                 }
             }
             .animation(.easeInOut(duration: 0.2), value: isReady)
@@ -151,7 +155,13 @@ struct RootView: View {
             importPairingFile(result)
         }
         .onAppear {
-            startTunnelInBackground()
+            // Existing installations with a pairing file have already passed
+            // initial setup; connection recovery remains available if needed.
+            if !checkedExistingSetup {
+                checkedExistingSetup = true
+                if pairingExists { setupCompleted = true }
+            }
+            startTunnelInBackground(showErrorUI: false)
             MountingProgress.shared.checkforMounted()
             signing.refreshIfPossible(reason: "launch")
             evaluateExpiryWarning()
@@ -296,7 +306,7 @@ struct RootView: View {
             : String(localized: "Open Self Maintenance to renew the provisioning profile on this iPhone. If the app fully expires, use iLoader for emergency recovery.")
     }
 
-    /// Same visual language as the readiness overlay: full-screen material scrim
+    /// Same visual language as the setup experience: full-screen material scrim
     /// plus a rounded material card. Uses no iOS-26-only API, so it needs no
     /// availability gate — `.regularMaterial` is the floor on iOS 17.4.
     private var expiryOverlay: some View {
@@ -358,153 +368,13 @@ struct RootView: View {
         .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
     }
 
-    // MARK: - Readiness overlay
-
-    /// Full-screen blocking overlay shown until pairing, tunnel and DDI are all up.
-    /// The scrim is an opaque-to-touches material layer, so it swallows every tap
-    /// that misses the card; the map underneath additionally has hit-testing off.
-    private var readinessOverlay: some View {
-        ZStack {
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .ignoresSafeArea()
-
-            readinessCard
-                .padding(.horizontal, 24)
-        }
-        .transition(.opacity)
-    }
-
-    private var readinessCard: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 6) {
-                Label("Device Not Connected", systemImage: "bolt.horizontal.circle.fill")
-                    .font(.headline)
-                    .foregroundStyle(.orange)
-                Text("TLocation needs a connection to this device before it can simulate a location.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            VStack(alignment: .leading, spacing: 14) {
-                readinessRow(
-                    title: String(localized: "Pairing file imported"),
-                    isDone: pairingExists,
-                    guidance: String(localized: "Import your pairing file.")
-                )
-                readinessRow(
-                    title: String(localized: "Connected to this device"),
-                    isDone: tunnel.isConnected,
-                    guidance: String(localized: "Connect LocalDevVPN, then Retry. Location Suite tests the phone-local endpoint directly on Wi-Fi, cellular, or offline paths.")
-                )
-                readinessRow(
-                    title: String(localized: "Developer Disk Image mounted"),
-                    isDone: mounting.coolisMounted,
-                    guidance: String(localized: "Waiting for the Developer Disk Image (DDI) to download and mount."),
-                    showsProgress: mounting.mountingThread != nil
-                )
-            }
-
-            VStack(spacing: 10) {
-                Button {
-                    isShowingPairingFilePicker = true
-                } label: {
-                    Label("Import Pairing File", systemImage: "square.and.arrow.down")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-
-                // Only useful while the tunnel is down — that is the one failure
-                // this button can actually fix.
-                if !tunnel.isConnected {
-                    Button {
-                        openLocalDevVPN()
-                    } label: {
-                        Label("Open LocalDevVPN", systemImage: "network")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                }
-
-                HStack(spacing: 10) {
-                    Button {
-                        retryConnection()
-                    } label: {
-                        // "Retry Connection" wrapped onto two lines in this
-                        // half-width slot on a narrow device.
-                        Label("Retry", systemImage: "arrow.clockwise")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-
-                    // Settings must stay reachable from here: it holds the target IP
-                    // field and "Redownload DDI", the recovery tools for this screen.
-                    Button {
-                        isShowingSettings = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                }
-            }
-            .font(.subheadline.weight(.medium))
-        }
-        .padding(22)
-        .frame(maxWidth: 420)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
-    }
-
-    private func readinessRow(
-        title: String,
-        isDone: Bool,
-        guidance: String,
-        showsProgress: Bool = false
-    ) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Group {
-                if isDone {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                } else if showsProgress {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: "circle.dashed")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .font(.body)
-            .frame(width: 22, height: 22)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(isDone ? .secondary : .primary)
-                if !isDone {
-                    Text(guidance)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            Spacer(minLength: 0)
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            isDone
-                ? String(localized: "\(title): done")
-                : String(localized: "\(title): pending")
-        )
-    }
+    // MARK: - Guided connection recovery
 
     private func openLocalDevVPN() {
         openFirstResolving(RootViewLinks.localDevVPN)
     }
 
-    /// The readiness overlay can be on screen with a simulation still running —
+    /// Guided recovery can be on screen with a simulation still running —
     /// `concludeSimulationHasStopped()` puts it there, and so does any tunnel
     /// failure — so this tap has to assume a resend may be mid-handshake. The
     /// tunnel start therefore queues behind whatever the location-simulation
@@ -515,7 +385,7 @@ struct RootView: View {
     /// answered, and neither touches the device's location-simulation service.
     private func retryConnection() {
         markTunnelDisconnected()
-        startTunnelAfterPendingLocationCommands()
+        startTunnelAfterPendingLocationCommands(showErrorUI: false)
         MountingProgress.shared.checkforMounted()
     }
 
@@ -525,18 +395,32 @@ struct RootView: View {
             do {
                 try PairingFileStore.importFromPicker(url)
                 pairingExists = true
+                pairingImportError = nil
                 markTunnelDisconnected()
                 // Same endpoint contention as Retry above: a pairing file can be
-                // imported from the readiness overlay with a simulation still
+                // imported from guided recovery with a simulation still
                 // running.
-                startTunnelAfterPendingLocationCommands()
+                startTunnelAfterPendingLocationCommands(showErrorUI: false)
                 AlertPresenter.dismissPresentedAlert()
             } catch {
+                pairingImportError = error.localizedDescription
                 LogManager.shared.addErrorLog("Failed to import pairing file: \(error.localizedDescription)")
-                showAlert(title: String(localized: "Import Failed"), message: error.localizedDescription, showOk: true)
             }
         case .failure(let error):
+            if (error as NSError).code == NSUserCancelledError { return }
+            pairingImportError = error.localizedDescription
             LogManager.shared.addErrorLog("Pairing file picker failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func finishSetup(createRoute: Bool) {
+        guard isReady else { return }
+        setupCompleted = true
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        if createRoute {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .openRouteComposerRequested, object: nil)
+            }
         }
     }
 

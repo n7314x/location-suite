@@ -22,6 +22,7 @@ let package = Package(
                 "ReleaseUpdateModels.swift",
                 "SigningExpiryPolicy.swift",
                 "ColdBootstrapModels.swift",
+                "SetupRecovery.swift",
                 "SelfMaintenanceModels.swift"
             ]
         ),

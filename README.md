@@ -5,7 +5,7 @@ Non-jailbroken iOS system-wide location simulation.
 ## Components
 
 - ios/      Native iOS companion app
-- web/      Chromebook/browser interface
+- web/      Public landing page (`/`) and Chromebook/browser interface (`/app`)
 - backend/  Local device-control API using pymobiledevice3
 - docs/     Architecture and setup documentation
 

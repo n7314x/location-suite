@@ -1375,6 +1375,9 @@ struct LocationSimulationView: View {
                 startExternalSimulation(at: requested)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .openRouteComposerRequested)) { _ in
+            if interactionMode == .point { toggleRouteMode() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .clearSimulatedLocationRequested)) { notification in
             if LocationSimulationRequest.isAlreadyApplied(notification) {
                 routePlayback.relinquishWithoutClearing()
